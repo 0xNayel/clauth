@@ -259,7 +259,11 @@ republishes it with the scheduler's live `fetch_status` / `next_refresh_at` /
 `pending_switch` that a single-shot build cannot see. A switch the daemon itself
 performs through `POST /api/v1/switch` is the exception: it republishes before
 answering, so a client waiting on the feed is woken by the switch rather than by
-the tick after it. Atomic (`tmp` + rename into place), `0600`. **Never carries a
+the tick after it. A switch republished with no daemon running keeps the stamp
+the daemon last wrote, or the epoch when no daemon has ever published: a fresh
+stamp is how a reader tells a live daemon from a dead one, and the switch-side
+write must carry `active_profile` forward without forging that liveness.
+Atomic (`tmp` + rename into place), `0600`. **Never carries a
 token, secret, or key**: names, tiers, percentages, timestamps only.
 
 A reader that wants a switch the moment it happens has two ways in. Over the
@@ -317,7 +321,7 @@ detectable whatever the clock did.
 | Field | Semantics |
 |---|---|
 | `schema` | Integer, currently `1`. Bumped ONLY on a breaking change; additive fields do not bump it (evolution rule below). |
-| `generated_at` | Write stamp, ISO-8601 UTC with an explicit `+00:00` offset (all timestamps are; parse the offset, never key on a `Z` suffix; the writer does not emit one). Readers derive staleness from it: a stamp much older than `refresh_interval_ms` means the daemon is gone/stuck, so show last-known data with a stale cue, never spin. |
+| `generated_at` | Write stamp, ISO-8601 UTC with an explicit `+00:00` offset (all timestamps are; parse the offset, never key on a `Z` suffix; the writer does not emit one). Readers derive staleness from it: a stamp much older than `refresh_interval_ms` means the daemon is gone/stuck, so show last-known data with a stale cue, never spin. A feed republished by a switch outside the daemon carries the daemon's last stamp forward, or the epoch when no daemon ever published, so staleness keeps meaning daemon-absent rather than following whichever process last wrote the file. |
 | `active_profile` | The profile whose credentials are currently installed, else `null`. |
 | `pending_switch` | A switch the daemon has accepted but not yet applied (`"<name>"`), else `null`. Exists so readers can show in-flight truth instead of a timing heuristic. Always `null` from the single-shot CLI. |
 | `wrap_off` | The fallback chain's stop-vs-stay-on-active flag, verbatim from state. |
