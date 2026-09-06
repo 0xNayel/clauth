@@ -224,6 +224,69 @@ fn a_conditional_read_without_wait_answers_immediately() {
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
+/// A zero-wait conditional GET is a legitimate "has it moved?" probe: the feed
+/// is read BEFORE the deadline is tested, so a feed that already differs from
+/// the client's tag answers 200 at once. The loop used to test its deadline
+/// first, which answered 304 without ever reading the file and delayed every
+/// non-zero wait's first read by one poll interval.
+#[test]
+fn a_zero_wait_conditional_read_reads_before_deciding() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let held = current_tag(&ctx);
+
+    // The feed moves; the reader holding the old tag must see it now, not on a
+    // hypothetical next poll.
+    write_feed(&ctx, &feed("beta", "2026-09-02T06:00:05+00:00"));
+    let resp = handle(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=0", Some(TOKEN), &held),
+    );
+    assert_eq!(
+        resp.status, 200,
+        "a differing feed is a change, even at wait=0"
+    );
+    assert_eq!(body_json(&resp)["active_profile"], "beta");
+
+    // A reader already current is told nothing changed.
+    let now_tag = resp.etag.clone().expect("a 200 carries an entity tag");
+    let resp = handle(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=0", Some(TOKEN), &now_tag),
+    );
+    assert_eq!(resp.status, 304);
+}
+
+/// A feed caught mid-replacement — a body that does not parse — is not a
+/// change. The wait keeps going rather than answering the truncated bytes with
+/// a tag fabricated from them, which is what the loop's own comment promises;
+/// digesting raw bytes instead made a torn read answer 200 with the garbage.
+#[test]
+fn a_wait_skips_a_feed_that_does_not_parse() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    // Half a feed: what a non-atomic writer leaves readable mid-write.
+    write_feed(
+        &ctx,
+        r#"{"schema":1,"generated_at":"2026-09-02T06:00:00+00:00","active_prof"#,
+    );
+
+    let resp = handle(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=1", Some(TOKEN), &tag),
+    );
+    assert_eq!(resp.status, 304, "an unparseable body is not a change");
+    assert!(
+        resp.body.is_empty(),
+        "the truncated bytes are never handed to the client"
+    );
+    assert_eq!(resp.etag.as_deref(), Some(tag.as_str()));
+}
+
 // ---------------------------------------------------------------- auth
 
 /// Every route, health included. An unauthenticated caller learns only that

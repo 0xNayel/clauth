@@ -186,22 +186,27 @@ fn status(ctx: &ApiContext, req: &Request) -> Response {
 fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Response {
     let deadline = std::time::Instant::now() + wait;
     loop {
+        // Read before the deadline is tested: a zero-wait conditional request is
+        // a legitimate "has it moved?" probe, and every non-zero wait gets its
+        // first read at once instead of one poll interval in.
+        //
+        // A file caught mid-replacement is not this request's problem: keep
+        // waiting rather than handing the client an error to interpret — and a
+        // body that does not parse is exactly that, never a change to answer
+        // with a tag fabricated from the raw bytes.
+        if let Ok(body) = std::fs::read(&ctx.status_path)
+            && serde_json::from_slice::<serde_json::Value>(&body).is_ok()
+        {
+            let etag = etag_for(&body);
+            if etag != tag {
+                return Response::raw_json_tagged(200, body, etag);
+            }
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             return Response::not_modified(tag.to_string());
         }
         std::thread::sleep(WAIT_POLL.min(deadline - now));
-
-        // A file caught mid-replacement is not this request's problem: keep
-        // waiting rather than handing the client an error to interpret.
-        let Ok(body) = std::fs::read(&ctx.status_path) else {
-            continue;
-        };
-        let etag = etag_for(&body);
-        if etag == tag {
-            continue;
-        }
-        return Response::raw_json_tagged(200, body, etag);
     }
 }
 
