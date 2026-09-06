@@ -1,10 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(unsafe_code)]
 
-//! Guard coverage for `delegate`'s two new inputs: `prompt_file` (a reusable
-//! prompt read from disk, validated against the delegate's `cwd`) and
-//! `profiles` (a fan-out that spends one window per account, blocking unless
-//! `background` is set).
+//! Guard coverage for `delegate`'s merged `prompt` (text or a path, validated
+//! against the delegate's `cwd`) and `profiles` (a fan-out that spends one
+//! window per account, blocking unless `background` is set).
 //!
 //! Every refusal here is pinned on the reason it names, so a guard dropped
 //! during a later edit fails its test rather than silently passing.
@@ -14,20 +13,21 @@ use crate::profile::{AppConfig, AppState};
 use crate::testutil::HomeSandbox;
 use std::io::{Seek, SeekFrom, Write};
 
-/// A `DelegateArgs` with every optional field unset and JSON format, so each
-/// test overrides only what it exercises.
+/// A `DelegateArgs` with every optional field unset, so each test overrides
+/// only what it exercises.
 fn base() -> DelegateArgs {
     DelegateArgs {
         profiles: None,
         prompt: None,
-        prompt_file: None,
         model: None,
         cwd: None,
         env: None,
         args: None,
-        timeout_secs: None,
-        idle_secs: None,
-        resume: None,
+        session_id: None,
+        subagent_type: None,
+        allowed_tools: None,
+        permission_mode: None,
+        result: None,
         isolated: None,
         background: None,
     }
@@ -143,34 +143,35 @@ fn work_dir(home: &std::path::Path) -> std::path::PathBuf {
     dir
 }
 
-// ── prompt source: exactly one of `prompt` / `prompt_file` ───────────────────
+// ── prompt: one arg, two ways ────────────────────────────────────────────────
 
 #[test]
-fn both_prompt_sources_are_refused_by_name() {
+fn a_missing_prompt_is_refused_by_name() {
     let _home = HomeSandbox::new();
     let result = call_delegate(DelegateArgs {
-        prompt: Some("hi".to_string()),
-        prompt_file: Some("p.txt".to_string()),
         profiles: Some(vec!["solo".to_string()]),
         ..base()
     });
     assert_refusal(
         &result,
-        &["exactly one of `prompt` or `prompt_file` must be given; both were"],
+        &["`prompt` must be given", "path to a prompt file"],
     );
 }
 
+/// Detection matches the spec: a leading `./` or `/` is a path unconditionally;
+/// a bare relative name is a path only when a file resolves under `cwd`.
 #[test]
-fn neither_prompt_source_is_refused_by_name() {
-    let _home = HomeSandbox::new();
-    let result = call_delegate(DelegateArgs {
-        profiles: Some(vec!["solo".to_string()]),
-        ..base()
-    });
-    assert_refusal(
-        &result,
-        &["exactly one of `prompt` or `prompt_file` must be given; neither was"],
-    );
+fn prompt_path_detection_matches_the_spec() {
+    let home = HomeSandbox::new();
+    let cwd = work_dir(home.home());
+    std::fs::write(cwd.join("real.md"), "task").expect("fixture file");
+    let cwd = cwd.to_str().expect("utf8 cwd");
+
+    assert!(super::prompt_is_path("./x.md", Some(cwd)));
+    assert!(super::prompt_is_path("/tmp/x.md", Some(cwd)));
+    assert!(super::prompt_is_path("real.md", Some(cwd)));
+    assert!(!super::prompt_is_path("just a prompt", Some(cwd)));
+    assert!(!super::prompt_is_path("missing.md", Some(cwd)));
 }
 
 // ── target: `profiles` is the one field ──────────────────────────────────────
@@ -188,71 +189,68 @@ fn an_absent_target_is_refused_by_name() {
     assert_refusal(&result, &["`profiles` is empty: name at least one profile"]);
 }
 
-// ── prompt_file boundary validation ──────────────────────────────────────────
+// ── merged prompt: path detection and validation ────────────────────────────
 
 #[test]
-fn prompt_file_absolute_path_is_refused_by_name() {
+fn a_path_shaped_prompt_that_does_not_resolve_is_refused_by_name() {
     let home = HomeSandbox::new();
     seed_profiles(&["solo"], true);
     let cwd = work_dir(home.home());
-    // The sandbox home is already absolute, so this is absolute on every
-    // platform. A literal like `/etc/passwd` is not: on Windows it has a root
-    // but no drive prefix, so `is_absolute()` is false there and the path
-    // falls through to a file-not-found instead of the refusal under test.
-    let abs = std::path::absolute(home.home().join("passwd"))
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("./missing-task.md".to_string()),
+        cwd: Some(cwd.to_str().unwrap().to_string()),
+        ..base()
+    });
+    assert_refusal(
+        &result,
+        &[
+            "prompt `./missing-task.md`",
+            "does not resolve under cwd",
+            "check the path",
+        ],
+    );
+}
+
+/// `std::path::absolute` yields a drive-prefixed path on Windows, which the
+/// detection rule (leading `./` or `/`) does not read as a path, so the miss
+/// refusal under test is a unix-only shape: `/` is the only prefix both
+/// platforms detect. A drive-prefixed missing path is literal text by spec.
+#[cfg(unix)]
+#[test]
+fn an_absolute_prompt_path_that_does_not_resolve_is_refused_by_name() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], true);
+    let abs = std::path::absolute(home.home().join("missing.md"))
         .expect("absolute path")
-        .to_str()
-        .expect("sandbox path is UTF-8")
-        .to_string();
+        .to_string_lossy()
+        .into_owned();
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
-        prompt_file: Some(abs.clone()),
-        cwd: Some(cwd.to_str().unwrap().to_string()),
+        prompt: Some(abs.clone()),
         ..base()
     });
-    assert_refusal(&result, &[&format!("prompt_file `{abs}`"), "absolute path"]);
-}
-
-/// On Windows `is_absolute()` needs BOTH a prefix and a root, so a
-/// drive-relative (`C:foo`) and a root-relative (`\etc\passwd`) spelling pass
-/// the check at the top of the join and arrive at the component loop. The
-/// `RootDir | Prefix` arm must refuse each by name: dropping the component
-/// re-roots the path under `cwd` and reads a different file than the caller
-/// named.
-#[cfg(windows)]
-#[test]
-fn prompt_file_drive_relative_path_is_refused_by_name() {
-    let home = HomeSandbox::new();
-    seed_profiles(&["solo"], true);
-    let cwd = work_dir(home.home());
-    for rel in ["C:foo", r"\etc\passwd"] {
-        let result = call_delegate(DelegateArgs {
-            profiles: Some(vec!["solo".to_string()]),
-            prompt_file: Some(rel.to_string()),
-            cwd: Some(cwd.to_str().unwrap().to_string()),
-            ..base()
-        });
-        assert_refusal(&result, &[&format!("prompt_file `{rel}`"), "absolute path"]);
-    }
+    assert_refusal(&result, &[&format!("prompt `{abs}`"), "does not resolve"]);
 }
 
 #[test]
-fn prompt_file_dotdot_escape_is_refused_by_name() {
+fn a_prompt_path_that_escapes_cwd_is_refused_by_name() {
     let home = HomeSandbox::new();
     seed_profiles(&["solo"], true);
     let cwd = work_dir(home.home());
+    std::fs::write(home.home().join("secret.txt"), "secret").expect("outside file");
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
-        prompt_file: Some("../secret.txt".to_string()),
+        prompt: Some("../secret.txt".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
     });
-    assert_refusal(&result, &["prompt_file `../secret.txt`", "escapes `cwd`"]);
+    assert_refusal(&result, &["prompt `../secret.txt`", "escapes `cwd`"]);
 }
 
 #[cfg(unix)]
 #[test]
-fn prompt_file_symlink_escape_is_refused_by_name() {
+fn a_prompt_path_symlink_escape_is_refused_by_name() {
     let home = HomeSandbox::new();
     seed_profiles(&["solo"], true);
     let cwd = work_dir(home.home());
@@ -262,21 +260,18 @@ fn prompt_file_symlink_escape_is_refused_by_name() {
 
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
-        prompt_file: Some("link.txt".to_string()),
+        prompt: Some("link.txt".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
     });
     assert_refusal(
         &result,
-        &[
-            "prompt_file `link.txt`",
-            "symlink target resolves outside `cwd`",
-        ],
+        &["prompt `link.txt`", "symlink target resolves outside `cwd`"],
     );
 }
 
 #[test]
-fn prompt_file_oversize_is_refused_by_name() {
+fn a_prompt_path_oversize_is_refused_by_name() {
     let home = HomeSandbox::new();
     seed_profiles(&["solo"], true);
     let cwd = work_dir(home.home());
@@ -288,42 +283,64 @@ fn prompt_file_oversize_is_refused_by_name() {
 
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
-        prompt_file: Some("big.txt".to_string()),
+        prompt: Some("big.txt".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
     });
-    assert_refusal(
-        &result,
-        &["prompt_file `big.txt`", "bytes over the", "byte cap"],
-    );
+    assert_refusal(&result, &["prompt `big.txt`", "bytes over the", "byte cap"]);
 }
 
-/// A directory used to end in an EISDIR-shaped refusal at read time. The type
-/// check refuses it deliberately, by name, before any open.
+/// A directory is refused by type, never opened. A bare `.` is literal text
+/// under the detection rule, so the `./` spelling is what routes it here.
 #[test]
-fn prompt_file_directory_is_refused_by_name() {
+fn a_prompt_path_directory_is_refused_by_name() {
     let home = HomeSandbox::new();
     seed_profiles(&["solo"], true);
     let cwd = work_dir(home.home());
 
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
-        prompt_file: Some(".".to_string()),
+        prompt: Some("./".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
     });
-    assert_refusal(&result, &["prompt_file `.`", "not a regular file"]);
+    assert_refusal(&result, &["prompt `./`", "not a regular file"]);
+}
+
+/// A path-shaped prompt that resolves reads the file, never sends the path text.
+#[test]
+fn a_resolved_prompt_path_reads_the_file() {
+    let home = HomeSandbox::new();
+    let cwd = work_dir(home.home());
+    std::fs::write(cwd.join("task.md"), "the file prompt").expect("fixture file");
+    let cwd = cwd.to_str().unwrap();
+
+    assert_eq!(
+        super::read_prompt_path(Some(cwd), "task.md").expect("relative file reads"),
+        "the file prompt"
+    );
+    assert_eq!(
+        super::read_prompt_path(Some(cwd), "./task.md").expect("dot-relative file reads"),
+        "the file prompt"
+    );
+    let abs = std::path::absolute(cwd)
+        .expect("absolute cwd")
+        .join("task.md");
+    assert_eq!(
+        super::read_prompt_path(None, abs.to_str().expect("utf8")).expect("absolute file reads"),
+        "the file prompt"
+    );
 }
 
 /// A FIFO blocks a read-only open until a writer appears, and the MCP server
 /// runs on the only thread of its current-thread runtime, so reading one as a
-/// `prompt_file` would freeze every tool until the process dies. The type check
+/// prompt path would freeze every tool until the process dies. The type check
 /// must refuse it without ever opening it. On a regression the call below hangs
 /// forever; the receive timeout turns that hang into a failing test instead of
 /// a wedged runner.
 #[cfg(unix)]
 #[test]
-fn prompt_file_refuses_a_fifo_without_blocking() {
+fn a_prompt_path_refuses_a_fifo_without_blocking() {
     let home = HomeSandbox::new();
     let cwd = work_dir(home.home());
     let fifo = cwd.join("pipe");
@@ -377,7 +394,7 @@ fn prompt_handle_growth_past_cap_is_refused_by_name() {
     let reason = super::read_prompt_handle(f, "grow.txt")
         .expect_err("a past-cap read is refused, not truncated");
     for needle in [
-        "prompt_file `grow.txt`",
+        "prompt `grow.txt`",
         "grew past the",
         "byte cap",
         "during the read",
@@ -434,7 +451,7 @@ fn prompt_handle_invalid_utf8_is_refused_by_name() {
     let reason = super::read_prompt_handle(file, "bad.txt")
         .expect_err("an invalid UTF-8 prompt is refused, not decoded");
     for needle in [
-        "prompt_file `bad.txt`",
+        "prompt `bad.txt`",
         "invalid UTF-8",
         &format!("byte offset {expected_offset}"),
     ] {
@@ -456,6 +473,253 @@ fn prompt_handle_multibyte_utf8_is_accepted() {
 
     let text = super::read_prompt_handle(file, "utf8.txt").expect("valid UTF-8 is read");
     assert_eq!(text, "héllo ☃ £", "the prompt is read unchanged");
+}
+
+// ── subagent_type ────────────────────────────────────────────────────────────
+
+/// The typed flag and its raw `args` spelling are the same decision spelled
+/// twice; refuse rather than guess precedence. Fires before any spawn or
+/// reservation, so no seed is needed.
+#[test]
+fn subagent_type_and_the_raw_agent_flag_are_refused_together() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        subagent_type: Some("code-reviewer".to_string()),
+        args: Some(vec!["--agent".to_string(), "code-reviewer".to_string()]),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["`subagent_type`", "`--agent`", "drop one"]);
+}
+
+/// The shadow rule's matcher covers both raw spellings: `--agent` as its own
+/// token and `--agent=value` as one.
+#[test]
+fn args_carry_flag_matches_both_spellings() {
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert!(super::args_carry_flag(&args(&["--agent", "x"]), "--agent"));
+    assert!(super::args_carry_flag(&args(&["--agent=x"]), "--agent"));
+    assert!(!super::args_carry_flag(&args(&["--agentfoo"]), "--agent"));
+    assert!(!super::args_carry_flag(&args(&["--model", "x"]), "--agent"));
+}
+
+/// The wiring the shadow rule protects: `subagent_type` reaches the child as
+/// `--agent <name>`. `run_delegate` cannot run without a real `claude` child,
+/// so the pin is a source scan, the same mechanism the heartbeat wiring pins
+/// use.
+#[test]
+fn subagent_type_is_passed_as_the_agent_flag() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let flag = body
+        .split_once("if let Some(agent) = opts.subagent_type {")
+        .expect("the agent arm exists")
+        .1
+        .split_once('}')
+        .expect("the arm is closed")
+        .0;
+    assert!(
+        flag.contains(r#"["--agent", agent]"#),
+        "the arm passes the long-form flag AND the caller's value: {flag}",
+    );
+}
+
+// ── permissions passthrough + result mode ────────────────────────────────────
+
+#[test]
+fn allowed_tools_and_the_raw_flag_are_refused_together() {
+    let _home = HomeSandbox::new();
+    for raw in ["--allowedTools", "--allowed-tools"] {
+        let result = call_delegate(DelegateArgs {
+            profiles: Some(vec!["solo".to_string()]),
+            prompt: Some("hi".to_string()),
+            allowed_tools: Some(vec!["Bash".to_string()]),
+            args: Some(vec![raw.to_string(), "Bash".to_string()]),
+            background: Some(true),
+            ..base()
+        });
+        assert_refusal(
+            &result,
+            &["`allowed_tools`", "`--allowedTools`", "drop one"],
+        );
+    }
+}
+
+#[test]
+fn permission_mode_and_the_raw_flag_are_refused_together() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        permission_mode: Some("acceptEdits".to_string()),
+        args: Some(vec![
+            "--permission-mode".to_string(),
+            "acceptEdits".to_string(),
+        ]),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(
+        &result,
+        &["`permission_mode`", "`--permission-mode`", "drop one"],
+    );
+}
+
+#[test]
+fn an_unrecognized_result_value_is_refused_by_name() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        result: Some("inline".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["unrecognized result", "accepted \"file\""]);
+}
+
+/// The wiring the shadow rules protect: `allowed_tools` joins to `--allowedTools`
+/// and `permission_mode` passes `--permission-mode <mode>`.
+#[test]
+fn the_permission_flags_reach_the_child() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let tools_arm = body
+        .split_once("if let Some(tools) = opts.allowed_tools {")
+        .expect("the allowed_tools arm exists")
+        .1
+        .split_once('}')
+        .expect("the arm is closed")
+        .0;
+    assert!(
+        tools_arm.contains("--allowedTools") && tools_arm.contains("join(\",\")"),
+        "the arm passes the joined tool list: {tools_arm}",
+    );
+    let mode_arm = body
+        .split_once("if let Some(mode) = opts.permission_mode {")
+        .expect("the permission_mode arm exists")
+        .1
+        .split_once('}')
+        .expect("the arm is closed")
+        .0;
+    assert!(
+        mode_arm.contains(r#"["--permission-mode", mode]"#),
+        "the arm passes the long-form flag AND the caller's value: {mode_arm}",
+    );
+}
+
+/// `result: "file"` writes the envelope to disk and returns path + sha256 + cost
+/// instead of the inline body. A nonexistent cwd stops the run at the cwd gate,
+/// which is still a folded envelope — and it lands in the file, not the reply.
+#[test]
+fn result_file_writes_the_envelope_and_returns_path_and_sha256() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], false);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        result: Some("file".to_string()),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    let text = first_text(&result);
+    assert!(
+        text.starts_with("result written to ") && text.contains("sha256 "),
+        "the reply carries path and sha256, not the inline body: {text}",
+    );
+    let path = text
+        .split_once("result written to ")
+        .expect("path leads")
+        .1
+        .split_once(" (sha256 ")
+        .expect("sha256 follows")
+        .0;
+    let path = std::path::Path::new(path);
+    assert!(path.exists(), "the envelope file landed: {text}");
+    let body = std::fs::read_to_string(path).expect("result file reads");
+    assert!(
+        body.contains("cwd does not exist"),
+        "the file holds the folded envelope: {body}",
+    );
+}
+
+/// A background handle with `result: "file"` names the result path up front, so
+/// the model that opted into file mode can find it without guessing the shape.
+#[test]
+fn a_background_handle_notes_where_the_result_file_will_land() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], false);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        result: Some("file".to_string()),
+        background: Some(true),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_ne!(result.is_error, Some(true), "the handle is not an error");
+    let text = first_text(&result);
+    assert!(
+        text.contains("result will be written to ") && text.contains("jobs/results/"),
+        "the handle names the result path: {text}",
+    );
+}
+
+/// A background fan-out with `result: "file"` names one result path per job, so
+/// the model that opted into file mode can find each account's result.
+#[test]
+fn a_background_fanout_notes_one_result_path_per_job() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "vendor"], false);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+        prompt: Some("hi".to_string()),
+        result: Some("file".to_string()),
+        background: Some(true),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "the fan-out handle is not an error"
+    );
+    let text = first_text(&result);
+    assert!(
+        text.contains("results will be written to:"),
+        "the fan-out names the result paths: {text}",
+    );
+    assert!(
+        text.matches("jobs/results/").count() >= 2,
+        "one path per job: {text}",
+    );
+    crate::testutil::assert_jobs_done(2);
 }
 
 // ── profiles fan-out guards ──────────────────────────────────────────────────
@@ -619,7 +883,7 @@ fn a_resume_without_profiles_resolves_the_account_from_the_conversation_record()
     seed_conversation_record(home.home(), "conv-1", Some("SOLO"));
 
     let result = call_delegate(DelegateArgs {
-        resume: Some("conv-1".to_string()),
+        session_id: Some("conv-1".to_string()),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -633,7 +897,7 @@ fn a_resume_without_profiles_resolves_the_account_from_the_conversation_record()
 fn a_resume_with_no_record_refuses_naming_profiles() {
     let _home = HomeSandbox::new();
     let result = call_delegate(DelegateArgs {
-        resume: Some("nope".to_string()),
+        session_id: Some("nope".to_string()),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -655,7 +919,7 @@ fn a_resume_whose_record_has_no_told_refuses_naming_profiles() {
     seed_conversation_record(home.home(), "conv-null", None);
 
     let result = call_delegate(DelegateArgs {
-        resume: Some("conv-null".to_string()),
+        session_id: Some("conv-null".to_string()),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -680,7 +944,7 @@ fn an_explicit_profiles_wins_over_the_record_for_a_resume() {
 
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["other".to_string()]),
-        resume: Some("conv-1".to_string()),
+        session_id: Some("conv-1".to_string()),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -701,7 +965,7 @@ fn a_resume_record_naming_an_unknown_account_refuses_profile_not_found() {
     seed_conversation_record(home.home(), "conv-g", Some("ghost"));
 
     let result = call_delegate(DelegateArgs {
-        resume: Some("conv-g".to_string()),
+        session_id: Some("conv-g".to_string()),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -736,7 +1000,7 @@ fn a_path_shaped_resume_id_is_refused_not_read() {
     crate::profile::atomic_write_600(&decoy, bytes).expect("decoy write");
 
     let result = call_delegate(DelegateArgs {
-        resume: Some("../escape".to_string()),
+        session_id: Some("../escape".to_string()),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -758,7 +1022,7 @@ fn a_path_shaped_resume_id_is_refused_not_read() {
 fn an_overlong_resume_id_is_echoed_bounded() {
     let _home = HomeSandbox::new();
     let result = call_delegate(DelegateArgs {
-        resume: Some("a".repeat(100)),
+        session_id: Some("a".repeat(100)),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -1149,15 +1413,16 @@ fn a_fanout_reply_carries_headroom_for_every_target() {
 fn prose_refusals_read_as_a_sentence_and_stay_one_block() {
     let _home = HomeSandbox::new();
 
-    let both = call_delegate(DelegateArgs {
-        prompt: Some("hi".to_string()),
-        prompt_file: Some("p.txt".to_string()),
+    let missing = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
         ..base()
     });
     assert_prose_refusal(
-        &both,
-        &["delegate failed: exactly one of `prompt` or `prompt_file` must be given; both were"],
+        &missing,
+        &[
+            "delegate failed: `prompt` must be given",
+            "path to a prompt file",
+        ],
     );
 
     let blocking = call_delegate(DelegateArgs {

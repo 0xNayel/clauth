@@ -1242,13 +1242,11 @@ pub(crate) struct RotationGuard {
 /// slow enough to burn its budget, which is an unanswered ACL dialog or a locked
 /// keychain, and the refusal is retryable.
 ///
-/// The CEILING is [`crate::mcp::MAX_WAIT_SECS_NO_PROGRESS`], the only deadline
-/// this wait sits inside: the MCP `delegate`'s pre-spawn window emits no progress
-/// notification, there being no child to report on yet, and that constant is the
-/// crate's already-derived answer to how long a peer that cannot receive progress
-/// tolerates silence — itself a conservative proxy for Claude Code's 30-minute
-/// stdio idle abort, not that abort. Past the abort the named refusal below
-/// reaches nobody. Pinned as a relation rather than restated here.
+/// The CEILING is Claude Code's 30-minute stdio idle abort: the MCP
+/// `delegate`'s pre-spawn window emits no progress notification, there being
+/// no child to report on yet, so the wait sits inside whatever silence the
+/// host tolerates before aborting the call. Past the abort the named refusal
+/// below reaches nobody. Pinned as a relation rather than restated here.
 ///
 /// A holder past this deadline gets a named retry rather than a fault, because
 /// the unbounded legs mean a firing is not proof of a wedge.

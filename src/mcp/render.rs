@@ -686,22 +686,11 @@ pub(crate) fn digest_prose(d: &Value) -> String {
 /// and a label naming a tool the handshake does not list sends the model
 /// searching for one.
 pub(crate) fn monitor_state_prose(p: &Value) -> String {
-    let state = match p.get("status").and_then(Value::as_str) {
-        Some("changed") => format!("monitor: {}", digest_prose(&p["since_your_last_call"])),
-        Some("armed") => {
-            "monitor armed: baseline set on this first digest call, nothing to compare against yet"
-                .to_string()
-        }
-        _ => {
-            let waited = p.get("waited_secs").and_then(Value::as_u64).unwrap_or(0);
-            format!("monitor: no change after {waited}s")
-        }
-    };
     let listing = jobs_listing_prose(p);
     if listing.is_empty() {
-        return state;
+        return "no delegate jobs".to_string();
     }
-    format!("{state}\n{listing}")
+    listing
 }
 
 /// The delegate jobs clauth is holding, one line each, or nothing at all when
@@ -1404,6 +1393,44 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
     Some(parts.join(", "))
 }
 
+/// The cost clause an envelope earns: ` (cost $X)`, ` (equivalent Anthropic API
+/// rate cost: $X)`, or ` (equivalent Anthropic API rate cost: $X, endpoint
+/// unknown)`, empty when the envelope carries no `total_cost_usd`.
+///
+/// `total_cost_usd` is the CHILD CLI's own figure, priced against Anthropic's
+/// card whatever endpoint served the call, so a DeepSeek or z.ai target's number
+/// is a wrong-basis figure a caller reads as the bill. Which endpoint answered
+/// is `delegate_call_endpoint`'s answer, arriving as data through the fold — this
+/// file derives no figure the JSON did not carry. Three readings, kept apart for
+/// the same reason `live_usage_prose` keeps its three.
+pub(crate) fn cost_clause(e: &Value) -> String {
+    let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) else {
+        return String::new();
+    };
+    let cost_s = fmt_cost(cost);
+    match e
+        .get("live_usage")
+        .and_then(|lu| lu.get("endpoint"))
+        .and_then(Value::as_str)
+    {
+        Some("anthropic") => format!(" (cost ${cost_s})"),
+        Some(_) => format!(" (equivalent Anthropic API rate cost: ${cost_s})"),
+        None => format!(" (equivalent Anthropic API rate cost: ${cost_s}, endpoint unknown)"),
+    }
+}
+
+/// Prose for a `result: "file"` reply: the path, the sha256, and the envelope's
+/// cost clause — the model Reads the file for the body.
+pub(crate) fn result_file_prose(path: &str, sha256: &str, e: &Value) -> String {
+    let mut out = format!("result written to {path} (sha256 {sha256})");
+    let cost = cost_clause(e);
+    if !cost.is_empty() {
+        out.push(';');
+        out.push_str(&cost);
+    }
+    out
+}
+
 /// Prose for a delegate envelope: the verdict (`finished` / `failed` / `timed
 /// out`), the self-report, cost and tokens, then the kill/resume markers. The
 /// raw envelope may carry more of claude's own fields; those stay in the JSON
@@ -1441,33 +1468,7 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
         _ => "unknown".to_string(),
     });
 
-    if let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) {
-        let cost_s = fmt_cost(cost);
-        // `total_cost_usd` is the CHILD CLI's own figure, priced against
-        // Anthropic's card whatever endpoint served the call, so a DeepSeek or
-        // z.ai target's number is a wrong-basis figure a caller reads as the
-        // bill. Which endpoint answered is `delegate_call_endpoint`'s answer,
-        // arriving as data through the fold — this file derives no figure the
-        // JSON did not carry.
-        //
-        // Three readings, kept apart for the same reason `live_usage_prose`
-        // keeps its three: only a POSITIVE `anthropic` earns the bare clause;
-        // a named other endpoint earns the equivalence clause, which states the
-        // figure is the Anthropic-card price; an unfolded envelope, or a target
-        // clauth could not classify, knows no name, so it keeps the clause and
-        // adds `endpoint unknown`.
-        match e
-            .get("live_usage")
-            .and_then(|lu| lu.get("endpoint"))
-            .and_then(Value::as_str)
-        {
-            Some("anthropic") => out.push_str(&format!(" (cost ${cost_s})")),
-            Some(_) => out.push_str(&format!(" (equivalent Anthropic API rate cost: ${cost_s})")),
-            None => out.push_str(&format!(
-                " (equivalent Anthropic API rate cost: ${cost_s}, endpoint unknown)"
-            )),
-        }
-    }
+    out.push_str(&cost_clause(e));
     if let Some(u) = e.get("usage") {
         let tokens = usage_prose(u);
         if !tokens.is_empty() {
@@ -1537,8 +1538,7 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
             .unwrap_or("unknown");
         let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
         // A raw start epoch carries no news a reader acts on; the JSON spelling
-        // keeps it. The handle's own spelling is unchanged: the bundled
-        // `asyncRewake` hook scans this prose for `d-<base36-ms>-<n>` tokens.
+        // keeps it. The handle's own spelling is unchanged.
         let mut out = format!("delegate to `{profile}` {status}, job `{job_id}`");
         if let Some(lu) = p.get("live_usage") {
             out.push_str("; ");
@@ -1585,10 +1585,10 @@ pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
 /// target's own headroom.
 ///
 /// The headroom clauses follow the id list rather than sitting inside each
-/// parenthesis: the ids and the account names are what the caller (and the
-/// `asyncRewake` hook) reads first, and a footer spliced between them would
-/// bury the handles. The digest is the reply's, not a row's: it is folded once
-/// at the top level, on `DigestMode`'s reporting rule.
+/// parenthesis: the ids and the account names are what the caller reads first,
+/// and a footer spliced between them would bury the handles. The digest is the
+/// reply's, not a row's: it is folded once at the top level, on `DigestMode`'s
+/// reporting rule.
 pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
     let jobs = p
         .get("jobs")
@@ -1661,14 +1661,7 @@ pub(crate) fn monitor_job_prose(p: &Value) -> String {
     if p.get("job_id").and_then(Value::as_str).is_some()
         && p.get("status").and_then(Value::as_str).is_some()
     {
-        return match p.get("status").and_then(Value::as_str) {
-            Some("blocking") => blocking_status_prose(p),
-            Some("stopped") => stopped_status_prose(p),
-            // `running` and any status a future arm adds before its prose arm
-            // exists: the running spelling is the safe fallback, and the
-            // explicit arms above are the split this rework added.
-            _ => running_status_prose(p),
-        };
+        return running_status_prose(p);
     }
     if let Some(lu) = p.get("live_usage") {
         let target = lu
@@ -1699,12 +1692,10 @@ pub(crate) fn monitor_job_prose(p: &Value) -> String {
 /// far each deadline still is, that account's headroom, and — on its own
 /// indented line — the newest thing the delegate wrote.
 ///
-/// A run can be missing either deadline and still be perfectly healthy — which
-/// shape drops which key is `running_payload`'s rule — so each absence is NAMED
-/// rather than left to read as a lost figure. Missing BOTH is the only case
-/// that means clauth is short a fact rather than reporting one: every deadline
-/// is recorded together at reserve time, so that job was started by a clauth
-/// which recorded neither.
+/// Output age always renders: every record heartbeats `last_output_at`, and a
+/// delegate has no deadlines anymore, so there is no pre-deadline-era record to
+/// special-case. A deadline countdown renders only where an OLD record still
+/// carries one; a new record simply omits it.
 pub(super) fn running_status_prose(p: &Value) -> String {
     let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
     let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
@@ -1717,23 +1708,15 @@ pub(super) fn running_status_prose(p: &Value) -> String {
         out.push_str(&format!(" on `{profile}`"));
     }
     out.push_str(&format!(", elapsed {elapsed}"));
-    let wall = p.get("wall_kill_in_secs").and_then(Value::as_u64);
-    let idle = p.get("idle_kill_in_secs").and_then(Value::as_u64);
-    if wall.is_none() && idle.is_none() {
-        out.push_str(", liveness not recorded (started under an older clauth)");
-    } else {
-        match p.get("last_output_secs_ago").and_then(Value::as_u64) {
-            Some(secs) => out.push_str(&format!(", last output {secs}s ago")),
-            None => out.push_str(", no output yet"),
-        }
-        match idle {
-            Some(secs) => out.push_str(&format!(", idle-kill in {secs}s")),
-            None => out.push_str(", no idle deadline"),
-        }
-        match wall {
-            Some(secs) => out.push_str(&format!(", wall-kill in {secs}s")),
-            None => out.push_str(", no wall clock"),
-        }
+    match p.get("last_output_secs_ago").and_then(Value::as_u64) {
+        Some(secs) => out.push_str(&format!(", last output {secs}s ago")),
+        None => out.push_str(", no output yet"),
+    }
+    if let Some(secs) = p.get("idle_kill_in_secs").and_then(Value::as_u64) {
+        out.push_str(&format!(", idle-kill in {secs}s"));
+    }
+    if let Some(secs) = p.get("wall_kill_in_secs").and_then(Value::as_u64) {
+        out.push_str(&format!(", wall-kill in {secs}s"));
     }
     if let Some(q) = p.get("quota") {
         out.push_str(&format!("; quota: {}", windows_prose(q)));
@@ -1754,56 +1737,6 @@ pub(super) fn running_status_prose(p: &Value) -> String {
 /// run, so no newline can break the block shape either.
 fn escape_quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// One asked job's verdict for a cancelling `monitor`'s opening line: what the
-/// wait OBSERVED, with the seconds that call actually waited for that job —
-/// never the grace constant. The id takes the module's backtick convention;
-/// the owner record fixes the words. Both spellings render here and nowhere
-/// else, so the fixed pair cannot drift.
-pub(super) fn kill_verdict(job_id: &str, killed: bool, waited_secs: u64) -> String {
-    if killed {
-        format!("killed `{job_id}` after {waited_secs}s")
-    } else {
-        format!("failed to kill `{job_id}` after {waited_secs}s")
-    }
-}
-
-/// One asked job's verdict for a cancelling `monitor` whose wait watched that
-/// job's blocking-run liveness record rather than a collectable one, with the
-/// seconds the call actually waited, like [`kill_verdict`]. `stopped`: the
-/// record vanished before the wait gave up, so the run has wound down; the
-/// other spelling: the record still stood when the wait ended, so the run is
-/// still stopping.
-pub(super) fn blocking_verdict(job_id: &str, stopped: bool, waited_secs: u64) -> String {
-    if stopped {
-        format!("stopped `{job_id}` after {waited_secs}s")
-    } else {
-        format!("`{job_id}` still stopping after {waited_secs}s")
-    }
-}
-
-/// The line a cancelling wait ticks while a blocking run's liveness record is
-/// all it can see: the id alone. An id-keyed read of liveness CONTENT stays
-/// forbidden by `RecordKind`'s contract, so the tick names the id and reads
-/// nothing of the record.
-pub(super) fn blocking_wait_prose(job_id: &str) -> String {
-    format!("waiting for blocking `delegate` `{job_id}` to stop")
-}
-
-/// The reply row for a blocking run whose liveness record still stood when the
-/// cancelling wait gave up: the run is stopping and nothing is collectable.
-pub(super) fn blocking_status_prose(p: &Value) -> String {
-    let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
-    format!("job `{job_id}` blocking: its run is still stopping; check again")
-}
-
-/// The reply row for a blocking run whose liveness record vanished mid-wait
-/// with no collectable record ever appearing: the run has ended, and its
-/// result went back through the call that started it.
-pub(super) fn stopped_status_prose(p: &Value) -> String {
-    let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
-    format!("job `{job_id}` stopped: its blocking run has ended and left nothing here to collect")
 }
 
 /// Prose for a `monitor` several-ids reply: one BLOCK per requested id, naming
@@ -1845,8 +1778,6 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
             match r.get("status").and_then(Value::as_str) {
                 Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),
                 Some("running") => running_status_prose(r),
-                Some("blocking") => blocking_status_prose(r),
-                Some("stopped") => stopped_status_prose(r),
                 _ => format!("job `{job_id}` unknown"),
             }
         })

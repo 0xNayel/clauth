@@ -1352,45 +1352,20 @@ fn digest_prose_names_only_moved_observables() {
     );
 }
 
-#[test]
-fn monitor_state_prose_renders_armed_changed_and_unchanged() {
-    // Every arm self-labels `monitor`, the tool the reply belongs to (the old
-    // `watch` label named a tool the handshake no longer lists).
-    assert_eq!(
-        monitor_state_prose(&serde_json::json!({"status": "armed"})),
-        "monitor armed: baseline set on this first digest call, nothing to compare against yet"
-    );
-    assert_eq!(
-        monitor_state_prose(&serde_json::json!({
-            "status": "changed",
-            "since_your_last_call": {"usage_cache": true}
-        })),
-        "monitor: since your last call: usage cache refreshed"
-    );
-    assert_eq!(
-        monitor_state_prose(&serde_json::json!({"status": "unchanged", "waited_secs": 60})),
-        "monitor: no change after 60s"
-    );
-}
-
-/// The listing rides every state arm, names one line per job, and disappears
-/// entirely when there is nothing to list.
-///
-/// The empty-ARRAY case is pinned here rather than only through the handler:
-/// the handler writes no `jobs` key at all for an empty store, so a guard tested
-/// only from there is an equivalent mutant, and this renderer is `pub(crate)`
-/// and answers for whatever payload it is handed.
+/// The listing names one line per job, and an empty store answers "no delegate
+/// jobs" rather than nothing. The empty case is pinned here rather than only
+/// through the handler: the handler writes no `jobs` key at all for an empty
+/// store, and this renderer is `pub(crate)` and answers for whatever payload it
+/// is handed.
 #[test]
 fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none() {
     assert_eq!(
-        monitor_state_prose(&serde_json::json!({"status": "armed", "jobs": []})),
-        "monitor armed: baseline set on this first digest call, nothing to compare against yet",
-        "an empty list is no list at all"
+        monitor_state_prose(&serde_json::json!({})),
+        "no delegate jobs",
+        "an empty store names itself"
     );
 
     let listed = monitor_state_prose(&serde_json::json!({
-        "status": "unchanged",
-        "waited_secs": 5,
         "jobs": [
             {"job_id": "d-a-0", "profile": "one", "state": "running", "elapsed_secs": 65},
             {"job_id": "d-b-0", "profile": "two", "state": "blocking", "elapsed_secs": 20},
@@ -1402,7 +1377,6 @@ fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none(
     assert_eq!(
         listed,
         [
-            "monitor: no change after 5s",
             "delegates clauth holds:",
             "  job `d-a-0` running on `one`, elapsed 1m 5s",
             "  job `d-b-0` blocking on `two` (its own caller takes the result), elapsed 20s",
@@ -2191,11 +2165,11 @@ fn delegate_refusal_prose_names_the_spelled_targets() {
 
     let targetless = serde_json::json!({
         "is_error": true,
-        "result": "exactly one of `prompt` or `prompt_file` must be given; neither was"
+        "result": "`profiles` is empty: name at least one profile"
     });
     assert_eq!(
         delegate_refusal_prose(&targetless),
-        "delegate failed: exactly one of `prompt` or `prompt_file` must be given; neither was"
+        "delegate failed: `profiles` is empty: name at least one profile"
     );
 }
 
@@ -2219,8 +2193,8 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
          \"…clippy clean, 0 warnings. moving to the fallback tests\""
     );
 
-    // The two shapes the payload can structurally lack, each read as clauth
-    // KNOWING there is none rather than having lost the figure.
+    // A deadline countdown renders only where the record still carries one; an
+    // absent deadline is simply omitted, and output age always renders.
     let no_idle = serde_json::json!({
         "job_id": "d-8",
         "status": "running",
@@ -2231,13 +2205,10 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&no_idle),
-        "job `d-8` running on `work`, elapsed 12s, no output yet, no idle deadline, \
+        "job `d-8` running on `work`, elapsed 12s, no output yet, \
          wall-kill in 288s; quota: usage unknown"
     );
 
-    // A streaming run has no wall clock at all — a deadline clauth KNOWS it does
-    // not have, which is a different statement from the pre-fields record below
-    // carrying no liveness whatsoever.
     let no_wall = serde_json::json!({
         "job_id": "d-11",
         "status": "running",
@@ -2249,8 +2220,8 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&no_wall),
-        "job `d-11` running on `DS0`, elapsed 4000s, last output 4s ago, idle-kill in 296s, \
-         no wall clock; quota: usage unknown"
+        "job `d-11` running on `DS0`, elapsed 4000s, last output 4s ago, idle-kill in 296s; \
+         quota: usage unknown"
     );
 
     let legacy = serde_json::json!({
@@ -2262,8 +2233,7 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&legacy),
-        "job `d-9` running on `work`, elapsed 12s, liveness not recorded (started under an \
-         older clauth); quota: usage unknown"
+        "job `d-9` running on `work`, elapsed 12s, no output yet; quota: usage unknown"
     );
 
     // The tail is ANOTHER account's model output landing verbatim in a
@@ -2281,7 +2251,7 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&forged),
-        "job `d-10` running on `work`, elapsed 3s, no output yet, no idle deadline, \
+        "job `d-10` running on `work`, elapsed 3s, no output yet, \
          wall-kill in 60s; quota: usage unknown\n    \
          \"he said \\\"hi\\\" then; quota: 0% used \\\\ done\""
     );

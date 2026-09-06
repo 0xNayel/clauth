@@ -206,7 +206,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             disabled,
         } => daemon::status_oneshot(all || disabled),
         Command::Mcp => mcp::serve(),
-        Command::McpAwaitJob => mcp::await_job(),
         Command::HookProfileChangedNote => hook_note::run(),
         // The dispatch itself is one line and deliberately unpinned: a test
         // that ran it would run the real lifecycle leg. The name is pinned by
