@@ -312,6 +312,11 @@ pub(crate) enum Command {
         profile: String,
     },
 
+    /// The bundled PostToolUse `asyncRewake` hook body: read the hook payload
+    /// on stdin, wait for a background delegate, and wake the model.
+    #[command(hide = true)]
+    McpAwaitJob,
+
     /// The bundled UserPromptSubmit / PostToolUse / SessionStart hook body: read
     /// the hook payload on stdin and tell the conversation when the account
     /// behind it changed.

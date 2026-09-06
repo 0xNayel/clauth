@@ -37,6 +37,7 @@ use serde::Deserialize;
 use sha2::Digest;
 
 use crate::logline::logline;
+use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::profile_json::{
@@ -2585,6 +2586,23 @@ fn render_done_envelope(
     (single_block(prose), is_error)
 }
 
+/// Poll cadence the `mcp-await-job` hook's wait runs at.
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Self-deadline for the `mcp-await-job` hook.
+///
+/// A delivery window, NOT a bound on the delegate: a streaming run has no wall
+/// clock, so no hook deadline can promise to outlast one and this number must
+/// not be read as trying to. It buys the common case — a run that finishes
+/// inside it is delivered without the model spending a turn — and on expiry the
+/// hook still exits 2, waking the model with a nudge to call `monitor`, so a
+/// longer run costs one deliberate check rather than a lost result.
+///
+/// Its own literal rather than a `MAX_RUN_TIMEOUT_SECS` offset, because that
+/// constant now bounds only what a caller may type. `plugins/hooks/hooks.json`
+/// carries the outer bound at 4260 s, and this must stay under it: the hook
+/// process is killed at that one, and a kill delivers nothing.
+const AWAIT_JOB_DEADLINE_SECS: u64 = 4200;
+
 /// Result of one read of a collectable job file.
 #[derive(Debug)]
 enum WaitOutcome {
@@ -4955,6 +4973,177 @@ async fn run_server(delegate_dot: bool) -> Result<()> {
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+pub(crate) fn await_job() -> ! {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let job_ids = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .as_ref()
+        .map(extract_job_ids)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| jobs::is_safe_job_id(id))
+        .collect::<Vec<_>>();
+    if job_ids.is_empty() {
+        std::process::exit(0); // sync delegate or unparseable input: nothing to deliver
+    }
+
+    let (delivered, pending) =
+        await_job_outcomes(&job_ids, Duration::from_secs(AWAIT_JOB_DEADLINE_SECS));
+    for envelope in &delivered {
+        // One line per delivered envelope, each opening with its account: a
+        // fan-out delivers N lines in one hook run; a bare cost figure names
+        // nobody to charge it to.
+        let profile = envelope
+            .get("live_usage")
+            .and_then(|lu| lu.get("profile"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        outln!(
+            "delegate to `{profile}` {}",
+            render::envelope_prose(envelope)
+        );
+    }
+    if delivered.is_empty() {
+        std::process::exit(0); // every id already gone: nothing was delivered
+    }
+    if pending.is_empty() {
+        std::process::exit(2); // wake the model with the result(s)
+    }
+    let noun = if pending.len() == 1 { "job" } else { "jobs" };
+    outln!(
+        "delegate {noun} `{}` still running; call `monitor` to retrieve {}",
+        pending.join("`, `"),
+        if pending.len() == 1 { "it" } else { "them" }
+    );
+    std::process::exit(2);
+}
+
+/// Poll every id in `job_ids` until each is `done` or gone, or `deadline`
+/// passes. Returns the delivered envelopes, folded the way every collect
+/// folds them ([`fold_done_envelope`]: live-usage footer, cost endpoint, and
+/// the no-envelope fallback), plus the ids still `running` at the deadline.
+/// A delivery claims its record ([`jobs::claim`]), so a `monitor` collect
+/// racing this wait owns the delivery and the hook drops that id; an absent
+/// id is dropped the same way (its file was GC'd or already collected).
+/// Blocking; the hook calls it directly on its own thread.
+fn await_job_outcomes(
+    job_ids: &[String],
+    deadline: Duration,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let start = Instant::now();
+    let mut delivered = Vec::new();
+    let mut pending: Vec<&String> = job_ids.iter().collect();
+    loop {
+        pending.retain(|id| match jobs::read(id) {
+            Some(r) if r.state == jobs::JobState::Done => {
+                // The claim owns the delivery: a `monitor` collect that reads
+                // `Done` in the same instant finds the file gone and answers
+                // its hedged unknown copy, so exactly one full envelope
+                // reaches the conversation.
+                match jobs::claim(id) {
+                    jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => {
+                        let (envelope, _is_error) = fold_done_envelope(&r, DigestMode::Skip);
+                        delivered.push(envelope);
+                        false
+                    }
+                    // Claimed between the read and the claim: a `monitor`
+                    // collect owns the delivery. Nothing to print, nothing
+                    // to wake — the collect's own reply reaches the model.
+                    jobs::Claim::Lost => false,
+                }
+            }
+            Some(_) => true, // still running: the loop exit decides on the deadline
+            None => false,
+        });
+        if pending.is_empty() || start.elapsed() >= deadline {
+            return (delivered, pending.into_iter().cloned().collect());
+        }
+        std::thread::sleep(JOB_POLL_INTERVAL);
+    }
+}
+
+/// Extract every background job id from a hook payload, preferring the
+/// documented `tool_response` slot so a delegate prompt that happens to carry a
+/// `job_id` can't shadow the real handles; fall back to a whole-payload scan
+/// only if that slot yields none (the exact shape is not host-guaranteed).
+fn extract_job_ids(payload: &serde_json::Value) -> Vec<String> {
+    let ids = payload
+        .get("tool_response")
+        .and_then(|tr| {
+            let found = find_job_ids(tr);
+            (!found.is_empty()).then_some(found)
+        })
+        .unwrap_or_else(|| find_job_ids(payload));
+    let mut seen: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !seen.contains(&id) {
+            seen.push(id);
+        }
+    }
+    seen
+}
+
+/// Recursively collect every job id from a hook-payload JSON, in document
+/// order. A string `job_id` field is collected wherever it sits; a string that
+/// is itself JSON is parsed and descended (the MCP tool result nests the
+/// response envelope as a JSON-encoded string), so this stays agnostic to the
+/// exact `tool_response` shape, which the host does not pin down.
+fn find_job_ids(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_job_ids(v, &mut out);
+    out
+}
+
+fn collect_job_ids(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            // A `job_id` value is the id itself, not a container to descend (and
+            // not text to scan): collected once, never re-scanned as a token.
+            let mut ids = Vec::new();
+            for (key, value) in map {
+                if key == "job_id" {
+                    ids.push(value);
+                } else {
+                    collect_job_ids(value, out);
+                }
+            }
+            for value in ids {
+                if let serde_json::Value::String(s) = value {
+                    out.push(s.clone());
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_job_ids(item, out);
+            }
+        }
+        serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(parsed) => collect_job_ids(&parsed, out),
+            // Not JSON: the prose spelling. `render::delegate_fanout_prose`
+            // carries no `job_id` KEY, so the `d-<base36-ms>-<n>` tokens it
+            // prints are the only way those jobs auto-arrive.
+            Err(_) => out.extend(scan_job_ids(s)),
+        },
+        _ => {}
+    }
+}
+
+/// Real job ids are `d-<base36-ms>-<n>`. Scan a plain string for such tokens so
+/// a prose tool reply still yields every job of a fan-out. The stamp is base-36
+/// rather than digits, so a lowercase `d-`-prefixed word such as `d-day-1` now
+/// matches too; that widening is deliberate — a length floor on the stamp would
+/// break the day the encoding width changes, and the digits-only gate already
+/// matched `d-2024-1`.
+fn scan_job_ids(s: &str) -> Vec<String> {
+    s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|token| token_is_job_id(token))
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
