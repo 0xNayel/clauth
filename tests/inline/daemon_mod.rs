@@ -1199,3 +1199,102 @@ fn the_rest_api_is_disabled_only_by_exactly_one() {
         });
     }
 }
+
+// ── publish_status: the switch-side republish ────────────────────────────────
+
+/// The feed currently sitting in the sandbox, as a `Value`.
+fn feed_on_disk() -> serde_json::Value {
+    let path = clauth_dir().expect("clauth dir").join("status.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).expect("read status.json"))
+        .expect("status.json is json")
+}
+
+/// Seed a feed the daemon could have written, naming `active` at `stamp`.
+fn seed_feed(active: &str, stamp: &str) {
+    let dir = clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("status.json"),
+        format!(r#"{{"schema":1,"generated_at":"{stamp}","active_profile":"{active}","pending_switch":null,"wrap_off":false,"refresh_interval_ms":120000,"profiles":[]}}"#),
+    )
+    .expect("seed status.json");
+}
+
+/// A switch landing outside the daemon republishes the feed, but keeps the
+/// daemon's last `generated_at`: readers (`clauth-tray`, the TUI's daemon dot)
+/// treat a fresh stamp as proof a daemon is alive, and stamping `now` from the
+/// CLI would forge that proof with no daemon running.
+#[test]
+fn a_non_daemon_publish_preserves_the_daemons_last_stamp() {
+    let _home = HomeSandbox::new();
+    let stamp = "2026-09-01T00:00:00+00:00";
+    seed_feed("alpha", stamp);
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "a-1"),
+            profile_with_creds("beta", "b-1"),
+        ],
+        Some("beta"),
+        120_000,
+    );
+
+    super::publish_status(&config);
+
+    let body = feed_on_disk();
+    assert_eq!(
+        body["generated_at"],
+        serde_json::json!(stamp),
+        "the stamp is the daemon's last write, not this publish's"
+    );
+    assert_eq!(body["active_profile"], serde_json::json!("beta"));
+}
+
+/// With nothing to preserve (no daemon has ever published here), the switch-side
+/// publish stamps the epoch rather than `now`: the file still names the account
+/// the operator switched to, while the staleness rule still reads "no daemon".
+#[test]
+fn a_non_daemon_publish_with_no_prior_feed_stamps_the_epoch() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "a-1")],
+        Some("alpha"),
+        120_000,
+    );
+
+    super::publish_status(&config);
+
+    let body = feed_on_disk();
+    assert_eq!(
+        body["generated_at"],
+        serde_json::json!("1970-01-01T00:00:00+00:00")
+    );
+    assert_eq!(body["active_profile"], serde_json::json!("alpha"));
+}
+
+/// The daemon-owned form (the one the API's own switch republishes through)
+/// stamps `now` even over an old file: a live daemon's write is itself the
+/// freshness signal, so stamp preservation belongs to `publish_status` alone.
+#[test]
+fn a_direct_feed_write_stamps_now() {
+    let _home = HomeSandbox::new();
+    let stamp = "2026-09-01T00:00:00+00:00";
+    seed_feed("alpha", stamp);
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "a-1"),
+            profile_with_creds("beta", "b-1"),
+        ],
+        Some("beta"),
+        120_000,
+    );
+
+    super::write_status_feed(&config, None);
+
+    let body = feed_on_disk();
+    assert_ne!(
+        body["generated_at"],
+        serde_json::json!(stamp),
+        "a daemon-side write is a freshness signal in itself"
+    );
+    assert_eq!(body["active_profile"], serde_json::json!("beta"));
+}

@@ -407,6 +407,11 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// the time this runs; the caller must not fail because a status file could not
 /// be written.
 ///
+/// The stamp is the daemon's, never this publish's: `generated_at` is how every
+/// reader (`clauth-tray`, the TUI's daemon dot) decides a daemon is alive, so
+/// the republish carries the daemon's last stamp forward, or the epoch when no
+/// daemon has ever published — see [`prior_generated_at`].
+///
 /// Call it OUTSIDE the switch's `with_state_lock`, the way every caller in
 /// `actions` does: [`build_status`] stats and reads each profile's caches and
 /// sweeps the session flocks, and that disk work has no business extending the
@@ -415,7 +420,23 @@ pub(crate) fn publish_status(config: &AppConfig) {
     if singleton_held().unwrap_or(false) {
         return;
     }
-    write_status_feed(config, None);
+    let stamp = prior_generated_at().unwrap_or_else(|| crate::usage::epoch_secs_to_iso(0));
+    write_status_feed_with_stamp(config, None, Some(&stamp));
+}
+
+/// The daemon's last `generated_at`, read off the feed this publish replaces.
+///
+/// `None` when no feed is on disk or it does not parse: no daemon has ever
+/// published here, and the caller answers that with the epoch, which every
+/// staleness rule reads as "no daemon".
+fn prior_generated_at() -> Option<String> {
+    let Ok(dir) = clauth_dir() else { return None };
+    let body = std::fs::read(dir.join(STATUS_FILE)).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()?
+        .get("generated_at")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Rewrite `status.json` from `config`, unconditionally.
@@ -434,7 +455,22 @@ pub(crate) fn publish_status(config: &AppConfig) {
 /// back to the mtime derivation until the next tick overwrote them.
 ///
 /// Best-effort and lock-placement rules are [`publish_status`]'s.
+///
+/// Stamps `generated_at` now: the daemon's own spelling, and itself the
+/// freshness signal. The non-daemon republish must not mint one, so it goes
+/// through [`write_status_feed_with_stamp`] with the preserved daemon stamp.
 pub(crate) fn write_status_feed(config: &AppConfig, live: Option<&LiveSignals>) {
+    write_status_feed_with_stamp(config, live, None);
+}
+
+/// [`write_status_feed`] with `generated_at` overridden: `None` stamps now;
+/// `Some` carries a stamp the caller owns — only [`publish_status`], which
+/// preserves the daemon's last write rather than forging a live one.
+fn write_status_feed_with_stamp(
+    config: &AppConfig,
+    live: Option<&LiveSignals>,
+    generated_at: Option<&str>,
+) {
     let Ok(dir) = clauth_dir() else { return };
     if let Err(e) = mkdir_700(&dir) {
         logline!(
@@ -443,7 +479,15 @@ pub(crate) fn write_status_feed(config: &AppConfig, live: Option<&LiveSignals>) 
         );
         return;
     }
-    let body = build_status(config, config.state.refresh_interval_ms, live, false);
+    let mut body = build_status(config, config.state.refresh_interval_ms, live, false);
+    // The backdate this applies is the one deliberate exception to
+    // `build_status`'s "the stamp never precedes a per-entry verdict instant"
+    // ordering: a non-daemon publish carries a daemon's OLD stamp over entries
+    // built now, which is the point — stamp freshness must keep meaning
+    // "a daemon wrote this", never "some process did".
+    if let (Some(field), Some(stamp)) = (body.get_mut("generated_at"), generated_at) {
+        *field = serde_json::json!(stamp);
+    }
     match serde_json::to_vec_pretty(&body) {
         Ok(json) => {
             if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), &json) {
