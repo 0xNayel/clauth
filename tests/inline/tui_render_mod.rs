@@ -454,8 +454,93 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
         "api account with a key shows a log-out row:\n{out}",
     );
     assert!(
-        out.contains("re-enter the base url"),
+        out.contains("re-enter the base URL"),
         "the login row's hint describes the API re-entry:\n{out}",
+    );
+}
+
+/// The Setup picker ends in exactly one trailing row (`+ new`), and the
+/// create form carries `+ capture current login` under `+ login` while the
+/// live login is unowned — flipping to its ✓ done state once stashed, and
+/// gone entirely when no live login is unsaved.
+#[test]
+fn new_form_renders_the_capture_row_and_its_done_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::actions::CaptureSnapshot;
+    use crate::tui::app::{ConfigRow, DraftLogin, Tab, build_draft_new, config_rows};
+
+    // A plain live credentials file, as `claude` itself leaves it.
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "live-access".to_string(),
+                refresh_token: Some("live-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut app = App::new(config);
+    app.refresh_unsaved_live_login();
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.profile_cursor = 0; // the `+ new` form
+
+    // Park the cursor on the capture row so its hint renders too.
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::CaptureLogin)
+        .expect("the capture row renders for an unowned live login");
+
+    let out = dump(&app, 120, 30);
+    assert!(
+        !out.contains("+ new from"),
+        "the picker carries no second trailing row:\n{out}"
+    );
+    assert!(
+        out.contains("+ capture current login"),
+        "the form carries the capture row under `+ login`:\n{out}"
+    );
+    assert!(
+        out.contains("save the current global credentials into a new account"),
+        "the capture row's hint explains what ⏎ stashes:\n{out}"
+    );
+
+    // Stashed: the ✓ done state, same pattern as `✓ logged in`.
+    let mut draft = build_draft_new();
+    draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+        credentials: None,
+        base_url: None,
+        api_key: None,
+        account_uuid: None,
+    })));
+    app.config_draft = Some(draft);
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("✓ captured current login"),
+        "a stashed snapshot renders the done state:\n{out}"
+    );
+
+    // No unsaved live login: no row at all.
+    app.config_draft = None;
+    app.unsaved_live_login = false;
+    let out = dump(&app, 120, 30);
+    assert!(
+        !out.contains("capture current login"),
+        "a saved or absent live login hides the row:\n{out}"
     );
 }
 

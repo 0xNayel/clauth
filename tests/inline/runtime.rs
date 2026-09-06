@@ -4030,20 +4030,19 @@ fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {
     );
 }
 
-/// The CEILING, as a relation between two independently-derived constants rather
-/// than a second literal: the pre-spawn wait is silent on the wire, so it has to
-/// end before the MCP peer that cannot receive progress gives up on the call. A
-/// deadline past that turns clauth's named refusal into the client's opaque abort,
-/// which is the outcome the bound exists to remove.
+/// The CEILING, as a relation between the wait and the host's own silence
+/// tolerance rather than a second literal: the pre-spawn wait is silent on the
+/// wire, so it has to end before Claude Code's 30-minute stdio idle abort
+/// gives up on the call. A deadline past that turns clauth's named refusal
+/// into the client's opaque abort, which is the outcome the bound exists to
+/// remove.
 #[test]
-fn the_rotation_deadline_ends_before_a_silent_mcp_peer_gives_up() {
+fn the_rotation_deadline_ends_before_the_host_idles_out_a_silent_call() {
     assert!(
-        crate::runtime::ROTATION_LOCK_TIMEOUT
-            < Duration::from_secs(crate::mcp::MAX_WAIT_SECS_NO_PROGRESS),
-        "the rotation wait must end inside the silence budget of a peer that \
-         cannot be sent progress: {:?} against {}s",
+        crate::runtime::ROTATION_LOCK_TIMEOUT < Duration::from_secs(1800),
+        "the rotation wait must end inside the silence budget of the host's \
+         30-minute stdio idle abort: {:?} against 1800s",
         crate::runtime::ROTATION_LOCK_TIMEOUT,
-        crate::mcp::MAX_WAIT_SECS_NO_PROGRESS,
     );
 }
 

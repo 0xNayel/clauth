@@ -83,6 +83,8 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 
 ## Setup tab rows
 
+The account list ends in an action row: `+ new`, which turns this pane into the create form. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed.
+
 | Row | Sets |
 |-----|------|
 | `status` | read-only, and present only while the account is disabled |
