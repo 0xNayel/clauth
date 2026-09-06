@@ -2309,6 +2309,9 @@ fn listing_row(job: &jobs::StoredJob, now: u64) -> serde_json::Value {
     } else {
         row["since_secs"] = serde_json::json!(job.age_secs(now));
     }
+    if let Some(sid) = &job.record.session_id {
+        row["session_id"] = serde_json::json!(sid);
+    }
     row
 }
 

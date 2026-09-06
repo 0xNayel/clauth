@@ -733,6 +733,15 @@ fn jobs_listing_prose(p: &Value) -> String {
         if state == "blocking" {
             out.push_str(" (its own caller takes the result)");
         }
+        // The orphaned row is the one where the session id is the only handle
+        // left: the server that wrote the record is gone. On a running row it
+        // would invite resuming a session the live run still holds, so it stays
+        // unsaid there — the JSON row still carries the key either way.
+        if state == "orphaned"
+            && let Some(sid) = row.get("session_id").and_then(Value::as_str)
+        {
+            out.push_str(&format!("; resume with session id `{sid}`"));
+        }
         out.push_str(&age_phrase(row));
     }
     // Guarded here as well as at the producer, because the only-when-true rule

@@ -6834,7 +6834,15 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
     .unwrap();
     seed_done_at("d-fin-0", "acct", now - 900_000, now - 90_500, "");
     // Silent past the corpse window, which is what makes a record an orphan.
-    seed_running("d-dead-0", "acct", now - jobs::RUNNING_TTL_MS - 200_500);
+    // Heartbeat spelling, because a session id rides the heartbeat alone.
+    let orphan_spec = running_spec("d-dead-0", "acct", now - jobs::RUNNING_TTL_MS - 200_500);
+    jobs::write_heartbeat_with_session(
+        &orphan_spec,
+        now - jobs::RUNNING_TTL_MS - 200_500,
+        "",
+        Some("6cc9c767-1cc3-4e77-a787-a7f8a6d41515"),
+    )
+    .unwrap();
 
     let text = monitor_state_text();
     let line = |id: &str| -> String {
@@ -6857,12 +6865,38 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
     // An orphan by when anything last wrote to it.
     assert_eq!(
         line("d-dead-0").trim(),
-        "job `d-dead-0` orphaned on `acct`, last seen 1d 0h ago",
+        "job `d-dead-0` orphaned on `acct`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1d 0h ago",
     );
     // And the two dead ones carry no elapsed figure — asserted per LINE, so the
     // live row's own `elapsed` cannot satisfy it.
     for id in ["d-fin-0", "d-dead-0"] {
         assert!(!line(id).contains("elapsed"), "{}", line(id));
+    }
+    // The JSON row carries the resume handle the orphaned prose renders —
+    // pinned here at the producer, while the renderer test pins the prose.
+    // The seed uses the heartbeat spelling because that is the only writer
+    // a running record's `session_id` has.
+    let mut payload = serde_json::json!({});
+    fold_jobs_listing(&mut payload, now);
+    let rows = payload["jobs"].as_array().unwrap();
+    let dead = rows
+        .iter()
+        .find(|r| r["job_id"].as_str() == Some("d-dead-0"))
+        .unwrap();
+    assert_eq!(
+        dead["session_id"].as_str(),
+        Some("6cc9c767-1cc3-4e77-a787-a7f8a6d41515"),
+        "the handle lives on the JSON row the orphaned prose renders from"
+    );
+    for id in ["d-blk-0", "d-fin-0"] {
+        let row = rows
+            .iter()
+            .find(|r| r["job_id"].as_str() == Some(id))
+            .unwrap();
+        assert!(
+            row.get("session_id").is_none(),
+            "seeds that carry no session id keep the key absent"
+        );
     }
 }
 

@@ -1389,6 +1389,44 @@ fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none(
     );
 }
 
+/// An orphaned listing row carries the run's session id, because the orphan
+/// case is the one where the operator has no other handle: the server that
+/// was writing the record is gone, and the resume id is the only way back
+/// into the run's transcript. A RUNNING row carries none of this: its session
+/// is still held by the live run, and inviting a resume onto a session the
+/// run still holds is the collision the row deliberately does not offer.
+#[test]
+fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
+    let listed = monitor_state_prose(&serde_json::json!({
+        "jobs": [
+            {
+                "job_id": "d-a-0",
+                "profile": "one",
+                "state": "running",
+                "elapsed_secs": 65,
+                "session_id": "held-by-the-live-run",
+            },
+            {
+                "job_id": "d-d-0",
+                "profile": "four",
+                "state": "orphaned",
+                "since_secs": 4000,
+                "session_id": "6cc9c767-1cc3-4e77-a787-a7f8a6d41515",
+            },
+        ],
+    }));
+    assert_eq!(
+        listed,
+        [
+            "delegates clauth holds:",
+            "  job `d-a-0` running on `one`, elapsed 1m 5s",
+            "  job `d-d-0` orphaned on `four`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1h 6m ago",
+        ]
+        .join("\n"),
+        "only the orphaned row offers the handle, and the age phrase stays the row's tail"
+    );
+}
+
 /// Zero is a real value on every one of these spans, and `humanize_duration`
 /// spells it `now` — which renders `elapsed now` and `finished now ago`.
 ///
