@@ -949,7 +949,7 @@ fn the_connection_cap_admits_up_to_the_limit_and_releases_on_drop() {
     drop(reopened);
 }
 
-/// The listener's failures have to be reachable BEFORE the singleton claim.
+/// The certificate failure has to be reachable BEFORE the singleton claim.
 ///
 /// `--replace` terminates the running daemon as part of claiming, so a
 /// certificate that fails to load after that point takes the incumbent down and
@@ -980,7 +980,7 @@ fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
     .expect("write tls.json");
 
     // Matched rather than `expect_err`: that needs `Debug` on the success type,
-    // and `Prepared` holds a bound socket and a rustls config — not a thing to
+    // and `Prepared` holds a rustls config — not a thing to
     // give a derived formatter to for a test's convenience.
     let Err(err) = super::prepare(
         "127.0.0.1:0".parse().expect("addr"),
@@ -993,4 +993,62 @@ fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
         msg.contains(&empty.path().display().to_string()) || msg.contains(".crt"),
         "the failure names the path the operator has to fix: {msg}"
     );
+}
+
+/// `prepare` reads the certificate and mints the token, and binds nothing: the
+/// bind belongs below the singleton claim, where the port is winnable, so a
+/// prepared-but-not-yet-serving listener leaves its port answering
+/// `ConnectionRefused`.
+#[test]
+fn prepare_leaves_the_port_unbound() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some((paths, _ca)) = generate_chain(dir.path()) else {
+        return;
+    };
+    // A concrete port, picked by binding and dropping: prepare must leave it
+    // exactly as free as it found it.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+
+    let _prepared = super::prepare(addr, &crate::daemon::api::tls::CertSource::Explicit(paths))
+        .expect("a valid certificate prepares");
+
+    let refused = std::net::TcpStream::connect(addr).expect_err("nothing bound the port");
+    assert!(
+        matches!(refused.kind(), std::io::ErrorKind::ConnectionRefused),
+        "prepare must not bind: {refused}"
+    );
+}
+
+/// The default mode's contract against a live daemon: losing the boot race is
+/// the desired end state, so a second `--listen` instance exits 0 rather than
+/// dying on the port the incumbent holds. The singleton and the port are held
+/// exactly as the incumbent holds them; the bind sits below the claim, so the
+/// redundant instance never reaches it.
+#[test]
+fn a_second_listener_instance_yields_to_the_daemon_holding_the_port() {
+    let _home = HomeSandbox::new();
+    let certdir = tempfile::tempdir().expect("tempdir");
+    let Some((paths, _ca)) = generate_chain(certdir.path()) else {
+        return;
+    };
+    let incumbent_port = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = incumbent_port.local_addr().expect("addr");
+    let dir = crate::profile::clauth_dir().expect("dir");
+    // `serve` would create this; the claim has to run before it, so the test
+    // stands the dir up itself.
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.clauth");
+    let _incumbent = match crate::daemon::probe::claim_singleton(&dir, false).expect("claim") {
+        crate::daemon::probe::Claim::Active(lock) => lock,
+        _ => panic!("an uncontended sandbox must yield an active claim"),
+    };
+
+    crate::daemon::serve(
+        crate::daemon::StartMode::ExitIfRunning,
+        Some(addr),
+        &crate::daemon::api::tls::CertSource::Explicit(paths),
+    )
+    .expect("a redundant listener instance exits 0, not a bind error");
 }

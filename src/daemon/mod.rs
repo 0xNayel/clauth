@@ -191,18 +191,17 @@ pub(crate) fn serve(
     // every instance after the first.
     mkdir_700(&dir).context("failed to create ~/.clauth")?;
 
-    // The listener's two failure modes — an unreadable certificate and a port
-    // already taken — are settled BEFORE the claim below, because the claim is
-    // what terminates the incumbent under `--replace`. Failing after it would
-    // leave the host with no daemon at all: no refresh, no auto-switch, not
-    // merely no listener. See `api::prepare`.
-    let prepared = match listen {
-        Some(addr) if api_enabled() => Some(api::prepare(addr, certs)?),
-        Some(addr) => {
-            logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
-            None
-        }
-        None => None,
+    // The listener's unreadable certificate is settled BEFORE the claim below,
+    // because the claim is what terminates the incumbent under `--replace`.
+    // Failing after it would leave the host with no daemon at all: no refresh,
+    // no auto-switch, not merely no listener. The bind deliberately does NOT
+    // happen here: it runs below the claim (and below a standby's promotion) in
+    // `api::serve_prepared`, where the incumbent's port is free and a redundant
+    // instance never reaches a bind at all.
+    let (prepared, no_api) = match listen {
+        Some(addr) if api_enabled() => (Some(api::prepare(addr, certs)?), None),
+        Some(addr) => (None, Some(addr)),
+        None => (None, None),
     };
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
@@ -240,9 +239,16 @@ pub(crate) fn serve(
 
     // After `boot` (the stores are seeded and the scheduler is up, so a request
     // arriving immediately gets real numbers) and before `run` (which never
-    // returns). Nothing here can fail on a certificate or a busy port — both
-    // were settled by `api::prepare` above the claim — so a listener that got
-    // this far starts.
+    // returns). The certificate was settled by `api::prepare` above the claim;
+    // the bind happens here for the first time, on a port that is winnable
+    // exactly now: the incumbent under `--replace` is dead, and a promoted
+    // standby holds the claim it parked for.
+    if let Some(addr) = no_api {
+        // Said here rather than above the claim so a redundant instance cannot
+        // print it and then "already running": two lines from a process that
+        // did nothing.
+        logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
+    }
     if let Some(prepared) = prepared {
         api::serve_prepared(
             prepared,

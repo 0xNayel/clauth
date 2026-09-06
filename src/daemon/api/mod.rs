@@ -148,27 +148,22 @@ fn claim_slot() -> Option<ConnectionSlot> {
     None
 }
 
-/// Start the listener. Returns once it is bound and its accept thread is
-/// running; the daemon's main loop carries on.
+/// Everything the listener needs except the socket, done before anything is at
+/// stake: the certificate is read and the token minted.
 ///
-/// Every failure here is fatal to the daemon by design (the caller propagates
-/// it): the operator asked for a listener, and a daemon that silently ran
-/// without one — no certificate, port already taken — would look healthy while
-/// the remote client stayed dark.
-/// Everything that can FAIL about the listener, done before anything is at
-/// stake: the certificate is read and the socket is bound.
-///
-/// Split from [`serve_prepared`] so `daemon::serve` can run it BEFORE claiming
-/// the singleton. Under `--replace` the claim terminates the running daemon, so
-/// a certificate that had just been renewed badly used to take the incumbent
-/// down and then abort — leaving the host with no daemon at all, and with it no
-/// refresh and no auto-switch, not merely no listener. `wiki/Daemon.md`
-/// recommends `clauth daemon --replace --listen` as the post-`lego renew` hook,
-/// which makes the documented automation the trigger. Prepared first, a bad
-/// renewal is a no-op: the incumbent keeps running.
+/// Split from [`serve_prepared`] so `daemon::serve` can settle the certificate
+/// BEFORE claiming the singleton. Under `--replace` the claim terminates the
+/// running daemon, so a certificate that had just been renewed badly used to
+/// take the incumbent down and then abort — leaving the host with no daemon at
+/// all, and with it no refresh and no auto-switch, not merely no listener.
+/// `wiki/Daemon.md` recommends `clauth daemon --replace --listen` as the
+/// post-`lego renew` hook, which makes the documented automation the trigger.
+/// Settled first, a bad renewal is a no-op: the incumbent keeps running.
+/// The cost of reading this early is a `--standby` instance's park: it carries
+/// the config built here through an unbounded wait, so a renewal that lands
+/// while it parks reaches the promoted daemon only at its next restart.
 pub(crate) struct Prepared {
     listen: SocketAddr,
-    listener: TcpListener,
     tls_config: Arc<rustls::ServerConfig>,
     auth: AuthToken,
 }
@@ -178,19 +173,23 @@ pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Pre
     // digest.
     let auth = AuthToken::from_plaintext(&token::load_or_create()?);
     let tls_config = tls::server_config(certs)?;
-    let listener = TcpListener::bind(listen)
-        .with_context(|| format!("failed to bind the REST API to {listen}"))?;
     Ok(Prepared {
         listen,
-        listener,
         tls_config,
         auth,
     })
 }
 
-/// Start serving on an already-[`prepare`]d listener. Only the accept thread's
-/// creation can fail here, and that failure is not one a certificate or a busy
-/// port can cause.
+/// Bind the listener [`prepare`] set up, and start serving on it.
+///
+/// The bind deliberately happens here, below the singleton claim and below a
+/// standby's promotion: above the claim, `--replace --listen` died on the port
+/// its dying incumbent still held, a plain second instance exited non-zero on
+/// a boot race its contract says it wins by yielding, and a parked standby held
+/// a listening socket nothing accepted on for the whole park. Every failure
+/// here is fatal to the daemon by design (the caller propagates it): the
+/// operator asked for a listener, and a daemon that silently ran without one
+/// would look healthy while the remote client stayed dark.
 pub(crate) fn serve_prepared(
     prepared: Prepared,
     config: ConfigHandle,
@@ -199,10 +198,11 @@ pub(crate) fn serve_prepared(
 ) -> Result<()> {
     let Prepared {
         listen,
-        listener,
         tls_config,
         auth,
     } = prepared;
+    let listener = TcpListener::bind(listen)
+        .with_context(|| format!("failed to bind the REST API to {listen}"))?;
     let ctx = ApiContext::new(config, status_path, auth, Some(live));
 
     let spawned = std::thread::Builder::new()
