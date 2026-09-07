@@ -1157,10 +1157,14 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
 ///
 /// `Lego` (not a generated chain) and no `HomeSandbox` on purpose: under the
 /// opt-out the decision never reads the certificate or the token file, so the
-/// arm is decided by the env var alone — and a regression that DID reach the
-/// cert read would fail here by erroring on an unreadable certificate, which
-/// is also a red. A sandbox would deadlock the guard: `HomeSandbox` holds
-/// `HOME_TEST_LOCK` for the test's life and `with_no_api_env` takes it again.
+/// arm is decided by the env var alone. The pin's RED CHAIN is the token mint:
+/// `prepare` mints the token (which resolves `home_dir()`) BEFORE it reads the
+/// certificate, so a regression that deletes the guard dies at the mint's
+/// sandbox panic — "test resolved the operator's real home" — before any
+/// certificate is consulted. Both `assert`s never evaluate on that edit; the
+/// panic is the red, and a legitimate one. A sandbox would deadlock the guard
+/// another way: `HomeSandbox` holds `HOME_TEST_LOCK` for the test's life and
+/// `with_no_api_env` takes it again.
 #[test]
 fn the_kill_switch_suppresses_the_listener_at_the_start_path() {
     with_no_api_env(Some("1"), || {

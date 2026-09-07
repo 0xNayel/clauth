@@ -287,6 +287,36 @@ fn a_wait_skips_a_feed_that_does_not_parse() {
     assert_eq!(resp.etag.as_deref(), Some(tag.as_str()));
 }
 
+/// The plain conditional GET holds the same guard: a feed caught mid-replacement
+/// is rebuilt from config rather than answered with the truncated bytes, so no
+/// path serves a torn body. The 200 below is a REBUILT body (the seeded config's
+/// `alpha` account), never the half-written file.
+#[test]
+fn a_plain_get_rebuilds_rather_than_serving_a_torn_feed() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let tag = current_tag(&ctx);
+
+    // Half a feed: what a non-atomic writer leaves readable mid-write.
+    write_feed(
+        &ctx,
+        r#"{"schema":1,"generated_at":"2026-09-02T06:00:00+00:00","active_prof"#,
+    );
+
+    let resp = handle(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
+    assert_eq!(resp.status, 200, "a torn feed is rebuilt, not skipped");
+    // Parsed BEFORE the field asserts, so the pin's red under a regression is
+    // the assertion on the answer, not a harness expect unwinding on garbage.
+    let body: serde_json::Value =
+        serde_json::from_slice(&resp.body).expect("the rebuilt body is whole, parseable JSON");
+    assert_eq!(
+        body["active_profile"], "alpha",
+        "the answer is the rebuilt body, never the truncated file bytes"
+    );
+    assert_eq!(body["schema"], serde_json::json!(1));
+}
+
 // ---------------------------------------------------------------- auth
 
 /// Every route, health included. An unauthenticated caller learns only that

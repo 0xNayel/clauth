@@ -333,6 +333,59 @@ fn the_live_read_refusal_is_logged_once_not_per_read() {
     );
 }
 
+/// The OTHER half of the split: a read error that is NOT the tier refusal must
+/// answer 500, never 503. A blanket-503 edit would tell the operator to run a
+/// newer clauth against a full disk. The only production trigger is a home that
+/// will not resolve; no harness reaches that (the sandbox panics first), so the
+/// arm is driven through the test seam.
+#[test]
+fn the_route_answers_internal_for_a_read_error_that_is_not_the_tier() {
+    let _home = HomeSandbox::new();
+    let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+        crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: Vec::new(),
+        },
+    ));
+    let status_path = token_path().expect("path").with_file_name("status.json");
+    let ctx = crate::daemon::api::routes::ApiContext::new(
+        config,
+        status_path,
+        AuthToken::from_plaintext(&"e".repeat(64)),
+        None,
+    );
+
+    fail_next_home_once();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let resp = crate::daemon::api::routes::handle(
+        &ctx,
+        &crate::daemon::api::http::Request {
+            method: "GET".to_string(),
+            path: "/api/v1/health".to_string(),
+            query: String::new(),
+            bearer: Some("e".repeat(64)),
+            if_none_match: None,
+            body: Vec::new(),
+            keep_alive: true,
+        },
+    );
+    assert_eq!(resp.status, 500, "a non-tier read failure is internal");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&resp.body).expect("json")["error"],
+        serde_json::json!("internal")
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("until the token file is readable"))
+            .count(),
+        1,
+        "the operator gets one line naming the failing read, not zero"
+    );
+}
+
 #[test]
 fn verify_accepts_the_exact_token_only() {
     let token = generate().expect("generate");

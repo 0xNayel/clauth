@@ -1225,9 +1225,15 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
         "the failure names the path the operator has to fix: {err:#}"
     );
 
-    // THE assertion: the incumbent is still the holder. `claim_by_replacing`
-    // terminates the holder, so if the claim had run before the failure the
-    // flock would be released and a fresh claim would succeed. It must not.
+    // THE assertion: the incumbent is still the holder. Under the order-flip
+    // regression this reads Redundant only via the incumbent FLOCK staying
+    // held: the incumbent here is this test's own process, which does not run
+    // as `clauth daemon` by argv, so `claim_by_replacing` would bail at the
+    // pid identity guard before signalling anything, and the flock is never
+    // released either way. The pin's true red is the error-text assert above —
+    // under the regression the bind dies above the claim and `serve` returns
+    // Ok. This assert stays as the second-order guard it is: it holds whenever
+    // the first one has already reddened the run.
     let second = crate::daemon::probe::claim_singleton(&dir, false).expect("second claim");
     assert!(
         matches!(second, crate::daemon::probe::Claim::Redundant),

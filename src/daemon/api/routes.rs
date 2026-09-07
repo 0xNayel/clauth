@@ -73,6 +73,10 @@ impl ApiContext {
 /// (it answers 401 rather than refusing the connection), which is all a liveness
 /// probe needs, and nothing else leaks — not the version, not an account name.
 pub(crate) fn handle(ctx: &ApiContext, req: &Request) -> Response {
+    // One-shot latch for the 500 arm below: the read runs per request, so an
+    // unlatched line would be one line per request for the daemon's life.
+    static READ_FAILED_NOTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     // Against the token as it is on disk NOW, not the one captured at spawn, so
     // `clauth daemon --rotate-token` takes effect against a running daemon. An
     // unknown tier written by a newer build is the one read that refuses rather
@@ -85,7 +89,16 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request) -> Response {
         {
             return Response::error(503, "token_tier_unknown");
         }
-        Err(_) => return Response::error(500, "internal"),
+        Err(e) => {
+            // The per-request summary line names the route and status only, so
+            // the cause has to be carried by this one line or nowhere.
+            if !READ_FAILED_NOTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                logline!(
+                    "clauth api: refusing every request until the token file is readable: {e:#}"
+                );
+            }
+            return Response::error(500, "internal");
+        }
     };
     if !req.bearer.as_deref().is_some_and(|t| live.verify(t)) {
         return Response::unauthorized();
@@ -147,7 +160,14 @@ fn status(ctx: &ApiContext, req: &Request) -> Response {
         if let (Some(wait), Some(tag)) = (waited, req.if_none_match.as_deref()) {
             return wait_for_status_change(ctx, tag, wait);
         }
-        if let Ok(body) = std::fs::read(&ctx.status_path) {
+        // A body caught mid-replacement never reaches the client here either:
+        // it does not parse, so the read falls through to the rebuild below —
+        // the same answer a missing file gets — instead of handing out the
+        // truncated bytes with a tag fabricated from them, the one shape the
+        // wait loop already refuses.
+        if let Ok(body) = std::fs::read(&ctx.status_path)
+            && serde_json::from_slice::<serde_json::Value>(&body).is_ok()
+        {
             let etag = etag_for(&body);
             if req.if_none_match.as_deref() == Some(etag.as_str()) {
                 return Response::not_modified(etag);

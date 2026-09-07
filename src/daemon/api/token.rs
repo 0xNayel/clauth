@@ -164,6 +164,17 @@ pub(crate) fn is_well_formed(token: &str) -> bool {
 /// about a bad file would be a line per request; the replacement is announced by
 /// [`load_or_create`], which is the only place a replacement actually happens.
 fn read_valid() -> Result<Option<String>> {
+    // Test seam: see [`FAIL_NEXT_HOME`]. Entry, not the path derivation, so
+    // the `Err` rides the same return the route dispatches on — in a test
+    // build an unresolvable home panics at `home_dir()` (the sandbox rule)
+    // rather than yielding the `Err`, so the arm has no other driver.
+    #[cfg(test)]
+    if FAIL_NEXT_HOME.swap(false, Ordering::AcqRel) {
+        return Err(anyhow::anyhow!(
+            "failed to resolve the clauth home for {}",
+            TOKEN_FILE
+        ));
+    }
     let path = token_path()?;
     let Ok(body) = std::fs::read_to_string(&path) else {
         return Ok(None);
@@ -209,6 +220,20 @@ fn read_valid() -> Result<Option<String>> {
 pub(crate) fn reset_schema_note_for_tests() {
     SCHEMA_NOTED.store(false, Ordering::Release);
     TIER_REFUSED.store(false, Ordering::Release);
+}
+
+/// Test-only: fail the next [`read_valid`] call outright, so a test can drive
+/// [`current_or`]'s non-tier `Err` arm — the one whose only production trigger
+/// is a home that will not resolve (a missing `~/.clauth`, an unnameable
+/// path), which no harness reaches because `home_dir()` panics first in a test
+/// build. One-shot on the same `swap` shape as every latch here.
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_HOME: AtomicBool = AtomicBool::new(false);
+
+/// Test-only arm of [`FAIL_NEXT_HOME`].
+#[cfg(test)]
+pub(crate) fn fail_next_home_once() {
+    FAIL_NEXT_HOME.store(true, Ordering::Release);
 }
 
 /// The token as it stands on disk RIGHT NOW, falling back to `spawned` when the

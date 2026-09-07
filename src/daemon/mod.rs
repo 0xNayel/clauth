@@ -423,6 +423,17 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// the republish carries the daemon's last stamp forward, or the epoch when no
 /// daemon has ever published — see [`prior_generated_at`].
 ///
+/// The probe-read-write is deliberately unserialized. The race it admits — a
+/// daemon's first tick landing between this probe and this write — costs one
+/// stamp at worst: the daemon's next tick (at most a second later) republishes
+/// with a fresh stamp over the same body, so the forged-fresh window is one
+/// tick, and the daemon's OWN writer never sees this write at all (it builds
+/// its body from its in-memory signals, not the file). Flocking the sequence
+/// would put `build_status`'s cache-stat and session-sweep disk work inside a
+/// cross-process lock, the exact shape the lock-placement rule below forbids.
+/// On a filesystem without working flock the probe errs and the publish
+/// proceeds by design: a possibly-thinner body is cheaper than a stale one.
+///
 /// Call it OUTSIDE the switch's `with_state_lock`, the way every caller in
 /// `actions` does: [`build_status`] stats and reads each profile's caches and
 /// sweeps the session flocks, and that disk work has no business extending the
