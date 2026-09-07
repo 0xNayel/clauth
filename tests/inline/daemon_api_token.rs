@@ -234,6 +234,117 @@ fn an_unknown_tier_refuses_rather_than_serving_or_replacing() {
     );
 }
 
+// ── tier on the live path ────────────────────────────────────────────────────
+
+/// The live-path refusal is TYPE-DISTINGUISHABLE: the route answers
+/// `503 token_tier_unknown` for the tier arm and `500 internal` for anything
+/// else `current_or` can error with. One blanket arm would label an IO
+/// failure with a code that tells the operator to downgrade — wrong advice
+/// for a full disk.
+#[test]
+fn the_route_distinguishes_the_tier_refusal_from_other_read_errors() {
+    let _guard = schema_note_serialized();
+    let _home = HomeSandbox::new();
+    let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+        crate::profile::AppConfig {
+            state: crate::profile::AppState::default(),
+            profiles: Vec::new(),
+        },
+    ));
+    let status_path = token_path().expect("path").with_file_name("status.json");
+    let ctx = crate::daemon::api::routes::ApiContext::new(
+        config,
+        status_path,
+        AuthToken::from_plaintext(&"e".repeat(64)),
+        None,
+    );
+    let path = token_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    let body = format!(
+        r#"{{"schema":1,"token":"{}","created_at":"x","tier":"readonly"}}"#,
+        "f".repeat(64)
+    );
+    std::fs::write(&path, body).expect("seed");
+
+    let resp = crate::daemon::api::routes::handle(
+        &ctx,
+        &crate::daemon::api::http::Request {
+            method: "GET".to_string(),
+            path: "/api/v1/health".to_string(),
+            query: String::new(),
+            bearer: Some("f".repeat(64)),
+            if_none_match: None,
+            body: Vec::new(),
+            keep_alive: true,
+        },
+    );
+    assert_eq!(resp.status, 503);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&resp.body).expect("json")["error"],
+        serde_json::json!("token_tier_unknown")
+    );
+}
+
+/// [`current_or`] is the live read behind every request, and it must refuse an
+/// unknown tier exactly as [`load_or_create`] does at startup. The startup
+/// refusal pins a file the daemon was never started with; this pins a file a
+/// NEWER clauth wrote under a running one — a `--rotate-token` from a build
+/// that knows a restricted tier. The old fallback here was the spawn-time
+/// token, which is the credential the rotation just replaced: the refused
+/// birth of round-1 blocker 3 (`--rotate-token` never revoking against a
+/// running daemon) re-arms through a version-skew door.
+#[test]
+fn the_live_read_refuses_an_unknown_tier_rather_than_keeping_the_spawn_token() {
+    let _guard = schema_note_serialized();
+    let _home = HomeSandbox::new();
+    let spawned = AuthToken::from_plaintext(&"e".repeat(64));
+    let path = token_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    let body = format!(
+        r#"{{"schema":1,"token":"{}","created_at":"x","tier":"readonly"}}"#,
+        "f".repeat(64)
+    );
+    std::fs::write(&path, body).expect("seed");
+
+    let err = current_or(&spawned).expect_err("the live read must refuse");
+    assert!(
+        format!("{err:#}").contains("readonly"),
+        "the operator has to be told which tier stopped it: {err:#}"
+    );
+}
+
+/// The refusal is one line in the log, not one per request: the read runs for
+/// every request, and a tray polling twice a minute would write the line twice
+/// a minute for the daemon's life.
+#[test]
+fn the_live_read_refusal_is_logged_once_not_per_read() {
+    let _guard = schema_note_serialized();
+    let _home = HomeSandbox::new();
+    let spawned = AuthToken::from_plaintext(&"e".repeat(64));
+    let path = token_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    let body = format!(
+        r#"{{"schema":1,"token":"{}","created_at":"x","tier":"readonly"}}"#,
+        "f".repeat(64)
+    );
+    std::fs::write(&path, body).expect("seed");
+
+    reset_schema_note_for_tests();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    assert!(current_or(&spawned).is_err());
+    assert!(current_or(&spawned).is_err());
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("this build does not know"))
+            .count(),
+        1,
+        "once per process, not once per read"
+    );
+}
+
 #[test]
 fn verify_accepts_the_exact_token_only() {
     let token = generate().expect("generate");

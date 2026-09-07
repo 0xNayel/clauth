@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -38,10 +38,36 @@ const SCHEMA: u64 = 1;
 /// bumping the schema and migrating them. Costing one line today buys that.
 const CONTROL_TIER: &str = "control";
 
-/// Whether [`read_valid`]'s schema-too-new note has already been raised in this
-/// process. `current_or` re-reads the file for every request, so an unlatched
-/// note would be a line per request for the daemon's life.
+/// Whether a refusal raised by this module has already been logged in this
+/// process. Both readers that can hit the unknown-tier refusal run per
+/// request on the live path (see [`current_or`]), so an unlatched line would
+/// be a line per request for the daemon's life.
 static SCHEMA_NOTED: AtomicBool = AtomicBool::new(false);
+static TIER_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// `read_valid`'s one hard refusal: a `tier` this build does not know. A
+/// distinct type so the callers (the route's 503, the startup exit) answer
+/// THIS and nothing else — an anyhow chain from some later IO arm must never
+/// masquerade as it.
+#[derive(Debug)]
+pub(crate) struct UnknownTier {
+    tier: String,
+    path: std::path::PathBuf,
+}
+
+impl std::fmt::Display for UnknownTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} carries tier {:?}, which this build does not know. \
+             Run the clauth that wrote it, or delete the file to mint a fresh control token",
+            self.path.display(),
+            self.tier
+        )
+    }
+}
+
+impl std::error::Error for UnknownTier {}
 
 /// `~/.clauth/auth_token.json`. `created_at` is informational — it answers "how
 /// old is the credential I copied to that other box?" without a second file.
@@ -156,25 +182,33 @@ fn read_valid() -> Result<Option<String>> {
             );
         }
     }
-    // A tier this build does not know is the one thing worth refusing to start
-    // over. Serving it as `control` would silently promote a token a newer build
+    // A tier this build does not know is the one thing worth refusing over.
+    // Serving it as `control` would silently promote a token a newer build
     // deliberately restricted, and replacing it would revoke, from a downgrade,
     // a credential the operator distributed on purpose. Neither is ours to pick.
     if parsed.tier != CONTROL_TIER {
-        bail!(
-            "{} carries tier {:?}, which this build does not know (it serves only {CONTROL_TIER:?}). \
-             Run the clauth that wrote it, or delete the file to mint a fresh control token",
-            path.display(),
-            parsed.tier
-        );
+        if !TIER_REFUSED.swap(true, Ordering::AcqRel) {
+            logline!(
+                "clauth daemon: {TOKEN_FILE} carries tier {:?}, which this build does not know \
+                 (it serves only {CONTROL_TIER:?}); refusing to serve that token",
+                parsed.tier
+            );
+        }
+        return Err(UnknownTier {
+            tier: parsed.tier,
+            path,
+        }
+        .into());
     }
     Ok(is_well_formed(&parsed.token).then_some(parsed.token))
 }
 
-/// Test-only: re-arm the schema note so a test can observe its one-shot.
+/// Test-only: re-arm the schema note and the tier refusal so a test can
+/// observe each one-shot.
 #[cfg(test)]
 pub(crate) fn reset_schema_note_for_tests() {
     SCHEMA_NOTED.store(false, Ordering::Release);
+    TIER_REFUSED.store(false, Ordering::Release);
 }
 
 /// The token as it stands on disk RIGHT NOW, falling back to `spawned` when the
@@ -198,11 +232,18 @@ pub(crate) fn reset_schema_note_for_tests() {
 /// worse than continuing on the token the daemon started with. It does mean a
 /// DELETED file stops revoking — but deleting it needs the same filesystem
 /// access that could read the token in the first place.
-pub(crate) fn current_or(spawned: &AuthToken) -> AuthToken {
+///
+/// The one thing that does NOT fall back is an unknown [`tier`](AuthTokenFile):
+/// a newer clauth's `--rotate-token` can write one under a running daemon, and
+/// the spawn-time token is exactly the credential that rotation just retired —
+/// falling back to it here would re-arm round-1 blocker 3 through a
+/// version-skew door. So the live path refuses to serve anything (the caller
+/// answers 503) and the operator runs the clauth that wrote the file. [`Err`]
+/// carries [`read_valid`]'s refusal; every softer failure stays inside the
+/// `Ok` fallback above.
+pub(crate) fn current_or(spawned: &AuthToken) -> Result<AuthToken> {
     read_valid()
-        .ok()
-        .flatten()
-        .map_or_else(|| spawned.clone(), |t| AuthToken::from_plaintext(&t))
+        .map(|token| token.map_or_else(|| spawned.clone(), |t| AuthToken::from_plaintext(&t)))
 }
 
 fn write(token: &str) -> Result<()> {

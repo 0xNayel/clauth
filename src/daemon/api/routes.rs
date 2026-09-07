@@ -75,8 +75,19 @@ impl ApiContext {
 /// probe needs, and nothing else leaks — not the version, not an account name.
 pub(crate) fn handle(ctx: &ApiContext, req: &Request) -> Response {
     // Against the token as it is on disk NOW, not the one captured at spawn, so
-    // `clauth daemon --rotate-token` takes effect against a running daemon.
-    let live = crate::daemon::api::token::current_or(&ctx.token);
+    // `clauth daemon --rotate-token` takes effect against a running daemon. An
+    // unknown tier written by a newer build is the one read that refuses rather
+    // than falling back — see `token::current_or`.
+    let live = match crate::daemon::api::token::current_or(&ctx.token) {
+        Ok(live) => live,
+        Err(ref e)
+            if e.downcast_ref::<crate::daemon::api::token::UnknownTier>()
+                .is_some() =>
+        {
+            return Response::error(503, "token_tier_unknown");
+        }
+        Err(_) => return Response::error(500, "internal"),
+    };
     if !req.bearer.as_deref().is_some_and(|t| live.verify(t)) {
         return Response::unauthorized();
     }
