@@ -404,8 +404,8 @@ fn published_windows_carries_an_oauth_accounts_windows() {
 /// utilization (#74): a 19h-lapsed 5h window publishing `100%` is a spent
 /// account reading as fully used, and `clauth list`'s `-` is the honest
 /// answer. A live window beside it stays; a live-maxed one stays too — a
-/// window pinned at the API's cap is live by definition and the T1 exemption
-/// reasons about it elsewhere.
+/// window pinned at the API's cap is live by definition, and the T1 stale
+/// exemption reasons about it elsewhere rather than dropping it here.
 #[test]
 fn published_windows_drops_rows_whose_reset_has_passed() {
     let _home = HomeSandbox::new();
@@ -416,12 +416,19 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         &UsageInfo {
             five_hour: Some(UsageWindow {
                 utilization: 100.0,
-                resets_at: Some(lapsed),
+                resets_at: Some(lapsed.clone()),
             }),
             seven_day: Some(UsageWindow {
                 utilization: 17.0,
-                resets_at: Some(live),
+                resets_at: Some(live.clone()),
             }),
+            weekly_scoped: vec![crate::usage::ScopedWindow {
+                label: "7d Opus".to_string(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(live),
+                },
+            }],
             ..Default::default()
         },
         Duration::from_secs(100),
@@ -430,9 +437,40 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
     let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
     assert_eq!(
         windows.len(),
-        1,
-        "the lapsed 5h row drops; the live 7d row stays: {windows:?}"
+        2,
+        "the lapsed 5h row drops; the live 7d and the live-maxed weekly row stay: {windows:?}"
     );
     assert_eq!(windows[0].label, "7d");
     assert_eq!(windows[0].utilization_pct, 17.0);
+    assert_eq!(windows[1].label, "7d Opus");
+    assert_eq!(
+        windows[1].utilization_pct, 100.0,
+        "a window pinned at the cap with a future reset is live, not lapsed"
+    );
+
+    // A lapsed stamp on the weekly row too proves the per-model window drops
+    // by the same rule and not because the weekly leg was skipped.
+    seed_usage_cache(
+        "kerry",
+        &UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 50.0,
+                resets_at: Some(lapsed.clone()),
+            }),
+            weekly_scoped: vec![crate::usage::ScopedWindow {
+                label: "7d Opus".to_string(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(lapsed),
+                },
+            }],
+            ..Default::default()
+        },
+        Duration::from_secs(100),
+    );
+    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    assert!(
+        windows.is_empty(),
+        "every lapsed row drops, weekly and 5h alike: {windows:?}"
+    );
 }
