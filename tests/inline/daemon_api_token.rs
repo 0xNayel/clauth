@@ -99,24 +99,16 @@ fn malformed_token_files_are_regenerated() {
     }
 }
 
-/// `read_valid`'s schema note latches process-wide, so the tests that trip it
-/// serialize here and re-arm the latch: each then observes its own lines
-/// (nextest isolates processes; the plain `cargo test` fallback runs tests as
-/// threads of one process).
-static SCHEMA_NOTE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn schema_note_serialized() -> std::sync::MutexGuard<'static, ()> {
-    SCHEMA_NOTE_TESTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// A file from a newer clauth is reused rather than rotated: a downgrade must
-/// not silently invalidate the token every client already holds.
+/// `read_valid`'s schema note latches process-wide. The tests that trip it all
+/// hold a [`HomeSandbox`] too, and every sandbox takes `HOME_TEST_LOCK` for its
+/// whole life, so the latch observers are already serialized by the sandbox
+/// itself (nextest isolates processes; the plain `cargo test` fallback runs
+/// tests as threads of one process). Never add a second mutex for this: an
+/// unranked test mutex acquired in both orders across tests is an ABBA
+/// deadlock under the threaded harness.
 #[test]
 fn future_schema_token_is_reused_when_well_formed() {
     let _home = HomeSandbox::new();
-    let _guard = schema_note_serialized();
     let future = "a".repeat(64);
     let path = token_path().expect("path");
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
@@ -145,7 +137,6 @@ fn the_schema_note_is_logged_once_not_per_read() {
     )
     .expect("seed");
 
-    let _guard = schema_note_serialized();
     reset_schema_note_for_tests();
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
@@ -211,9 +202,9 @@ fn a_file_without_a_tier_reads_as_control() {
 /// So the only safe move is to do neither and say so.
 #[test]
 fn an_unknown_tier_refuses_rather_than_serving_or_replacing() {
-    // schema 2 > 1 trips the schema note's latch on the way to the tier bail;
-    // serialize with the other latch observers (see SCHEMA_NOTE_TESTS).
-    let _guard = schema_note_serialized();
+    // Schema 2 > 1 trips the schema note's latch on the way to the tier bail;
+    // the sandbox's `HOME_TEST_LOCK` serializes the latch observers (see the
+    // `future_schema` test's doc).
     let _home = HomeSandbox::new();
     let restricted = "c".repeat(64);
     let path = token_path().expect("path");
@@ -243,7 +234,6 @@ fn an_unknown_tier_refuses_rather_than_serving_or_replacing() {
 /// for a full disk.
 #[test]
 fn the_route_distinguishes_the_tier_refusal_from_other_read_errors() {
-    let _guard = schema_note_serialized();
     let _home = HomeSandbox::new();
     let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(
         crate::profile::AppConfig {
@@ -295,7 +285,6 @@ fn the_route_distinguishes_the_tier_refusal_from_other_read_errors() {
 /// running daemon) re-arms through a version-skew door.
 #[test]
 fn the_live_read_refuses_an_unknown_tier_rather_than_keeping_the_spawn_token() {
-    let _guard = schema_note_serialized();
     let _home = HomeSandbox::new();
     let spawned = AuthToken::from_plaintext(&"e".repeat(64));
     let path = token_path().expect("path");
@@ -318,7 +307,6 @@ fn the_live_read_refuses_an_unknown_tier_rather_than_keeping_the_spawn_token() {
 /// a minute for the daemon's life.
 #[test]
 fn the_live_read_refusal_is_logged_once_not_per_read() {
-    let _guard = schema_note_serialized();
     let _home = HomeSandbox::new();
     let spawned = AuthToken::from_plaintext(&"e".repeat(64));
     let path = token_path().expect("path");
