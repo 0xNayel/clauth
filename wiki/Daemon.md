@@ -155,6 +155,14 @@ hosts where it cannot work.
   look perfectly current. `clauth daemon --replace --listen` is the in-place
   restart for that hook — `--replace` composes with `--listen`, but the hook has
   to pass both, since a `--replace` on its own takes over without a listener.
+  One thing that hook cannot recover from: if some OTHER process (not the
+  daemon) holds the port, `--replace` terminates the daemon first and then dies
+  at the bind, leaving the host with no daemon at all — refresh and auto-switch
+  stop until it is started again. The renewal hook is the one place this bites
+  by construction: whatever binds the port while the daemon is being restarted
+  (a second daemonless listener, a port-hijacking probe) is a squatter the
+  incumbent daemon's death does not clear. Check `clauth daemon --status` after
+  the hook, or make the hook fall back to a plain restart on failure.
   Nothing warns you in advance: a certificate that expires under a running
   daemon produces client-side TLS errors, not a clauth log line.
 - **The token.** 32 CSPRNG bytes through SHA-256, hex, so 64 characters.
