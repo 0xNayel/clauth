@@ -10,6 +10,8 @@
 //! no reason to keep a copy that a core dump could yield. Only
 //! `clauth daemon --print-token` reads the plaintext back, and only to print it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,6 +37,11 @@ const SCHEMA: u64 = 1;
 /// then adds a value to a field every deployed file already carries, instead of
 /// bumping the schema and migrating them. Costing one line today buys that.
 const CONTROL_TIER: &str = "control";
+
+/// Whether [`read_valid`]'s schema-too-new note has already been raised in this
+/// process. `current_or` re-reads the file for every request, so an unlatched
+/// note would be a line per request for the daemon's life.
+static SCHEMA_NOTED: AtomicBool = AtomicBool::new(false);
 
 /// `~/.clauth/auth_token.json`. `created_at` is informational — it answers "how
 /// old is the credential I copied to that other box?" without a second file.
@@ -142,10 +149,12 @@ fn read_valid() -> Result<Option<String>> {
         // Written by a newer clauth. Refusing to reuse it would rotate the
         // operator's distributed token behind their back on a downgrade, so
         // take it if it still looks like a token and let the newer field set be.
-        logline!(
-            "clauth daemon: {TOKEN_FILE} is schema {} (this build knows {SCHEMA})",
-            parsed.schema
-        );
+        if !SCHEMA_NOTED.swap(true, Ordering::AcqRel) {
+            logline!(
+                "clauth daemon: {TOKEN_FILE} is schema {} (this build knows {SCHEMA})",
+                parsed.schema
+            );
+        }
     }
     // A tier this build does not know is the one thing worth refusing to start
     // over. Serving it as `control` would silently promote a token a newer build
@@ -160,6 +169,12 @@ fn read_valid() -> Result<Option<String>> {
         );
     }
     Ok(is_well_formed(&parsed.token).then_some(parsed.token))
+}
+
+/// Test-only: re-arm the schema note so a test can observe its one-shot.
+#[cfg(test)]
+pub(crate) fn reset_schema_note_for_tests() {
+    SCHEMA_NOTED.store(false, Ordering::Release);
 }
 
 /// The token as it stands on disk RIGHT NOW, falling back to `spawned` when the

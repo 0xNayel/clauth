@@ -21,7 +21,7 @@ use crate::logline::logline;
 use crate::oauth;
 use crate::profile::ConfigHandle;
 
-use super::http::{Request, Response, sanitize_for_log};
+use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::token::AuthToken;
 
 /// Every route lives under this prefix, and it is spelled once.
@@ -325,8 +325,14 @@ fn switch(ctx: &ApiContext, req: &Request) -> Response {
             )
         }
         Err(e) => {
-            let reason = sanitize_for_log(&e.to_string());
-            logline!("clauth api: switch to '{canonical}' refused: {reason}");
+            // The body carries the whole control-flattened reason (what it may
+            // reflect at all is a separate task's); only the log copy takes
+            // the line-length bound.
+            let reason = flatten_control_chars(&e.to_string());
+            logline!(
+                "clauth api: switch to '{canonical}' refused: {}",
+                sanitize_for_log(&reason)
+            );
             // A held state flock is the one retryable failure here: another
             // clauth process is mid-write, and the same request will work in a
             // moment. Everything else needs the operator to change something.

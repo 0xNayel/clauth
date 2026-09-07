@@ -514,13 +514,39 @@ pub(crate) fn write_response<W: Write>(
     w.flush()
 }
 
-/// Flatten control characters before a string reaches `daemon.log`. `logline!`
-/// is line-oriented and strips nothing, so an embedded newline — in a request
+/// Flatten control characters in a string taken off the wire. `logline!` is
+/// line-oriented and strips nothing, so an embedded newline — in a request
 /// path, or in an error carrying an upstream message — would forge a log entry.
-pub(crate) fn sanitize_for_log(s: &str) -> String {
+pub(crate) fn flatten_control_chars(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// What one sanitized string may contribute to a `daemon.log` line, in chars.
+/// A request's method and path are wire bytes bounded only by the 8 KiB header
+/// limit (httparse checks token bytes, not length), and the 401 line is written
+/// for peers that never presented a credential, so an unbounded carry would let
+/// any unauthenticated peer fill the log with chosen bytes.
+const LOG_TEXT_LIMIT: usize = 128;
+
+/// Make a string safe for one `daemon.log` line: [`flatten_control_chars`]
+/// plus a length bound, with `...` marking a cut that is taken by chars and so
+/// never splits a character.
+pub(crate) fn sanitize_for_log(s: &str) -> String {
+    let flattened = flatten_control_chars(s);
+    let mut cleaned: String = flattened.chars().take(LOG_TEXT_LIMIT).collect();
+    if flattened.chars().nth(LOG_TEXT_LIMIT).is_some() {
+        cleaned.push_str("...");
+    }
+    cleaned
+}
+
+/// One request's `METHOD /path` as it may appear in a `daemon.log` line: the
+/// whole summary through [`sanitize_for_log`], because the method is wire
+/// bytes too, so bounding the path alone still leaves the flood open.
+pub(crate) fn request_summary(method: &str, path: &str) -> String {
+    sanitize_for_log(&format!("{method} {path}"))
 }
 
 /// Reason phrases for the statuses this server actually emits. Clients key on

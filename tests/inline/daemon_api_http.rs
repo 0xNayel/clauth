@@ -12,6 +12,8 @@
 //! The framing tests here and the real-socket ones in `daemon_api_server.rs`
 //! are two halves of the same guarantee.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 
 use std::io::Cursor;
@@ -555,6 +557,37 @@ fn log_sanitizer_flattens_control_characters() {
         forged.len(),
         "characters are replaced, not dropped"
     );
+}
+
+/// Bounded to [`LOG_TEXT_LIMIT`]: the 401 log line is written for peers that
+/// never presented a credential, and a request path is bounded only by the
+/// 8 KiB header limit, so without a bound of its own an unauthenticated peer
+/// writes kilobytes of chosen bytes into `daemon.log` per connection. The cut
+/// is taken by chars, never bytes, so no multibyte character is split.
+#[test]
+fn log_sanitizer_bounds_a_long_path() {
+    let long = format!("/api/v1/status?x={}", "A".repeat(8192));
+    let cleaned = sanitize_for_log(&long);
+    assert!(cleaned.ends_with("..."), "a cut is marked");
+    assert_eq!(cleaned.chars().count(), LOG_TEXT_LIMIT + 3);
+
+    let multibyte = "é".repeat(LOG_TEXT_LIMIT * 2);
+    let cleaned = sanitize_for_log(&multibyte);
+    assert!(cleaned.ends_with("..."));
+    assert_eq!(cleaned.chars().count(), LOG_TEXT_LIMIT + 3);
+}
+
+/// The summary line the connection loop logs: the METHOD is wire bytes too
+/// (httparse checks token bytes, not length), so the bound has to cover the
+/// whole `METHOD /path` string, not the path alone.
+#[test]
+fn the_request_summary_bounds_the_method_too() {
+    let method = "B".repeat(8192);
+    let path = format!("/api/v1/status?x={}", "A".repeat(8192));
+    let summary = request_summary(&method, &path);
+    assert!(summary.ends_with("..."), "a cut is marked");
+    assert!(summary.chars().count() <= LOG_TEXT_LIMIT + 3);
+    assert!(summary.starts_with('B'), "the cut keeps the front");
 }
 
 // ── conditional GET ─────────────────────────────────────────────────────────

@@ -344,6 +344,75 @@ fn a_real_tls_request_is_served_end_to_end() {
     drop(home);
 }
 
+/// The per-request log line is what an unauthenticated peer can fill: the 401
+/// is logged for peers that never presented a credential, and a request path is
+/// bounded only by the 8 KiB header limit. The connection handler runs on the
+/// worker thread this closure IS, so the logline capture installs there and the
+/// real served line lands in the buffer.
+#[test]
+fn the_log_line_for_a_long_unauthenticated_path_is_bounded() {
+    let Some(fx) = fixture() else {
+        eprintln!(
+            "SKIPPED the_log_line_for_a_long_unauthenticated_path_is_bounded: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let Fixture {
+        port,
+        listener,
+        server_tls,
+        client_tls,
+        ctx,
+        feed: _feed,
+        _home,
+        _dir,
+    } = fx;
+
+    // Both wire fields flood: the method is raw bytes httparse never length-
+    // checks, and the path/query split means a flood can ride either. One
+    // request carrying a long METHOD and a long bare PATH (no `?`) catches a
+    // bound that covers only one of them.
+    let method = "B".repeat(2048);
+    let path = format!("/{}", "A".repeat(2048));
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            let (stream, peer) = listener.accept().expect("accept");
+            serve_connection(stream, peer, &server_tls, &ctx, Limits::DEFAULT);
+        });
+
+        let anonymous = round_trip(
+            port,
+            &client_tls,
+            &format!(
+                "{method} {path} HTTP/1.1\r\nHost: {SERVER_NAME}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .expect("anonymous round trip");
+        assert!(
+            anonymous.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+            "{anonymous}"
+        );
+    });
+
+    // "clauth api: " (12) + a peer address (≤21) + " " + the summary (≤131:
+    // `http::LOG_TEXT_LIMIT` plus its "..." marker) + " -> 401" (7).
+    let bound = 12 + 21 + 1 + 131 + 7;
+    let logged = lines.snapshot();
+    let line = logged
+        .iter()
+        .find(|l| l.ends_with("-> 401"))
+        .expect("the 401 line was logged");
+    assert!(
+        line.chars().count() <= bound,
+        "a long unauthenticated path writes a bounded line: {} chars",
+        line.chars().count()
+    );
+}
+
 /// A test fixture's whole world: a certificate, a seeded feed, and a listener.
 /// Returns the port plus everything the caller has to keep alive.
 struct Fixture {

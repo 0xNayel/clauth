@@ -6,6 +6,8 @@
 //! All disk state is redirected into a [`HomeSandbox`] tempdir, so nothing here
 //! reads or writes the operator's real `~/.clauth/auth_token.json`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 
 use crate::testutil::HomeSandbox;
@@ -97,11 +99,24 @@ fn malformed_token_files_are_regenerated() {
     }
 }
 
+/// `read_valid`'s schema note latches process-wide, so the tests that trip it
+/// serialize here and re-arm the latch: each then observes its own lines
+/// (nextest isolates processes; the plain `cargo test` fallback runs tests as
+/// threads of one process).
+static SCHEMA_NOTE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn schema_note_serialized() -> std::sync::MutexGuard<'static, ()> {
+    SCHEMA_NOTE_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A file from a newer clauth is reused rather than rotated: a downgrade must
 /// not silently invalidate the token every client already holds.
 #[test]
 fn future_schema_token_is_reused_when_well_formed() {
     let _home = HomeSandbox::new();
+    let _guard = schema_note_serialized();
     let future = "a".repeat(64);
     let path = token_path().expect("path");
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
@@ -112,6 +127,39 @@ fn future_schema_token_is_reused_when_well_formed() {
     .expect("seed");
 
     assert_eq!(load_or_create().expect("load"), future);
+}
+
+/// The schema-too-new note is a process-wide one-shot: `current_or` re-reads the
+/// file for every request, and an unlatched note would be a line per request —
+/// a tray polling twice a minute writing that line twice a minute for the
+/// daemon's life.
+#[test]
+fn the_schema_note_is_logged_once_not_per_read() {
+    let _home = HomeSandbox::new();
+    let future = "c".repeat(64);
+    let path = token_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        format!(r#"{{"schema":99,"token":"{future}","created_at":"x"}}"#),
+    )
+    .expect("seed");
+
+    let _guard = schema_note_serialized();
+    reset_schema_note_for_tests();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    assert_eq!(read_valid().expect("read"), Some(future.clone()));
+    assert_eq!(read_valid().expect("read"), Some(future));
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("this build knows"))
+            .count(),
+        1,
+        "once per process, not once per read"
+    );
 }
 
 // ── tier ────────────────────────────────────────────────────────────────────
@@ -163,6 +211,9 @@ fn a_file_without_a_tier_reads_as_control() {
 /// So the only safe move is to do neither and say so.
 #[test]
 fn an_unknown_tier_refuses_rather_than_serving_or_replacing() {
+    // schema 2 > 1 trips the schema note's latch on the way to the tier bail;
+    // serialize with the other latch observers (see SCHEMA_NOTE_TESTS).
+    let _guard = schema_note_serialized();
     let _home = HomeSandbox::new();
     let restricted = "c".repeat(64);
     let path = token_path().expect("path");
