@@ -241,11 +241,23 @@ pub(crate) struct Window {
 }
 
 /// The [`Window`] rows of an OAuth usage read — 5h, 7d, then one entry per
-/// weekly model window (`7d <model>`).
+/// weekly model window (`7d <model>`). A window whose `resets_at` has passed
+/// drops here (#74): past its reset the figure is the previous window's last
+/// utilization, not a current reading, and a lapsed 5h at `100%` read as a
+/// permanently spent account. A window with no parseable `resets_at` stays —
+/// absence of a stamp is missing data, not a lapsed window, and the row
+/// without it is the honest shape every pre-reset row already publishes.
 pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
+    let now_secs = crate::usage::now_epoch_secs();
     usage
         .windows()
         .into_iter()
+        .filter(|(_, w)| {
+            w.resets_at
+                .as_deref()
+                .and_then(crate::usage::iso_to_epoch_secs)
+                .is_none_or(|resets_at| now_secs < resets_at)
+        })
         .map(|(label, w)| Window {
             label: label.to_string(),
             utilization_pct: w.utilization,

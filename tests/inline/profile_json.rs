@@ -399,3 +399,40 @@ fn published_windows_carries_an_oauth_accounts_windows() {
     assert_eq!(windows[0].label, "5h");
     assert_eq!(windows[0].utilization_pct, 42.0);
 }
+
+/// A window whose `resets_at` has passed renders unknown, never as its last
+/// utilization (#74): a 19h-lapsed 5h window publishing `100%` is a spent
+/// account reading as fully used, and `clauth list`'s `-` is the honest
+/// answer. A live window beside it stays; a live-maxed one stays too — a
+/// window pinned at the API's cap is live by definition and the T1 exemption
+/// reasons about it elsewhere.
+#[test]
+fn published_windows_drops_rows_whose_reset_has_passed() {
+    let _home = HomeSandbox::new();
+    let lapsed = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 3600);
+    let live = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600);
+    seed_usage_cache(
+        "kerry",
+        &UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(lapsed),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 17.0,
+                resets_at: Some(live),
+            }),
+            ..Default::default()
+        },
+        Duration::from_secs(100),
+    );
+
+    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    assert_eq!(
+        windows.len(),
+        1,
+        "the lapsed 5h row drops; the live 7d row stays: {windows:?}"
+    );
+    assert_eq!(windows[0].label, "7d");
+    assert_eq!(windows[0].utilization_pct, 17.0);
+}
