@@ -703,6 +703,97 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     );
 }
 
+/// The #74 age arm: past `2 × max(interval_ms, 5min) + interval` of cache age
+/// the reading is stale on the single-shot path too — the exact surface that
+/// reported `stale: false` at 22h. A live-maxed window under the spent-accounts
+/// opt-out cannot change by polling, so its age arm stays silent: only the
+/// opt-out skips it and the flag it would otherwise poll is still consulted.
+#[test]
+fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    config.state.refresh_interval_ms = 90_000;
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()["stale"]
+            .clone()
+    };
+    // Threshold at this interval: 2 × max(90s, 5min) + 90s = 690s.
+    let clock =
+        |age_secs: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+    let set_age = |age_secs: u64| crate::testutil::set_mtime(&path, clock(age_secs));
+    let threshold_secs = (2 * 300_000 + 90_000) / 1000;
+    // Fresh and at-threshold → not stale; past it → stale on the single-shot.
+    set_age(threshold_secs - 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "a cache younger than the threshold is not stale"
+    );
+    set_age(threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "past 2 × max(interval, 5min) + interval the single-shot publishes stale — #74's 22h reading"
+    );
+    assert_eq!(
+        v["schema"], 1,
+        "the age arm is additive — schema must not bump"
+    );
+
+    // A live-maxed window under the spent-accounts opt-out is exempt from the
+    // age arm: its figure cannot change by polling, so age distrusts nothing.
+    // The cache is rewritten at the 100% cap (a live window pinned there), which
+    // also resets the mtime — the age below is re-established after the rewrite.
+    config.state.refresh_spent_accounts = false;
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    set_age(threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "a live-maxed window the opt-out skips is never age-stale"
+    );
+    // The stuck-429 arm is untouched: the exemption shares the OR, it does not
+    // replace the flag. Pinned by its own test above.
+}
+
 /// The third-party leg writes its outcomes to `third_party_status`, not the
 /// OAuth `status` store the feed used to read alone. A name missing from that
 /// one fell through to the mtime derivation — and an `AuthExpired` fetch writes

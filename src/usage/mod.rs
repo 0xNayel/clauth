@@ -43,6 +43,7 @@ pub(crate) use auto_start_queue::{
 // tests robust against a change to the constant's value.
 #[cfg(test)]
 pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
+pub(crate) use scheduler::DEGRADED_GAP_CEILING_MS;
 pub(crate) use scheduler::MAX_RETRY_AFTER_MS;
 // Test-only: reset the per-host request-spacing slots so a real-bytes wire test
 // driving a builder through `await_request_slot` doesn't sleep out the window,

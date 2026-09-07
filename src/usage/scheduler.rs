@@ -36,6 +36,15 @@ const HISTORY_PRUNE_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
 /// (`profile_json::MAX_LIVE_REFRESH_GAP_MS` reads it for exactly that).
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 
+/// Longest gap a degraded fetch can leave to a NON-TERMINAL profile's next poll
+/// (#74): the 5-minute floor every backoff ladder and the generic rescan clamp
+/// their GAP to, `max(interval_ms, this)` at each site. A server-provided
+/// `retry-after` hint stays honored to [`MAX_RETRY_AFTER_MS`] — an endpoint
+/// that NAMES its recovery time outranks the ladder, and only a hint beyond
+/// the 15min clamp is shortened, never one under it. Terminal credentials
+/// (`AuthExpired` — dead api key, lapsed console) stop outright instead.
+pub(crate) const DEGRADED_GAP_CEILING_MS: u64 = 5 * 60 * 1000;
+
 /// Widen-only poll deferral for an `auth_broken` profile. Each quarantined
 /// poll spends a guaranteed-dead 401 → refresh → 400 pair against the token
 /// endpoint, so the cadence stretches to the same ceiling the 429 ladder
