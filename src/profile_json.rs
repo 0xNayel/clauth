@@ -128,10 +128,12 @@ const STALE_AFTER_MS: u64 = 2 * MAX_LIVE_REFRESH_GAP_MS;
 /// polls at: `2 × max(interval_ms, 5min) + interval_ms`. ONE home for the
 /// arithmetic so [`ProfileWindows::stale`] and the `status.json` arm derive
 /// from the same threshold and can never drift. The 5-minute floor is the
-/// longest gap the degraded-fetch cadence can legally leave a non-terminal
-/// profile (#74): past it, age says the fetch stopped rather than the cadence
-/// being slow. `interval_ms` is the LIVE refresh interval the caller polls at,
-/// so a deliberately slow cadence widens the grace rather than redding it.
+/// ceiling the degraded-fetch cadence work (#74) clamps every backoff ladder
+/// to; until that clamp lands the 15-min hints can legally leave a longer
+/// gap, so this threshold reads conservative (a stalled cache marks stale
+/// early, never late). `interval_ms` is the LIVE refresh interval the caller
+/// polls at, so a deliberately slow cadence widens the grace rather than
+/// redding it.
 pub(crate) fn stale_after_ms(interval_ms: u64) -> u64 {
     let floored = interval_ms.max(crate::usage::DEGRADED_GAP_CEILING_MS);
     2 * floored + interval_ms

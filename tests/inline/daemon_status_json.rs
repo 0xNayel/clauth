@@ -710,6 +710,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
 /// opt-out skips it and the flag it would otherwise poll is still consulted.
 #[test]
 fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
+    use crate::usage::FetchStatus;
     let _home = HomeSandbox::new();
     let mut config = AppConfig {
         state: AppState::default(),
@@ -742,11 +743,12 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
             .unwrap()["stale"]
             .clone()
     };
-    // Threshold at this interval: 2 × max(90s, 5min) + 90s = 690s.
+    // Threshold at this interval: 2 × max(90s, the degraded ceiling) + 90s.
+    let ceiling_secs = crate::usage::DEGRADED_GAP_CEILING_MS / 1000;
     let clock =
         |age_secs: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
     let set_age = |age_secs: u64| crate::testutil::set_mtime(&path, clock(age_secs));
-    let threshold_secs = (2 * 300_000 + 90_000) / 1000;
+    let threshold_secs = 2 * ceiling_secs + 90;
     // Fresh and at-threshold → not stale; past it → stale on the single-shot.
     set_age(threshold_secs - 60);
     let v = build_status(&config, 90_000, None, false);
@@ -792,6 +794,38 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     );
     // The stuck-429 arm is untouched: the exemption shares the OR, it does not
     // replace the flag. Pinned by its own test above.
+
+    // The age arm holds on the DAEMON feed too: same cache, live signals
+    // attached, no stuck-429 (Fresh store entry, no streaks) — an old cache
+    // must read stale on the more-used surface, not only the single-shot.
+    config.state.refresh_spent_accounts = true;
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    set_age(threshold_secs + 60);
+    let live = LiveSignals {
+        status: &HashMap::from([("work".to_string(), FetchStatus::Fresh)]),
+        third_party_status: &Default::default(),
+        next_refresh: &HashMap::new(),
+        streaks: &HashMap::new(),
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 90_000, Some(&live), false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "an overdue cache reads stale on the live daemon feed too"
+    );
 }
 
 /// The third-party leg writes its outcomes to `third_party_status`, not the

@@ -168,6 +168,24 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
     );
 }
 
+/// `stale_after_ms` is the shared threshold derivation (#74): the status feed's
+/// age arm and any other stale judgment derive their bound through it, so the
+/// formula itself — floor at the degraded-fetch ceiling, scale with the
+/// interval — is pinned exactly rather than through any one consumer.
+#[test]
+fn stale_after_ms_floors_at_the_degraded_ceiling_and_scales_with_interval() {
+    let ceiling = crate::usage::DEGRADED_GAP_CEILING_MS;
+    // Below the ceiling the floor binds: a tight cadence still gets the full
+    // grace a degraded fetch can leave.
+    assert_eq!(stale_after_ms(90_000), 2 * ceiling + 90_000);
+    // At the ceiling the interval dominates; at the max interval the threshold
+    // is 3h. Monotone: a slower cadence always means a wider grace.
+    assert_eq!(stale_after_ms(ceiling), 3 * ceiling);
+    assert_eq!(stale_after_ms(3_600_000), 2 * 3_600_000 + 3_600_000);
+    assert!(stale_after_ms(90_000) < stale_after_ms(ceiling));
+    assert!(stale_after_ms(ceiling) < stale_after_ms(3_600_000));
+}
+
 /// A cache stamp in the FUTURE is a clock that moved, not a fresh read. A
 /// saturating subtraction renders it as `cached just now` with `stale` false —
 /// maximum confidence for the one stamp that proves the age cannot be trusted.

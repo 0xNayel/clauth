@@ -42,15 +42,16 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 pub(crate) struct LiveSignals<'a> {
     pub(crate) status: &'a HashMap<String, FetchStatus>,
     /// The THIRD-PARTY leg's outcomes, kept as a separate map rather than merged
-    /// into `status`: `stale` below is contracted as a stuck 429 read off the
-    /// OAuth store, and folding the two would silently retarget it.
+    /// into `status`: `stale`'s stuck arm is contracted as a stuck 429 read off
+    /// the OAuth store, and folding the two would silently retarget it.
     pub(crate) third_party_status: &'a HashMap<String, FetchStatus>,
     pub(crate) next_refresh: &'a HashMap<String, u64>,
     /// Consecutive-429 streaks, so a profile whose live `status` is `RateLimited`
     /// AND whose streak has passed the active cap can be published as `stale` (a
     /// deep-slot stuck read the daemon distrusts — the same judgment
     /// `scan_auto_switch` acts on). Empty for the single-shot `status --json` (no
-    /// daemon), so `stale` is always `false` there.
+    /// daemon), so the STUCK arm is always `false` there; the age arm needs no
+    /// store and fires on both paths.
     pub(crate) streaks: &'a HashMap<String, u32>,
     /// The switch target the daemon has accepted but not yet applied (from
     /// `pending_switch`), so a reader can show in-flight truth instead of a
@@ -178,10 +179,11 @@ pub(crate) struct ProfileEntry {
     /// Freshness: a live daemon's verdict or the cache-mtime derivation; `None`
     /// when there is no cache at all.
     pub(crate) fetch_status: Option<String>,
-    /// Additive (schema stays 1): true when the daemon distrusts this reading
-    /// as a deep-slot stuck RateLimited — readers dim it / show a "stuck" cue
-    /// instead of treating it as current truth. Always false for the single-shot
-    /// `status --json`.
+    /// Additive (schema stays 1): true when this reading is distrusted, by
+    /// either arm — a deep-slot stuck RateLimited, or cache age past
+    /// `stale_after_ms(interval)` (the stuck arm needs the live stores and is
+    /// `false` single-shot). Readers dim it / show a "stuck" cue instead of
+    /// treating it as current truth.
     pub(crate) stale: bool,
     /// ISO-8601 UTC stamp of the cache behind the published figures; `None`
     /// when there is no cache.
