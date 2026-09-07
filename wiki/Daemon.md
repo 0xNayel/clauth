@@ -196,13 +196,7 @@ hosts where it cannot work.
 | `GET /api/v1/status` | The `status.json` body below, byte for byte off disk. Conditional: the `ETag` digests everything in the body except `generated_at`, so a feed rewritten by a tick that changed nothing answers `304` with no body. `?wait=<secs>` on a request already carrying the current tag holds it open until the accounts actually move (capped at 60s, inside the connection's own 120s lifetime), which is how a client follows a switch without polling. `?all=1` rebuilds the body to include disabled accounts, which the published file always hides, and never waits. |
 | `POST /api/v1/switch` | Body `{"profile":"<name>"}` (resolved case-insensitively). Returns `{"ok":true,"previous":…,"active":…}`. Republishes `status.json` before answering, so every reader parked on `GET /api/v1/status?wait=` is woken by the same switch rather than by the next tick. |
 
-`POST /api/v1/switch` failures: `404` unknown profile · `409` refused, because the
-target is disabled, its credentials were rejected by a refresh, or the live
-login is one clauth has not saved (the body's `reason` names the fix, and
-nothing was changed) · `409` `switch_in_progress` when another switch is still
-running · `503` another clauth process is holding the state lock, so the same
-request will work shortly · `400` a malformed body. Refusals carry
-`{"ok":false,"error":"<code>","reason":…}`.
+`POST /api/v1/switch` failures: `404` unknown profile · `409` refused, because the target is disabled, its credentials were rejected by a refresh, or the live login is one clauth has not saved (the body's `reason` names the fix, and nothing was changed) · `409` `switch_in_progress` when another switch is still running · `503` another clauth process is holding the state lock, so the same request will work shortly · `500` `switch_failed`, an unexpected failure whose `reason` is a fixed sentence pointing at `daemon.log` for the full error chain · `400` a malformed body. Refusals carry `{"ok":false,"error":"<code>","reason":…}`.
 
 The switch is the same action `clauth <name>` and the MCP tool perform, so it
 inherits their gates rather than reimplementing them, and the daemon's main loop
