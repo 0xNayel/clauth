@@ -256,6 +256,19 @@ pub(crate) fn window_row_is_live(w: &UsageWindow) -> bool {
         .is_none_or(|resets_at| crate::usage::now_epoch_secs() < resets_at)
 }
 
+/// [`window_row_is_live`] for a third-party provider's cached bar: the same
+/// one-derivation liveness, shared with the roster's rank and headline so a
+/// lapsed bar cannot rank or render its last utilization while the OAuth
+/// window it mirrors drops (#74). The bar's own `resets_at` stamps it only
+/// when the provider's response carried one (z.ai, generic, Alibaba); an
+/// unstamped bar stays, the same missing-data call the OAuth row makes.
+pub(crate) fn usage_bar_is_live(b: &crate::providers::UsageBar) -> bool {
+    b.resets_at
+        .as_deref()
+        .and_then(crate::usage::iso_to_epoch_secs)
+        .is_none_or(|resets_at| crate::usage::now_epoch_secs() < resets_at)
+}
+
 /// The [`Window`] rows of an OAuth usage read — 5h, 7d, then one entry per
 /// weekly model window (`7d <model>`). A window whose `resets_at` has passed
 /// drops here (#74): past its reset the figure is the previous window's last

@@ -1951,7 +1951,15 @@ fn a_running_check_renders_a_bar_shaped_provider_cache_too() {
         THIRD_PARTY_CACHE_FILE,
     )
     .unwrap();
-    std::fs::write(&cache, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).expect("provider cache");
+    // Through the captured-cache writer, which re-anchors the bars' absolute
+    // `resets_at` stamps to now: this test pins the bars SHAPE, and the raw
+    // captured stamps drift past as real time moves.
+    std::fs::create_dir_all(cache.parent().unwrap()).expect("cache dir");
+    std::fs::write(
+        &cache,
+        crate::testutil::reanchored_bars_cache_bytes(crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES),
+    )
+    .expect("provider cache");
     seed_running("d-bars-0", "bars", now_ms());
 
     let text = monitor_text("d-bars-0");
@@ -4960,6 +4968,81 @@ fn roster_rank_skips_a_window_whose_reset_has_passed() {
         roster_rank(&crate::profile::ProfileName::from("lapsed")),
         RosterRank::Window(75.0),
         "a lapsed 5h at 100% ranks on the live 7d beside it, never as 0% free",
+    );
+}
+
+/// The same rule for the third-party arm (#74): a provider's cached bar whose
+/// reset has passed is not headroom, so the rank falls to the next live bar —
+/// never to the wallet arm, which would rank a windows-publishing provider as a
+/// scalar account.
+#[test]
+fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["zai"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let bar = |label: &str, pct: f64, resets_at: Option<String>| UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at,
+        used: None,
+        total: None,
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("zai"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![crate::providers::StatRow {
+                label: "total".to_string(),
+                value: "1117.10 CNY".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            }],
+            bars: vec![
+                bar("5h", 100.0, Some(stamp(-3600))),
+                bar("7d", 30.0, Some(stamp(3600))),
+            ],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("zai")),
+        RosterRank::Window(70.0),
+        "a lapsed 5h bar at 100% ranks on the live 7d beside it, not as 0% free and not on the wallet",
+    );
+
+    // Every bar lapsed: nothing a window could say, so the wallet arm takes
+    // over exactly as it does for a provider that never published bars.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("zai"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![crate::providers::StatRow {
+                label: "total".to_string(),
+                value: "1117.10 CNY".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            }],
+            bars: vec![bar("5h", 100.0, Some(stamp(-3600)))],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("zai")),
+        RosterRank::Balance {
+            currency: "CNY".to_string(),
+            amount: 1117.10,
+        },
+        "with no live bar the wallet arm takes over, the same rank a barless provider gets",
     );
 }
 

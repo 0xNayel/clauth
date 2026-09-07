@@ -494,8 +494,10 @@ fn a_bars_carrying_z_ai_row_renders_the_headline_alone() {
     })
     .expect("save state");
 
-    let parsed = serde_json::from_str::<crate::providers::ThirdPartyStats>(CAPTURED_GLM_CACHE)
-        .expect("the captured z.ai cache parses");
+    let parsed: crate::providers::ThirdPartyStats = serde_json::from_slice(
+        &crate::testutil::reanchored_bars_cache_bytes(CAPTURED_GLM_CACHE),
+    )
+    .expect("the captured z.ai cache parses");
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("glm"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,

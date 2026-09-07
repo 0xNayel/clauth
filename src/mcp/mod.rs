@@ -293,8 +293,15 @@ fn roster_rank(name: &ProfileName) -> RosterRank {
     if let Some(bar) = stats
         .bars
         .iter()
+        .filter(|b| crate::profile_json::usage_bar_is_live(b))
         .find(|b| b.label == "5h")
-        .or_else(|| stats.bars.iter().find(|b| b.label == "7d"))
+        .or_else(|| {
+            stats
+                .bars
+                .iter()
+                .filter(|b| crate::profile_json::usage_bar_is_live(b))
+                .find(|b| b.label == "7d")
+        })
     {
         return RosterRank::Window(100.0 - bar.pct);
     }

@@ -344,11 +344,25 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
         .map(|r| r.value.as_str());
 
     let mut body = if !s.bars.is_empty() {
-        s.bars
+        // A bar whose reset has passed is the previous window's last reading
+        // (#74): it drops the same way the OAuth row drops, so the headline
+        // renders the account's live headroom rather than a stale figure. All
+        // bars lapsed leaves the wallet/row arms, which is the honest answer
+        // for an account no live bar speaks for.
+        let live_bars: Vec<&crate::providers::UsageBar> = s
+            .bars
             .iter()
-            .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .filter(|b| crate::profile_json::usage_bar_is_live(b))
+            .collect();
+        if live_bars.is_empty() {
+            String::new()
+        } else {
+            live_bars
+                .iter()
+                .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
         format!("{}: {}", wallet.label, wallet.value)
     } else if let Some(row) = s

@@ -99,6 +99,37 @@ fn third_party_headline_skips_value_less_heading_row() {
     assert_eq!(third_party_headline(&s), "api balance: $4.20");
 }
 
+/// A bar whose `resets_at` has passed is the previous window's last reading,
+/// not current headroom (#74, the OAuth rule's third-party arm): it drops from
+/// the headline the same way the row drops from the published `windows` array,
+/// while an unstamped bar stays — no stamp is missing data, not a lapsed window.
+#[test]
+fn third_party_headline_drops_bars_whose_reset_has_passed() {
+    let lapsed = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 3_600);
+    let live = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3_600);
+    let s = third_party_stats(
+        vec![
+            UsageBar {
+                label: "5h".to_string(),
+                pct: 100.0,
+                resets_at: Some(lapsed),
+                used: None,
+                total: None,
+            },
+            UsageBar {
+                label: "7d".to_string(),
+                pct: 30.0,
+                resets_at: Some(live),
+                used: None,
+                total: None,
+            },
+        ],
+        vec![],
+        None,
+    );
+    assert_eq!(third_party_headline(&s), "7d 30%");
+}
+
 /// The reader here is picking a delegate target, so a provider's refusal has to
 /// reach the headline WITH its figure: the number alone reads as spendable and
 /// sent one run into a `402`, while the refusal alone hides how short the
