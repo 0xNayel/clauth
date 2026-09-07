@@ -13,7 +13,7 @@ use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
 use crate::providers::{Provider, ThirdPartyStats};
-use crate::usage::{PlanInfo, PlanTier, UsageInfo, now_ms};
+use crate::usage::{PlanInfo, PlanTier, UsageInfo, UsageWindow, now_ms};
 
 /// The last-persisted `/profile` plan for a name, off the same on-disk cache
 /// every reader here sources from.
@@ -240,6 +240,22 @@ pub(crate) struct Window {
     pub(crate) resets_at: Option<String>,
 }
 
+/// Whether one window row is still a CURRENT reading: a parseable `resets_at`
+/// in the future, or no parseable stamp at all. This is the row-level half of
+/// the [`oauth_windows`] drop (#74), shared with the MCP `5h/7d_used_pct`
+/// fields and the roster's own rank, so one lapsed window cannot read as a
+/// spent account through one surface while the row it came from drops through
+/// another. Deliberately looser than [`crate::usage::five_hour_live`], which
+/// requires a future stamp: that predicate decides whether a window EXISTS for
+/// fetch-skip logic, while this one keeps the unstamped row the published
+/// array already carries.
+pub(crate) fn window_row_is_live(w: &UsageWindow) -> bool {
+    w.resets_at
+        .as_deref()
+        .and_then(crate::usage::iso_to_epoch_secs)
+        .is_none_or(|resets_at| crate::usage::now_epoch_secs() < resets_at)
+}
+
 /// The [`Window`] rows of an OAuth usage read — 5h, 7d, then one entry per
 /// weekly model window (`7d <model>`). A window whose `resets_at` has passed
 /// drops here (#74): past its reset the figure is the previous window's last
@@ -248,16 +264,10 @@ pub(crate) struct Window {
 /// absence of a stamp is missing data, not a lapsed window, and the row
 /// without it is the honest shape every pre-reset row already publishes.
 pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
-    let now_secs = crate::usage::now_epoch_secs();
     usage
         .windows()
         .into_iter()
-        .filter(|(_, w)| {
-            w.resets_at
-                .as_deref()
-                .and_then(crate::usage::iso_to_epoch_secs)
-                .is_none_or(|resets_at| now_secs < resets_at)
-        })
+        .filter(|(_, w)| window_row_is_live(w))
         .map(|(label, w)| Window {
             label: label.to_string(),
             utilization_pct: w.utilization,

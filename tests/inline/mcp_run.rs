@@ -4926,6 +4926,127 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     );
 }
 
+/// A window whose reset has passed is the previous window's last reading, not
+/// headroom anyone can spend (#74). The rank must not sort a lapsed 5h at
+/// `100% used` to the bottom of the roster: it falls through to the next live
+/// figure, exactly as the dropped row leaves `usage unknown` in the prose.
+#[test]
+fn roster_rank_skips_a_window_whose_reset_has_passed() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::UsageInfo;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["lapsed"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("lapsed"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(stamp(-3600)),
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 25.0,
+                resets_at: Some(stamp(3600)),
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("lapsed")),
+        RosterRank::Window(75.0),
+        "a lapsed 5h at 100% ranks on the live 7d beside it, never as 0% free",
+    );
+}
+
+/// A 19h-lapsed 5h at the 100% cap still published `5h_used_pct: 100.0` beside
+/// the already-filtered `windows[]` (#74): one reply saying two things about one
+/// window. A lapsed share reads `null` — the same unknown the dropped row
+/// renders — while a live window beside it keeps its number, and an unstamped
+/// window stays: no stamp is missing data, not a lapsed window.
+#[test]
+fn a_folded_live_usage_clause_gates_the_pct_fields_on_window_liveness() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("cache path");
+    let seeded = |five: Option<crate::usage::UsageWindow>,
+                  seven: Option<crate::usage::UsageWindow>| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: five,
+                seven_day: seven,
+                ..Default::default()
+            },
+        );
+        crate::testutil::set_mtime(
+            &cache_path,
+            std::time::SystemTime::now() - Duration::from_secs(240),
+        );
+        fold_delegate_live_usage(
+            serde_json::json!({"is_error": false, "result": "ok"}),
+            &crate::profile::ProfileName::from("work"),
+            delegate_call_endpoint("work", &HashMap::new()),
+            None,
+            0,
+            DigestMode::Skip,
+        )
+    };
+
+    let live = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(stamp(3600)),
+        }),
+        None,
+    );
+    assert_eq!(live["live_usage"]["5h_used_pct"], 42.0);
+
+    let lapsed = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(stamp(-3600)),
+        }),
+        Some(crate::usage::UsageWindow {
+            utilization: 25.0,
+            resets_at: Some(stamp(3600)),
+        }),
+    );
+    assert_eq!(
+        lapsed["live_usage"]["5h_used_pct"],
+        serde_json::Value::Null,
+        "a lapsed 5h publishes no share: the row dropped, so the figure beside it is not a reading",
+    );
+    assert_eq!(
+        lapsed["live_usage"]["7d_used_pct"], 25.0,
+        "the live 7d beside it keeps its number",
+    );
+
+    let unstamped = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 30.0,
+            resets_at: None,
+        }),
+        None,
+    );
+    assert_eq!(
+        unstamped["live_usage"]["5h_used_pct"], 30.0,
+        "no stamp is missing data, not a lapsed window: the row stays, the share stays",
+    );
+}
+
 /// The two-wallet ruling (owner 2026-08-28): a profile whose cached rows carry
 /// the empty USD wallet BEFORE the funded CNY one ranks on the funded wallet —
 /// zero-amount wallets drop, the first funded one is the pick. Driven from the
