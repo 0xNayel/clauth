@@ -69,7 +69,7 @@ fn build_status_top_level_shape_and_active() {
             "active",
             "auth_status",
             "auto_start",
-            // Additive under schema 1 (interleaved auto-start queue): the
+            // Additive (interleaved auto-start queue): the
             // profile's queue slot and the queue's shared next-open estimate,
             // `null` for a profile that holds no slot.
             "auto_start_queue",
@@ -223,20 +223,20 @@ fn set_expiry(p: &mut Profile, expires_at: i64) {
 }
 
 #[test]
-fn build_status_auth_status_ok_expiring_broken() {
+fn build_status_auth_status_ok_expired_broken() {
     let _home = HomeSandbox::new();
     let now = crate::usage::now_ms() as i64;
 
     let mut ok = oauth_profile("ok");
     set_expiry(&mut ok, now + 3_600_000); // real life left → ok
-    let mut expiring = oauth_profile("expiring");
-    set_expiry(&mut expiring, now - 1_000); // past due, not flagged → expiring
+    let mut expired = oauth_profile("expired");
+    set_expiry(&mut expired, now - 1_000); // past due, not flagged → expired
     let mut broken = oauth_profile("broken");
     set_expiry(&mut broken, now - 1_000); // past due AND flagged → broken wins
 
     let mut config = AppConfig {
         state: AppState::default(),
-        profiles: vec![ok, expiring, broken],
+        profiles: vec![ok, expired, broken],
     };
     config.set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
 
@@ -244,17 +244,17 @@ fn build_status_auth_status_ok_expiring_broken() {
     let profiles = v["profiles"].as_array().unwrap();
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(get("ok")["auth_status"], "ok");
-    assert_eq!(get("expiring")["auth_status"], "expiring");
+    assert_eq!(get("expired")["auth_status"], "expired");
     assert_eq!(
         get("broken")["auth_status"],
         "broken",
-        "broken outranks expiring"
+        "broken outranks expired"
     );
 }
 
 /// `auth_status` reports on the credential a profile STORES, not on where its
 /// requests route: a hybrid (OAuth pair + `base_url`) with a dead access token
-/// must publish `expiring`, while an endpoint-only profile has no token to expire.
+/// must publish `expired`, while an endpoint-only profile has no token to expire.
 #[test]
 fn build_status_auth_status_types_the_hybrid_on_its_credential() {
     let _home = HomeSandbox::new();
@@ -280,7 +280,7 @@ fn build_status_auth_status_types_the_hybrid_on_its_credential() {
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(
         get("hybrid")["auth_status"],
-        "expiring",
+        "expired",
         "a stored pair expires regardless of the endpoint it routes past"
     );
     assert_eq!(
@@ -322,7 +322,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     assert_eq!(v["pending_switch"], "home");
     assert_eq!(
         v["schema"], SCHEMA_VERSION,
-        "pending_switch is part of schema 1 — no bump"
+        "pending_switch is additive — no bump of its own"
     );
 }
 
@@ -520,6 +520,50 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     );
 }
 
+/// A single-shot body derives `next_refresh_at` as mtime + interval. Once that
+/// stamp is past (`now >= stamp`) no live countdown vouches for it, so the field
+/// publishes `null` — pre-fix it published the overdue stamp, which reads as
+/// perpetually overdue (#74). Live-store stamps stay verbatim.
+#[test]
+fn build_status_nulls_a_past_derived_next_refresh() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    // Back-date the cache by 2 × interval, so mtime + interval is a known
+    // interval_ms in the past (mtime and interval are both ms, pinned here).
+    let interval_ms = 300_000u64;
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(2 * interval_ms),
+    );
+
+    let v = build_status(&config, interval_ms, None, false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_null(),
+        "a past derived stamp must publish null, got: {p}"
+    );
+}
+
 /// The half a spent-skip gate keyed on `is_third_party` gets wrong: a GENERIC
 /// api-key endpoint (`provider` is `None`, so that predicate says false) is
 /// fetched on the cadence by the third-party leg, and `drop_spent_oauth` blanks
@@ -613,8 +657,8 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
 // RLS-1: the additive per-profile `stale` flag = the daemon distrusts this
 // reading as a deep-slot stuck RateLimited (live status RateLimited AND the 429
 // streak past the active cap) — the SAME predicate `scan_auto_switch` acts on,
-// so the published cue and the switch decision cannot drift. Additive: schema
-// stays 1; the single-shot (no streaks) is always false.
+// so the published cue and the switch decision cannot drift. Additive: the
+// single-shot (no streaks) is always false.
 #[test]
 fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     use crate::usage::FetchStatus;
@@ -642,8 +686,8 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     // single-shot (no daemon / no streaks) → stale is present-and-false.
     let none = build_status(&config, 300_000, None, false);
     assert_eq!(
-        none["schema"], 1,
-        "stale is additive — schema must not bump"
+        none["schema"], SCHEMA_VERSION,
+        "stale is additive — no bump of its own"
     );
     assert_eq!(
         stale_of("work", &none),
@@ -765,8 +809,8 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         "past 2 × max(interval, 5min) + interval the single-shot publishes stale — #74's 22h reading"
     );
     assert_eq!(
-        v["schema"], 1,
-        "the age arm is additive — schema must not bump"
+        v["schema"], SCHEMA_VERSION,
+        "the age arm is additive — no bump of its own"
     );
 
     // A live-maxed window under the spent-accounts opt-out is exempt from the

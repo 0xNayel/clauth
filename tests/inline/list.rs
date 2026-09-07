@@ -435,3 +435,144 @@ fn a_dead_api_key_is_told_the_key_was_rejected() {
         "no session exists to name, got:\n{table}"
     );
 }
+
+/// The table has no freshness column, so a warm cache old enough to be
+/// distrusted renders the `(stale)` suffix — the same cue `status --json`
+/// publishes, surfaced where the table's numbers would otherwise read as live.
+#[test]
+fn list_table_marks_a_stale_reading() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    let age_ms = crate::profile_json::stale_after_ms(config.state.refresh_interval_ms) + 60_000;
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(age_ms),
+    );
+
+    let table = render_table(
+        &config,
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+    );
+    assert!(
+        table.contains("(stale)"),
+        "an old cache must render the stale cue, got:\n{table}"
+    );
+}
+
+/// `auth_status: "broken"` means the OAuth credential is dead and re-auth is the
+/// action — the same `(login expired)` the fetch-status path renders, read off
+/// the entry rather than re-derived from config.
+#[test]
+fn list_table_names_a_broken_oauth_credential() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("dead")],
+    };
+    config.set_auth_broken(&crate::profile::ProfileName::from("dead"), true);
+
+    let table = render_table(
+        &config,
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+    );
+    assert!(
+        table.contains("login expired"),
+        "a broken OAuth credential must read as login expired, got:\n{table}"
+    );
+}
+
+/// A profile can be both `auth_status: "broken"` and `fetch_status:
+/// "AuthExpired"` — a hybrid whose OAuth refresh was rejected and whose api
+/// key was too. Both render per the stacked rule; the identical-label pair
+/// (broken + lapsed console) collapses to one.
+#[test]
+fn list_table_stacks_both_dead_credentials_and_dedupes_the_identical_pair() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://api.deepseek.com/anthropic";
+    let mut p = crate::profile::Profile::new(
+        "hybrid".to_string(),
+        Some(base.to_string()),
+        Some("sk-rejected".to_string()),
+    );
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "hybrid-access".to_string(),
+            refresh_token: Some("hybrid-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let mut config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["hybrid".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    config.set_auth_broken(&crate::profile::ProfileName::from("hybrid"), true);
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["hybrid"]);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("hybrid"), fp);
+
+    let table = render_table(
+        &config,
+        &build_profile_entries(&config, 300_000, None, false),
+    );
+    assert!(
+        table.contains("login expired, key rejected"),
+        "a broken OAuth pair over a rejected key renders both labels, got:\n{table}"
+    );
+    assert_eq!(
+        table.matches("login expired").count(),
+        1,
+        "the broken label renders once, got:\n{table}"
+    );
+}
+
+/// The identical-label pair collapses: a broken OAuth pair beside a lapsed
+/// Alibaba console both read `login expired`, and the label says nothing twice.
+#[test]
+fn list_table_collapses_the_identical_login_expired_pair() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = crate::profile::Profile::new("qwen".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    let mut config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["qwen".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    config.set_auth_broken(&crate::profile::ProfileName::from("qwen"), true);
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["qwen"]);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
+
+    let table = render_table(
+        &config,
+        &build_profile_entries(&config, 300_000, None, false),
+    );
+    assert_eq!(
+        table.matches("login expired").count(),
+        1,
+        "one dead credential renders one login-expired cue, got:\n{table}"
+    );
+}

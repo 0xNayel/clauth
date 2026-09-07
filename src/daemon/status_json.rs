@@ -26,8 +26,10 @@ use crate::usage::{
     FetchStatus, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms, windows_maxed,
 };
 
-/// Bump when the JSON shape changes in a way readers must branch on.
-pub(crate) const SCHEMA_VERSION: u64 = 1;
+/// Bump when the JSON shape changes in a way readers must branch on. 2: the
+/// `auth_status` value `expiring` was renamed to `expired` (breaking — a
+/// reader keying on the old word must refuse or translate).
+pub(crate) const SCHEMA_VERSION: u64 = 2;
 
 /// Live scheduler signals a running daemon has that the single-shot
 /// `clauth status --json` cannot see. When absent, freshness and next-refresh
@@ -110,7 +112,7 @@ fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
 }
 
 /// Per-profile auth health for `status.json`. `broken` (last refresh rejected
-/// as revoked/invalid — `AppState::auth_broken`) outranks `expiring` (an OAuth
+/// as revoked/invalid — `AppState::auth_broken`) outranks `expired` (an OAuth
 /// access token past its expiry, refresh not yet run); everything else is
 /// `ok`. Readers default an absent field to `ok` (the additive-evolution
 /// rule); it is still emitted for an explicit, greppable contract.
@@ -118,14 +120,13 @@ fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
 /// Keyed on credential typing ([`Profile::login_is_oauth`]), not endpoint routing:
 /// this reports on the token the profile STORES, and a hybrid (an OAuth pair plus
 /// a `base_url`) holds one that expires like any other. Reading it behind the
-/// endpoint gate published a permanent `ok` over a dead token. The value set is
-/// unchanged, so the schema stays 1.
+/// endpoint gate published a permanent `ok` over a dead token.
 fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str {
     if config.is_auth_broken(&p.name) {
         return "broken";
     }
     if p.login_is_oauth() && p.access_token_expires_at().is_some_and(|exp| now_ms >= exp) {
-        return "expiring";
+        return "expired";
     }
     "ok"
 }
@@ -174,12 +175,12 @@ pub(crate) struct ProfileEntry {
     pub(crate) tier: Option<String>,
     /// A live `clauth start` session runs for this profile.
     pub(crate) has_live_session: bool,
-    /// `ok` / `expiring` / `broken` (see [`auth_status_str`]).
+    /// `ok` / `expired` / `broken` (see [`auth_status_str`]).
     pub(crate) auth_status: String,
     /// Freshness: a live daemon's verdict or the cache-mtime derivation; `None`
     /// when there is no cache at all.
     pub(crate) fetch_status: Option<String>,
-    /// Additive (schema stays 1): true when this reading is distrusted, by
+    /// Additive: true when this reading is distrusted, by
     /// either arm — a deep-slot stuck RateLimited, or cache age past
     /// `stale_after_ms(interval)` (the stuck arm needs the live stores and is
     /// `false` single-shot). Readers dim it / show a "stuck" cue instead of
@@ -192,7 +193,7 @@ pub(crate) struct ProfileEntry {
     /// pending (a spent skipped account, or no cache).
     pub(crate) next_refresh_at: Option<String>,
     pub(crate) auto_start: bool,
-    /// Additive (schema stays 1): this profile's slot in the interleaved
+    /// Additive: this profile's slot in the interleaved
     /// auto-start queue, `None`/`null` when it holds none — the toggle is off,
     /// it never opted into `auto_start`, or it cannot open a window.
     /// `default` so a reader stays additive-tolerant of an older writer.
@@ -322,10 +323,13 @@ pub(crate) fn build_profile_entries(
 
             // next_refresh_at: the live countdown store, else mtime + interval
             // (also the fallback for names the live store doesn't carry). A
-            // spent OAuth account under `refresh_spent_accounts` OFF has no
-            // pending refresh — the scheduler blanks its live entry, so guard the
-            // derivation too, else it falls through to a past mtime+interval
-            // stamp that reads as perpetually overdue.
+            // derived stamp already past (`now >= mtime + interval`) publishes
+            // None — the single-shot has no live countdown to vouch for it, so
+            // an overdue stamp would read as perpetually overdue (#74).
+            // Live-store stamps stay verbatim: a daemon's own countdown is real.
+            // A spent OAuth account under `refresh_spent_accounts` OFF has no
+            // pending refresh — the scheduler blanks its live entry, so
+            // `spent_skipped` guards the derivation too.
             //
             // Excluded on the cache selector, not `is_third_party`: the skip
             // this mirrors (`drop_spent_oauth`) blanks the OAUTH leg's map
@@ -333,7 +337,12 @@ pub(crate) fn build_profile_entries(
             // leg's countdown — a hybrid is spent on one leg and pending on the
             // other. That predicate also pins the constant below: the `&&`
             // reaches it only where `usage_cache_file` resolves to that file.
-            let derived_next = || mtime_ms.map(|mt| mt.saturating_add(interval_ms));
+            let derived_next = || {
+                mtime_ms.and_then(|mt| {
+                    let stamp = mt.saturating_add(interval_ms);
+                    (stamp > now).then_some(stamp)
+                })
+            };
             let spent_skipped = !config.state.refresh_spent_accounts
                 && !p.usage_cache_is_third_party()
                 && load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
