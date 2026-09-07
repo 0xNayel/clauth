@@ -13,9 +13,8 @@ use std::time::Duration;
 
 use sha2::Digest as _;
 
-use crate::actions::switch_profile_noninteractive;
+use crate::actions::{SwitchError, switch_profile_noninteractive};
 use crate::daemon::build_status;
-use crate::lock::StateLockTimeout;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::oauth;
@@ -336,21 +335,41 @@ fn switch(ctx: &ApiContext, req: &Request) -> Response {
             )
         }
         Err(e) => {
-            // The body carries the whole control-flattened reason (what it may
-            // reflect at all is a separate task's); only the log copy takes
-            // the line-length bound.
-            let reason = flatten_control_chars(&e.to_string());
+            // The chain (`{:#}`, every context anyhow carries) goes to
+            // daemon.log, the surface the operator owns — bounded like every
+            // logline is; the body keeps only what the closed set reflects. A
+            // `Failed` chain carries absolute home paths in its contexts
+            // (`failed to publish /home/…/credentials.json`), and a body is
+            // the one surface handed to a remote reader.
             logline!(
                 "clauth api: switch to '{canonical}' refused: {}",
-                sanitize_for_log(&reason)
+                sanitize_for_log(&flatten_control_chars(&format!("{e:#}")))
             );
             // A held state flock is the one retryable failure here: another
             // clauth process is mid-write, and the same request will work in a
             // moment. Everything else needs the operator to change something.
-            if e.downcast_ref::<StateLockTimeout>().is_some() {
-                Response::refused(503, "state_locked", &reason)
+            if let Some(timeout) = e.state_lock_timeout() {
+                Response::refused(
+                    503,
+                    "state_locked",
+                    &flatten_control_chars(&timeout.to_string()),
+                )
+            } else if let Some(sentence) = e.deep_refusal() {
+                // A refusal authored by a leg's own gate (the deep membership
+                // re-read under the state flock): the sentence is the same
+                // closed set, so it reflects like the arms above.
+                Response::refused(409, "switch_refused", &sentence)
             } else {
-                Response::refused(409, "switch_refused", &reason)
+                match &e {
+                    SwitchError::Refused(sentence) => {
+                        Response::refused(409, "switch_refused", sentence)
+                    }
+                    // The reflected copy is a fixed literal, so it needs no
+                    // sanitize; the variable chain stays in daemon.log.
+                    SwitchError::Failed(_) => {
+                        Response::refused(500, "switch_failed", "the switch failed; see daemon.log")
+                    }
+                }
             }
         }
     }

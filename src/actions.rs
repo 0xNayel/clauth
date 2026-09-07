@@ -14,7 +14,7 @@ use crate::claude::{
     live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
     read_claude_endpoint_config, snapshot_active_credentials,
 };
-use crate::lock::{StateLockHeld, with_state_lock};
+use crate::lock::{StateLockHeld, StateLockTimeout, with_state_lock};
 use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::out::{out, outln};
@@ -73,6 +73,23 @@ pub(crate) fn validate_profile_name(
 /// write, so a concurrent `disable_profile` can't land in the gap — a
 /// pre-lock check in a CLI/MCP wrapper is a friendly early error at best,
 /// never the authoritative one.
+/// An authored refusal raised by a deep leg rather than one of
+/// [`switch_profile_noninteractive`]'s own arms: the same closed diagnostic set
+/// (condition + fix, never a path), lifted out of the open anyhow chain so a
+/// remote surface can reflect it. Carried through anyhow's chain by the legs,
+/// so it reaches a caller as the head line — the CLI prints the sentence, the
+/// MCP tool's `reason` holds it, byte-identical to the old `bail!` head.
+#[derive(Debug)]
+pub(crate) struct DeepRefusal(pub(crate) String);
+
+impl std::fmt::Display for DeepRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeepRefusal {}
+
 fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()> {
     // Fresh membership, not just the in-memory list: a caller can hold a config
     // older than a concurrent CLI delete/rename (the daemon reloads once a
@@ -82,13 +99,15 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
     // here, before any side effect. Runs under the state flock, which makes the
     // on-disk read stable.
     if !crate::profile::is_configured(name)? {
-        bail!("profile '{name}' not found");
+        bail!(DeepRefusal(format!("profile '{name}' not found")));
     }
     let Some(profile) = config.find(name) else {
-        bail!("profile '{name}' not found");
+        bail!(DeepRefusal(format!("profile '{name}' not found")));
     };
     if profile.is_disabled() {
-        bail!("'{name}': account is disabled, run `clauth enable {name}`");
+        bail!(DeepRefusal(format!(
+            "'{name}': account is disabled, run `clauth enable {name}`"
+        )));
     }
     Ok(())
 }
@@ -275,6 +294,80 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
 /// because the AUTH-1 gate below may refresh over HTTP, which must never run
 /// under the config mutex. `refresher` is injected so the gate is testable
 /// offline (production callers pass [`oauth::refresh_result`]).
+/// Why a headless switch ([`switch_profile_noninteractive`]) failed, split so
+/// each caller can reflect only what its surface may show.
+///
+/// [`SwitchError::Refused`] carries an authored sentence — the `bail!` arms
+/// and the `format::Message` renders below, the closed diagnostic set every
+/// clauth surface already spells the same way. A reflectable refusal: it
+/// names the condition and the fix, never a path.
+///
+/// [`SwitchError::Failed`] carries the open anyhow chain (the IO arms and
+/// path-bearing contexts under `finish_switch` and the link/snapshot
+/// helpers). A chain like that names absolute paths under the operator's
+/// home, so only local surfaces may read it: the MCP tool (stdio to the
+/// operator's own machine) via the plain Display, the daemon's own
+/// `daemon.log` via the alternate `{:#}` form. An HTTP body reflects none of
+/// the chain itself — the route reflects only the fixed literal, the
+/// path-free `StateLockTimeout` Display, and the closed-set `DeepRefusal`.
+#[derive(Debug)]
+pub(crate) enum SwitchError {
+    Refused(String),
+    Failed(anyhow::Error),
+}
+
+impl SwitchError {
+    /// The retryable condition inside a [`Failed`] chain, if any: contention
+    /// on the state flock can be raised anywhere down the switch, so it is
+    /// asked of the chain rather than caught at one site.
+    pub(crate) fn state_lock_timeout(&self) -> Option<&StateLockTimeout> {
+        match self {
+            Self::Refused(_) => None,
+            Self::Failed(e) => e.downcast_ref(),
+        }
+    }
+
+    /// A [`DeepRefusal`] raised by a leg's own gate rather than one of the
+    /// arms above, if any: the same closed set, so the route reflects it as
+    /// a 409 rather than answering an authored refusal with the 500 literal.
+    pub(crate) fn deep_refusal(&self) -> Option<String> {
+        match self {
+            Self::Refused(_) => None,
+            Self::Failed(e) => e.downcast_ref::<DeepRefusal>().map(|r| r.0.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for SwitchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `alternate()` is what `{:#}` sets: the full chain for the one
+            // surface (daemon.log) that may read it. The plain form keeps
+            // anyhow's head-line semantics, so the MCP tool's `reason`
+            // payload stays byte-identical for every input.
+            Self::Refused(sentence) => f.write_str(sentence),
+            Self::Failed(e) => {
+                if f.alternate() {
+                    write!(f, "{e:#}")
+                } else {
+                    write!(f, "{e}")
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for SwitchError {}
+
+/// Every anyhow arm below (the IO legs, the path-bearing contexts) funnels
+/// through `?` into `Failed`, the half a remote surface may not reflect;
+/// `From` is what keeps the call sites bare.
+impl From<anyhow::Error> for SwitchError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Failed(e)
+    }
+}
+
 pub(crate) fn switch_profile_noninteractive(
     config: &crate::profile::ConfigHandle,
     target: &ProfileName,
@@ -283,7 +376,7 @@ pub(crate) fn switch_profile_noninteractive(
         &str,
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
-) -> Result<(Option<String>, String)> {
+) -> std::result::Result<(Option<String>, String), SwitchError> {
     let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
@@ -301,7 +394,9 @@ pub(crate) fn switch_profile_noninteractive(
     // authoritative `ensure_switch_target_ok` gate inside `switch_profile`
     // stays the backstop, this only prevents the spurious rotation.
     if target_disabled {
-        bail!("'{target}': account is disabled, run `clauth enable {target}`");
+        return Err(SwitchError::Refused(format!(
+            "'{target}': account is disabled, run `clauth enable {target}`"
+        )));
     }
 
     // AUTH-1 (Incident C): gate the target before its credentials land in the
@@ -314,11 +409,17 @@ pub(crate) fn switch_profile_noninteractive(
     if previous.as_deref() != Some(target) {
         match oauth::ensure_installable(config, target, refresher) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
-            oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(target).line()),
+            oauth::AuthGate::Broken => {
+                return Err(SwitchError::Refused(
+                    crate::format::login_expired(target).line(),
+                ));
+            }
             // NOT a CLI stderr path — this is the MCP tool's JSON `reason`, so it
             // keeps the canned line without the status.
             oauth::AuthGate::Transient(e) => {
-                bail!("{}", crate::format::refresh_transient(target, &e).line())
+                return Err(SwitchError::Refused(
+                    crate::format::refresh_transient(target, &e).line(),
+                ));
             }
         }
     }
@@ -338,10 +439,10 @@ pub(crate) fn switch_profile_noninteractive(
             Some(DivergenceChoice::Discard) => switch_profile_discard(config, target)?,
             Some(DivergenceChoice::NewProfile) | None => {
                 let active = previous.as_deref().unwrap_or_default();
-                bail!(
+                return Err(SwitchError::Refused(format!(
                     "'{active}' has a login clauth hasn't saved, {}",
                     crate::format::RESOLVE_IN_TUI
-                )
+                )));
             }
         }
     } else {

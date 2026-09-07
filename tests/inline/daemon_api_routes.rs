@@ -14,8 +14,8 @@
 use super::*;
 
 use crate::profile::{
-    AppConfig, AppState, ClaudeCredentials, ConfigHandle, OAuthToken, Profile, save_app_state,
-    save_profile,
+    AppConfig, AppState, ClaudeCredentials, ConfigHandle, DivergenceChoice, OAuthToken, Profile,
+    save_app_state, save_profile,
 };
 use crate::testutil::HomeSandbox;
 
@@ -731,6 +731,254 @@ fn a_switch_to_a_clock_expired_target_does_not_invert_the_lock_order() {
     assert_eq!(
         resp.status, 409,
         "an unrefreshable target is refused, not unwound through the gate"
+    );
+}
+
+/// The switch is the same action `clauth <name>` and the MCP tool perform, so
+/// it inherits their refusal sentences — not their anyhow chains. The IO arms
+/// of a switch carry context strings that name absolute paths under the
+/// operator's home (`failed to publish /home/…/credentials.json`); a reason
+/// that reflects the open chain puts the operator's home layout in an HTTP
+/// body, and the body is the one surface the daemon hands to a remote reader.
+/// The failure is posed by making the live `.credentials.json` a directory:
+/// the relink stages its symlink fine, and the rename onto a directory fails
+/// `EISDIR` — the `failed to publish <home path>` arm itself.
+#[test]
+fn a_failed_switch_reflects_no_home_path() {
+    let home = HomeSandbox::new();
+    let config = seeded_config();
+    {
+        let mut cfg = config.lock().expect("config");
+        // A diverged-looking live slot routes to the divergence machinery, so
+        // the Discard default is what lets a headless switch reach the link
+        // publish this fixture is built to fail.
+        cfg.state.default_divergence = Some(DivergenceChoice::Discard);
+    }
+    std::fs::create_dir_all(
+        crate::profile::claude_dir()
+            .expect("claude dir")
+            .join(".credentials.json"),
+    )
+    .expect("pose the wedge");
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+
+    let resp = handle(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    let body = body_json(&resp);
+    let reason = body["reason"].as_str().expect("reason is a string");
+    let sandbox = home.home().display().to_string();
+    assert_eq!(
+        resp.status,
+        500,
+        "an IO failure answers switch_failed, body: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
+    assert_eq!(body["error"], serde_json::json!("switch_failed"));
+    assert!(
+        !reason.contains(&sandbox) && !reason.contains("/home/"),
+        "the reflected reason must carry no home path, got: {reason}"
+    );
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("alpha"),
+        "a failed switch must leave the active profile unchanged"
+    );
+}
+
+/// The 500 the failed switch answers is a fixed literal, so the context that
+/// would name the home path has to live somewhere the operator can read: the
+/// refusal logline, and only it. `Refused` renders a bare sentence, `Failed`
+/// the full anyhow chain — a head-line-only copy would name neither the
+/// failed operation nor its cause, and the body's "see daemon.log" would
+/// point at a log that cannot answer.
+#[test]
+fn a_failed_switchs_context_reaches_the_log_but_not_the_body() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    {
+        let mut cfg = config.lock().expect("config");
+        cfg.state.default_divergence = Some(DivergenceChoice::Discard);
+    }
+    std::fs::create_dir_all(
+        crate::profile::claude_dir()
+            .expect("claude dir")
+            .join(".credentials.json"),
+    )
+    .expect("pose the wedge");
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+    let resp = handle(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 500);
+
+    let body = body_json(&resp);
+    assert_eq!(
+        body["reason"],
+        serde_json::json!("the switch failed; see daemon.log"),
+        "the body is the fixed literal, nothing else"
+    );
+    let joined = lines.snapshot().join("\n");
+    let logged = joined
+        .lines()
+        .find(|line| line.contains("refused"))
+        .expect("the refusal reached the log");
+    assert!(
+        logged.contains("failed to publish"),
+        "the logline names the operation that failed: {logged}"
+    );
+    assert!(
+        logged.contains("Is a directory"),
+        "the logline carries the underlying cause, not the head line alone: {logged}"
+    );
+    let home = _home.home().display().to_string();
+    assert!(
+        !body["reason"].as_str().unwrap_or_default().contains(&home),
+        "the home path lives in the log, never the body"
+    );
+}
+
+/// The authored refusals — the closed diagnostic set `src/format.rs` renders
+/// — reflect verbatim, so a remote reader gets the same actionable sentence
+/// the CLI and MCP surfaces do, name and fix included.
+#[test]
+fn a_refused_switch_reflects_the_authored_sentence() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    {
+        let mut cfg = config.lock().expect("config");
+        let beta = cfg
+            .find_mut(&crate::profile::ProfileName::from("beta"))
+            .expect("beta");
+        beta.disabled = true;
+        save_profile(beta).expect("save");
+    }
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+
+    let resp = handle(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    let body = body_json(&resp);
+    assert_eq!(resp.status, 409);
+    assert_eq!(body["error"], serde_json::json!("switch_refused"));
+    assert_eq!(
+        body["reason"],
+        serde_json::json!("'beta': account is disabled, run `clauth enable beta`")
+    );
+}
+
+/// A config snapshot a tick old must not misfile a genuine refusal as an
+/// unexpected failure. `ensure_switch_target_ok` re-reads the roster off disk
+/// under the state flock precisely because the daemon holds a handle a
+/// concurrent `clauth delete` can leave behind; the refusal it raises there is
+/// still authored, still carries the fix, and must still answer 409 — the
+/// route's own membership check passed a moment earlier, so answering 500 for
+/// what the disk says a tick later mislabels a refusal the operator can act
+/// on. Posed by the divergence itself: the handle still lists beta while the
+/// saved roster does not.
+#[test]
+fn a_target_vanishing_mid_switch_answers_refused_not_failed() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    // seeded_config saved a roster carrying both profiles; take beta back off
+    // the disk while the in-memory handle keeps it, which is exactly what a
+    // delete racing the route's pre-check leaves behind.
+    {
+        let mut cfg = config.lock().expect("config");
+        cfg.state.profiles.retain(|n| n != "beta");
+        save_app_state(&cfg.state).expect("save roster");
+    }
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+
+    let resp = handle(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    let body = body_json(&resp);
+    assert_eq!(
+        resp.status,
+        409,
+        "a vanished target is a refusal, not an unexpected failure: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
+    assert_eq!(body["error"], serde_json::json!("switch_refused"));
+    assert_eq!(
+        body["reason"],
+        serde_json::json!("profile 'beta' not found")
+    );
+}
+
+/// A held state flock is the one retryable refusal, and its reason is the
+/// closed `StateLockTimeout` Display — `~/.clauth/.lock` spelled as a literal,
+/// never the sandbox's absolute home. Posed with the same independent open
+/// file description `tests/inline/lock.rs` uses to stand in for a second
+/// clauth process, plus the thread-local deadline override so the wait is
+/// milliseconds, not 25 s.
+#[test]
+fn a_state_lock_timeout_is_503_with_a_path_free_reason() {
+    let _home = HomeSandbox::new();
+    // Seeded BEFORE the wedge: `seeded_config` takes the state flock itself.
+    let ctx = ctx_with(seeded_config());
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+
+    let resp = handle(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+
+    let body = body_json(&resp);
+    assert_eq!(resp.status, 503, "{}", String::from_utf8_lossy(&resp.body));
+    assert_eq!(body["error"], serde_json::json!("state_locked"));
+    let reason = body["reason"].as_str().expect("reason is a string");
+    assert!(
+        !reason.contains("/home/") && !reason.contains("home"),
+        "the reflected reason must carry no home path, got: {reason}"
+    );
+    assert!(
+        reason.contains("state lock"),
+        "the reason names the condition, got: {reason}"
     );
 }
 
