@@ -168,6 +168,21 @@ fn api_enabled() -> bool {
     std::env::var(NO_API_ENV).as_deref() != Ok("1")
 }
 
+/// `serve`'s listener decision, extracted because it is the REST kill switch's
+/// call site: `Some(addr)` under `CLAUTH_NO_API=1` must yield `no_api`, never a
+/// prepared listener. The prepare arm reads the certificate and mints the token;
+/// the bind itself runs later, below the claim, in `api::serve_prepared`.
+fn listener_setup(
+    listen: Option<SocketAddr>,
+    certs: &api::tls::CertSource,
+) -> Result<(Option<api::Prepared>, Option<SocketAddr>)> {
+    Ok(match listen {
+        Some(addr) if api_enabled() => (Some(api::prepare(addr, certs)?), None),
+        Some(addr) => (None, Some(addr)),
+        None => (None, None),
+    })
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
 ///
@@ -198,11 +213,7 @@ pub(crate) fn serve(
     // happen here: it runs below the claim (and below a standby's promotion) in
     // `api::serve_prepared`, where the incumbent's port is free and a redundant
     // instance never reaches a bind at all.
-    let (prepared, no_api) = match listen {
-        Some(addr) if api_enabled() => (Some(api::prepare(addr, certs)?), None),
-        Some(addr) => (None, Some(addr)),
-        None => (None, None),
-    };
+    let (prepared, no_api) = listener_setup(listen, certs)?;
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
     // redundant instance must not GC the live daemon's runtime forest or walk

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(unsafe_code, clippy::unwrap_used, clippy::expect_used)]
 
 //! One real request over a real TLS connection.
 //!
@@ -97,19 +97,23 @@ fn no_tls_fixture() {
 }
 
 /// A CA, and a `localhost` certificate signed by it, laid out the way lego
-/// writes them. Returns `None` when `openssl` cannot produce them.
+/// writes them. `Err` when `openssl` is missing AND the run demands a fixture;
+/// `Ok(None)` only for a missing `openssl` on a box that accepted the skip.
 ///
-/// The leaf gets its name from a subjectAltName in an extension FILE. Both
-/// details matter: rustls verifies the SAN and ignores the CN entirely, and an
-/// `-extfile` on disk keeps generation independent of what the test harness has
-/// attached to stdin.
-fn generate_chain(dir: &Path) -> Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)> {
+/// A present-but-failing `openssl` is an `Err` too, not a skip: LibreSSL
+/// rejecting `-addext` is exactly that case, and a leg that CI marks as
+/// required was silently carrying zero listener coverage while reporting
+/// green — a skipped test is indistinguishable from a passing one in a
+/// summary line.
+fn generate_chain(
+    dir: &Path,
+) -> Result<Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)>, String> {
     // Checked up front and separately from the generation below, so "no openssl
     // here" (a skip) is never confused with "openssl is present and failing" (a
-    // broken fixture, which returns `None` and shows up as an absent test).
+    // broken fixture, which errors below).
     if !openssl(&["version"]) {
         no_tls_fixture();
-        return None;
+        return Ok(None);
     }
 
     let ca_key = dir.join("ca.key");
@@ -118,13 +122,14 @@ fn generate_chain(dir: &Path) -> Option<(crate::daemon::api::tls::CertPaths, std
     let ext = dir.join("leaf.ext");
     let paths = crate::daemon::api::tls::lego_paths_in(dir, SERVER_NAME);
 
-    std::fs::write(
+    let write_ext = std::fs::write(
         &ext,
         format!("subjectAltName=DNS:{SERVER_NAME}\nbasicConstraints=critical,CA:FALSE\n"),
-    )
-    .ok()?;
-
-    let ok = openssl(&[
+    );
+    if let Err(e) = write_ext {
+        return Err(format!("failed to write the leaf extension file: {e}"));
+    }
+    let ca_args = [
         "req",
         "-x509",
         "-newkey",
@@ -133,16 +138,17 @@ fn generate_chain(dir: &Path) -> Option<(crate::daemon::api::tls::CertPaths, std
         "ec_paramgen_curve:P-256",
         "-nodes",
         "-keyout",
-        ca_key.to_str()?,
+        ca_key.to_str().ok_or("ca key path is not UTF-8")?,
         "-out",
-        ca_crt.to_str()?,
+        ca_crt.to_str().ok_or("ca crt path is not UTF-8")?,
         "-days",
         "3650",
         "-subj",
         "/CN=clauth-test-ca",
         "-addext",
         "basicConstraints=critical,CA:TRUE",
-    ]) && openssl(&[
+    ];
+    let leaf_args = [
         "req",
         "-newkey",
         "ec",
@@ -150,33 +156,84 @@ fn generate_chain(dir: &Path) -> Option<(crate::daemon::api::tls::CertPaths, std
         "ec_paramgen_curve:P-256",
         "-nodes",
         "-keyout",
-        paths.key.to_str()?,
+        paths.key.to_str().ok_or("leaf key path is not UTF-8")?,
         "-out",
-        csr.to_str()?,
+        csr.to_str().ok_or("csr path is not UTF-8")?,
         "-subj",
         &format!("/CN={SERVER_NAME}"),
-    ]) && openssl(&[
+    ];
+    let sign_args = [
         "x509",
         "-req",
         "-in",
-        csr.to_str()?,
+        csr.to_str().ok_or("csr path is not UTF-8")?,
         "-CA",
-        ca_crt.to_str()?,
+        ca_crt.to_str().ok_or("ca crt path is not UTF-8")?,
         "-CAkey",
-        ca_key.to_str()?,
+        ca_key.to_str().ok_or("ca key path is not UTF-8")?,
         "-out",
-        paths.cert.to_str()?,
+        paths.cert.to_str().ok_or("leaf crt path is not UTF-8")?,
         "-days",
         "3650",
         "-extfile",
-        ext.to_str()?,
-    ]);
-    if !ok {
-        return None;
+        ext.to_str().ok_or("leaf ext path is not UTF-8")?,
+    ];
+    if !openssl(&ca_args) {
+        return Err("openssl failed to generate the test CA".to_string());
+    }
+    if !openssl(&leaf_args) {
+        return Err("openssl failed to generate the test leaf key".to_string());
+    }
+    if !openssl(&sign_args) {
+        return Err("openssl failed to sign the test leaf".to_string());
     }
     // lego's `<fqdn>.issuer.crt`: the chain the leaf does not carry itself.
-    std::fs::copy(&ca_crt, paths.issuer.as_deref()?).ok()?;
-    Some((paths, ca_crt))
+    let issuer = paths
+        .issuer
+        .as_deref()
+        .ok_or_else(|| "no issuer path for the lego layout".to_string())?;
+    std::fs::copy(&ca_crt, issuer).map_err(|e| format!("failed to copy the issuer chain: {e}"))?;
+    Ok(Some((paths, ca_crt)))
+}
+
+/// A present-but-failing `openssl` must fail the run, not skip it. The missing
+/// case is covered by `no_tls_fixture` + `CLAUTH_REQUIRE_TLS_FIXTURE`; the
+/// FAILING case is the one CI's required legs were silently passing on — macOS
+/// LibreSSL rejecting `-addext` reports green over zero listener coverage.
+///
+/// A fake `openssl` that answers `version` (so the presence probe passes) and
+/// fails everything else stands in for exactly that box.
+#[test]
+fn a_present_but_failing_openssl_fails_the_fixture_not_the_skip() {
+    let _home = HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(_home.home()).expect("shim dir");
+    let shim = tmp.path().join("openssl");
+    std::fs::write(&shim, "#!/bin/sh\n[ \"$1\" = version ] && exit 0\nexit 1\n")
+        .expect("write shim");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&shim).expect("shim meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).expect("chmod shim");
+    }
+    // SAFETY: env mutation is unsafe in Rust 2024; serialized by the sandbox's
+    // HOME_TEST_LOCK, restored below.
+    unsafe {
+        let prev_path = std::env::var_os("PATH").expect("PATH is set");
+        let mut path = std::ffi::OsString::from(tmp.path());
+        path.push(":");
+        path.push(&prev_path);
+        std::env::set_var("PATH", path);
+        let result = generate_chain(tmp.path());
+        std::env::set_var("PATH", prev_path);
+        let Err(msg) = result else {
+            panic!("a failing openssl must error the fixture, not skip it");
+        };
+        assert!(
+            msg.contains("openssl failed"),
+            "the failure names its cause: {msg}"
+        );
+    }
 }
 
 /// A TLS client connection that can be driven request by request.
@@ -261,7 +318,7 @@ fn round_trip(
 #[test]
 fn a_real_tls_request_is_served_end_to_end() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let Some((paths, ca_crt)) = generate_chain(dir.path()) else {
+    let Some((paths, ca_crt)) = generate_chain(dir.path()).expect("fixture") else {
         eprintln!("SKIPPED a_real_tls_request_is_served_end_to_end: openssl is not usable here");
         return;
     };
@@ -429,7 +486,7 @@ struct Fixture {
 /// `None` when openssl cannot produce a certificate here.
 fn fixture() -> Option<Fixture> {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (paths, ca_crt) = generate_chain(dir.path())?;
+    let (paths, ca_crt) = generate_chain(dir.path()).expect("fixture")?;
     let server_tls = tls::server_config_from(&paths).expect("server config");
     let client_tls = client_config(&ca_crt)?;
 
@@ -925,7 +982,7 @@ fn a_framing_error_answers_and_closes_even_on_a_persistent_connection() {
 #[test]
 fn a_plaintext_client_gets_nothing_back() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let Some((paths, _ca)) = generate_chain(dir.path()) else {
+    let Some((paths, _ca)) = generate_chain(dir.path()).expect("fixture") else {
         eprintln!("SKIPPED a_plaintext_client_gets_nothing_back: openssl is not usable here");
         return;
     };
@@ -1072,7 +1129,7 @@ fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
 fn prepare_leaves_the_port_unbound() {
     let _home = HomeSandbox::new();
     let dir = tempfile::tempdir().expect("tempdir");
-    let Some((paths, _ca)) = generate_chain(dir.path()) else {
+    let Some((paths, _ca)) = generate_chain(dir.path()).expect("fixture") else {
         return;
     };
     // A concrete port, picked by binding and dropping: prepare must leave it
@@ -1100,7 +1157,7 @@ fn prepare_leaves_the_port_unbound() {
 fn a_second_listener_instance_yields_to_the_daemon_holding_the_port() {
     let _home = HomeSandbox::new();
     let certdir = tempfile::tempdir().expect("tempdir");
-    let Some((paths, _ca)) = generate_chain(certdir.path()) else {
+    let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
         return;
     };
     let incumbent_port = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1120,4 +1177,61 @@ fn a_second_listener_instance_yields_to_the_daemon_holding_the_port() {
         &crate::daemon::api::tls::CertSource::Explicit(paths),
     )
     .expect("a redundant listener instance exits 0, not a bind error");
+}
+
+/// A failing `prepare` must leave the singleton UNCLAIMED: `--replace`
+/// terminates the incumbent as part of claiming, so a certificate that dies in
+/// the prepare step above the claim has to die without touching the incumbent
+/// at all. The unit under test is the ORDER in `daemon::serve`, which no test
+/// pinned: the certificate-failure test calls `prepare` directly and this file's
+/// only other `serve` caller drives `ExitIfRunning` with a valid certificate.
+///
+/// Redundant with nothing: without the order, `--replace --listen` with a broken
+/// cert is the round-2 blocker — the incumbent is reaped first and the host is
+/// left with no daemon, no refresh, and no auto-switch.
+#[test]
+fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
+    let _home = HomeSandbox::new();
+    // An empty cert dir: a present `tls.json` pointing there, so `prepare`
+    // itself fails to load the certificate rather than skipping the listener.
+    let empty = tempfile::tempdir().expect("tempdir");
+    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
+    std::fs::write(
+        &tls_json,
+        serde_json::json!({ "schema": 1, "cert_dir": empty.path() }).to_string(),
+    )
+    .expect("write tls.json");
+    // A concrete port the incumbent holds, so a bind misplaced above the claim
+    // would fail here for a different reason.
+    let incumbent_port = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = incumbent_port.local_addr().expect("addr");
+    let dir = crate::profile::clauth_dir().expect("dir");
+    let incumbent = match crate::daemon::probe::claim_singleton(&dir, false).expect("claim") {
+        crate::daemon::probe::Claim::Active(lock) => lock,
+        _ => panic!("an uncontended sandbox must yield an active claim"),
+    };
+
+    let Err(err) = crate::daemon::serve(
+        crate::daemon::StartMode::Replace,
+        Some(addr),
+        &crate::daemon::api::tls::CertSource::Lego,
+    ) else {
+        panic!("an unreadable certificate must fail serve, not pass");
+    };
+    assert!(
+        format!("{err:#}").contains(&empty.path().display().to_string())
+            || format!("{err:#}").contains(".crt"),
+        "the failure names the path the operator has to fix: {err:#}"
+    );
+
+    // THE assertion: the incumbent is still the holder. `claim_by_replacing`
+    // terminates the holder, so if the claim had run before the failure the
+    // flock would be released and a fresh claim would succeed. It must not.
+    let second = crate::daemon::probe::claim_singleton(&dir, false).expect("second claim");
+    assert!(
+        matches!(second, crate::daemon::probe::Claim::Redundant),
+        "the failing prepare must leave the singleton held by the incumbent: {second:?}"
+    );
+    drop(incumbent);
 }

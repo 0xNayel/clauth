@@ -1148,6 +1148,38 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
 
 // ── CLAUTH_NO_API ───────────────────────────────────────────────────────────
 
+/// The kill switch pinned at its CALL SITE, not just its predicate: with
+/// `CLAUTH_NO_API=1` and a `--listen` address, `serve`'s listener decision must
+/// yield the no-api arm — no certificate read, no token mint, nothing for
+/// `api::serve_prepared` to bind later. Deleting the `api_enabled()` guard from
+/// the start path (leaving the predicate test green) re-arms a listener the
+/// operator could only kill by editing the unit.
+///
+/// `Lego` (not a generated chain) and no `HomeSandbox` on purpose: under the
+/// opt-out the decision never reads the certificate or the token file, so the
+/// arm is decided by the env var alone — and a regression that DID reach the
+/// cert read would fail here by erroring on an unreadable certificate, which
+/// is also a red. A sandbox would deadlock the guard: `HomeSandbox` holds
+/// `HOME_TEST_LOCK` for the test's life and `with_no_api_env` takes it again.
+#[test]
+fn the_kill_switch_suppresses_the_listener_at_the_start_path() {
+    with_no_api_env(Some("1"), || {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let (prepared, no_api) =
+            super::listener_setup(Some(addr), &super::api::tls::CertSource::Lego)
+                .expect("the opt-out is a decision, not a failure");
+        assert!(
+            prepared.is_none(),
+            "CLAUTH_NO_API=1 must suppress the listener at the start path"
+        );
+        assert_eq!(
+            no_api,
+            Some(addr),
+            "the opt-out still names the address it declined to serve"
+        );
+    });
+}
+
 /// `set_var`/`remove_var` are unsafe in Rust 2024 because they aren't
 /// thread-safe in a multi-threaded process. Serialized here by `HOME_TEST_LOCK`
 /// (the one mutex every env mutator across the suite takes) and undone before
