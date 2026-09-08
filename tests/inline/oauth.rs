@@ -82,6 +82,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -217,6 +218,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -282,6 +284,7 @@ fn profile_without_refresh_token_excluded() {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -376,6 +379,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -411,6 +415,7 @@ fn third_party_config(name: &str) -> AppConfig {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),

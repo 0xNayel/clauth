@@ -44,6 +44,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -1171,6 +1172,7 @@ fn bare(name: &str) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 

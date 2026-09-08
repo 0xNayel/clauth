@@ -45,6 +45,8 @@ use crate::profile::{
     ModelSettings, PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
     load_config, reload_fingerprint, save_app_state, save_profile,
 };
+use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
+use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
@@ -55,7 +57,7 @@ use crate::usage::{
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
     UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
     collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
-    now_ms, spawn_refresher, switch_gate_in_flight,
+    now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -2386,6 +2388,9 @@ impl App {
             let info_map = self.usage_store.lock().ok();
             let status_map = self.usage_status.lock().ok();
             let mut cfg = self.config();
+            let now = now_ms();
+            let interval_ms = cfg.state.refresh_interval_ms;
+            let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             for p in &mut cfg.profiles {
                 if let Some(s) = info_map.as_ref() {
                     p.usage = s.get(p.name.as_str()).cloned();
@@ -2403,6 +2408,22 @@ impl App {
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
                 }
+                // #74 degraded cue: cache age past the derived threshold reads
+                // stale, independent of fetch_status. Same threshold, same
+                // mtime source, and same maxed-window exemption as
+                // `status.json`'s `age_stale` arm — the exemption reads the
+                // DISK cache (`load_profile_cache`), never the live store,
+                // because the two can diverge on a spent account the
+                // scheduler dropped from its due set: reading the store there
+                // would publish the exact disagreement the exemption exists
+                // to prevent.
+                let spent_skipped = !refresh_spent_accounts
+                    && !p.usage_cache_is_third_party()
+                    && load_profile_cache::<UsageInfo>(&p.name, USAGE_CACHE_FILE)
+                        .is_some_and(|u| windows_maxed(&u, (now / 1000) as i64));
+                p.usage_stale = !spent_skipped
+                    && profile_cache_mtime_ms(&p.name, usage_cache_file(p))
+                        .is_some_and(|mt| now.saturating_sub(mt) > stale_after_ms(interval_ms));
             }
 
             bells = cfg

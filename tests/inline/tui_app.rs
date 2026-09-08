@@ -7505,6 +7505,98 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
     );
 }
 
+/// #74 degraded cue, FEED half: `apply_usage` derives `usage_stale` off the
+/// DISK cache mtime vs `stale_after_ms`, with the spent-account exemption
+/// reading the disk cache too (never the live store — a spent account the
+/// scheduler dropped from its due set keeps its store entry, so the two
+/// sources disagree exactly on the exempted state). The render pins in
+/// `tui_render_usage.rs` hold only if this derivation is right.
+#[test]
+fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
+    let stale_at = |age_ms: u64, disk_util: f64| {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = {
+            let mut profile =
+                crate::testutil::blank_profile(&crate::profile::ProfileName::from(GATE_PROFILE));
+            profile.bell_threshold = None;
+            App::new(crate::profile::AppConfig {
+                state: crate::profile::AppState {
+                    profiles: vec![GATE_PROFILE.into()],
+                    // The spent skip exists only under the opt-out (the
+                    // default is ON), so the exempt arm below needs it OFF.
+                    refresh_spent_accounts: false,
+                    ..crate::profile::AppState::default()
+                },
+                profiles: vec![profile],
+            })
+        };
+        // The live store carries a NON-maxed body while the disk cache is
+        // maxed (spent): the exemption must read the disk side, so a
+        // store-reading derivation flips stale on for a spent account and
+        // reds the exempt arm below.
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        {
+            let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+            store.insert(
+                GATE_PROFILE.to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 42.0,
+                        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                    }),
+                    ..UsageInfo::default()
+                },
+            );
+        }
+        crate::testutil::register_names(&[GATE_PROFILE]);
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(GATE_PROFILE),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: disk_util,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                ..UsageInfo::default()
+            },
+        );
+        let path = crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from(GATE_PROFILE),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .expect("cache path resolves");
+        crate::testutil::set_mtime(
+            &path,
+            std::time::SystemTime::now() - std::time::Duration::from_millis(age_ms),
+        );
+        app.apply_usage();
+        {
+            let cfg = app.config();
+            cfg.profiles
+                .iter()
+                .find(|p| p.name.as_str() == GATE_PROFILE)
+                .expect("profile present")
+                .usage_stale
+        }
+    };
+    let interval = crate::profile::AppState::default().refresh_interval_ms;
+    let fresh = stale_at(crate::profile_json::stale_after_ms(interval) / 2, 42.0);
+    let stale = stale_at(crate::profile_json::stale_after_ms(interval) + 60_000, 42.0);
+    // `windows_maxed` keys on the DISK body (100%, a far-future reset): the
+    // exempt arm holds even at an age far past the threshold, and holds
+    // against the live store's non-maxed body.
+    let spent = stale_at(
+        crate::profile_json::stale_after_ms(interval) + 60_000,
+        100.0,
+    );
+    assert!(!fresh, "a cache under the threshold must not read stale");
+    assert!(stale, "a cache past the threshold must read stale");
+    assert!(
+        !spent,
+        "a live-maxed window is exempt: its figure cannot change by polling"
+    );
+}
+
 /// The read half: the log is written by whichever process holds the fetch lease,
 /// so a file that appeared or grew since the last look must be picked up off its
 /// mtime. Written here AFTER the `App` is built, standing in for the daemon
@@ -8227,6 +8319,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 

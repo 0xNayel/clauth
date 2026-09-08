@@ -245,6 +245,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
             endpoint: None,
             best_effort: false,
         }),
+        usage_stale: false,
     }
 }
 
@@ -298,6 +299,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
             endpoint: None,
             best_effort: false,
         }),
+        usage_stale: false,
     }
 }
 
@@ -364,6 +366,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -775,6 +778,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 

@@ -977,6 +977,21 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         return render_status_rows(rows, w);
     }
 
+    // The `stale` cue: cache age past `stale_after_ms`, a fact orthogonal to
+    // `fetch_status` — the same kick-`blocked` precedent earns it its own pill.
+    // A `cached` pill and this cue can coexist: one names the last outcome, the
+    // other the reading's age. Same threshold + exemption as `status.json`'s
+    // `stale` age arm.
+    if profile.usage_stale {
+        rows.push(DiagRow {
+            content: pill(
+                "stale".to_string(),
+                theme::warning().add_modifier(Modifier::BOLD),
+            ),
+            hint: None,
+        });
+    }
+
     let countdown = header.next_refresh_ms.map(|next| {
         let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
         format!("{secs}s")

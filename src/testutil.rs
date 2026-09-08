@@ -848,6 +848,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         credentials: None,
         usage: None,
         fetch_status: None,
+        usage_stale: false,
         provider: None,
         third_party_usage: None,
     }

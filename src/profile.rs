@@ -360,6 +360,11 @@ pub(crate) struct Profile {
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
+    /// Cache age past [`crate::profile_json::stale_after_ms`] — the Usage tab's
+    /// degraded cue (#74). Fed by `tui::app::apply_usage` from the shared mtime
+    /// helper, keyed to the live refresh interval; a fact orthogonal to
+    /// `fetch_status`, so a `cached` pill and this cue can coexist.
+    pub(crate) usage_stale: bool,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
     /// Provider-specific usage data (e.g. DeepSeek balance).
@@ -390,6 +395,7 @@ impl Profile {
             credentials: slot(None),
             usage: None,
             fetch_status: None,
+            usage_stale: false,
             provider,
             third_party_usage: None,
         }
@@ -2287,6 +2293,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         credentials: slot(credentials),
         usage: None,
         fetch_status: None,
+        usage_stale: false,
         provider,
         third_party_usage,
     };

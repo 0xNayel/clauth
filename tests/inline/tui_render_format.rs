@@ -84,6 +84,7 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         fetch_status: status,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
