@@ -886,6 +886,179 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
     assert!(config.is_active(&crate::profile::ProfileName::from("a")));
 }
 
+/// The h3-probe fixture shape: third-party base_url-only profiles (no
+/// credentials, no network path), persisted through the real writers. `a` is
+/// the active chain head, `b` the chain's second member, `c` the explicit
+/// writer's target. `active_util`/`sibling_util` pick the decision — a clear
+/// sibling yields `To("b")`, an exhausted one under `switch_off_when_spent`
+/// yields `Off`.
+fn seed_auto_dispatch_fixture(active_util: f64, sibling_util: f64, wrap_off: bool) -> AppConfig {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mk = |name: &str, util: f64| {
+        let mut p = Profile::new(
+            name.to_string(),
+            Some("https://api.deepseek.com".to_string()),
+            None,
+        );
+        p.fallback_threshold = Some(95.0);
+        p.usage = Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: util,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        });
+        crate::profile::save_profile(&p).expect("persist profile fixture");
+        p
+    };
+    let a = mk("a", active_util);
+    let b = mk("b", sibling_util);
+    let c = mk("c", 10.0);
+    let state = AppState {
+        profiles: ["a", "b", "c"].into_iter().map(Into::into).collect(),
+        fallback_chain: ["a", "b"].into_iter().map(Into::into).collect(),
+        active_profile: Some("a".into()),
+        switch_off_when_spent: wrap_off,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist fixture state");
+    AppConfig {
+        state,
+        profiles: vec![a, b, c],
+    }
+}
+
+/// Drive one decision/dispatch ordering cell: arm the rendezvous for
+/// `expected`, run the REAL `auto_switch_if_needed` on its own thread, release
+/// a REAL `switch_profile(&disk_handle, "c")` into the interval after the
+/// decision, and assert the writer waits out the automatic transaction and
+/// lands last. The bounded wait is a negative observation discharged by the
+/// join: the seam sits at the decision/dispatch boundary inside the hold, so
+/// a shape that releases State between the two lets the writer finish inside
+/// the window and reds the blocked-witness assert here; a shape that instead
+/// moves the boundary away from the seam falls through to the final
+/// persisted-state assert.
+fn assert_explicit_switch_waits_out_the_auto_transaction(
+    expected: crate::fallback::SwitchAction,
+    final_active: &str,
+) {
+    let wrap_off = expected == crate::fallback::SwitchAction::Off;
+    let sibling_util = if wrap_off { 96.0 } else { 10.0 };
+    let config = seed_auto_dispatch_fixture(96.0, sibling_util, wrap_off);
+
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let auto_handle = std::sync::Arc::clone(&handle);
+    let (decision_rx, permit_tx) =
+        crate::fallback::install_auto_decision_rendezvous(expected.clone());
+    let auto_worker =
+        std::thread::spawn(move || crate::fallback::auto_switch_if_needed(&auto_handle, None));
+
+    let reached = decision_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the automatic actor reached the decision/dispatch boundary");
+    assert_eq!(
+        reached.action, expected,
+        "the fixture forces exactly this decision"
+    );
+
+    let (explicit_done_tx, explicit_done_rx) = std::sync::mpsc::channel::<()>();
+    // Registered so a red that unwinds the driver while the writer is still
+    // queued on the state lock still joins it BEFORE `HomeSandbox::drop`
+    // clears the home override — the writer's switch must never resolve
+    // against the operator's real `~/.clauth`.
+    let worker_done = crate::testutil::register_background_task();
+    let explicit_worker = std::thread::spawn(move || {
+        let writer_handle = switch_handle_from_disk();
+        let result = switch_profile(&writer_handle, &"c".into());
+        let _ = explicit_done_tx.send(());
+        let _ = worker_done.send(());
+        result
+    });
+
+    match explicit_done_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(()) => panic!(
+            "the explicit switch completed while the automatic decision-and-dispatch \
+             transaction held State: the dispatch left the decision's state hold"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(e) => panic!("unexpected channel error {e:?}"),
+    }
+    assert_eq!(
+        persisted_active(),
+        "a",
+        "the explicit switch has not landed while the transaction holds State"
+    );
+
+    permit_tx.send(()).expect("release the automatic dispatch");
+    let auto_result = auto_worker
+        .join()
+        .expect("the automatic actor did not panic")
+        .expect("the automatic switch succeeded");
+    explicit_worker
+        .join()
+        .expect("the explicit writer did not panic")
+        .expect("the explicit switch succeeded");
+    assert_eq!(
+        auto_result,
+        Some(expected),
+        "the automatic dispatch applied its decision"
+    );
+    assert_eq!(
+        persisted_active(),
+        final_active,
+        "the explicit switch that waited out the transaction lands last and wins"
+    );
+}
+
+/// The post-decision gap: an explicit switch (CLI/TUI/MCP) released into the
+/// interval between the automatic decision and its dispatch must wait for the
+/// transaction and win — not complete inside the gap and then be overwritten
+/// by the already-made decision. The shape that returned the decision out of
+/// the state hold, dropped the config guard, and let the dispatch wrappers
+/// re-take both locks left a real interval exactly there (the h3 probe
+/// measured the automatic's stale `To("b")` persisting over the operator's
+/// `c`).
+#[test]
+fn an_explicit_switch_cannot_slip_between_the_auto_decision_and_its_dispatch() {
+    let _home = HomeSandbox::new();
+    assert_explicit_switch_waits_out_the_auto_transaction(
+        crate::fallback::SwitchAction::To("b".to_string()),
+        "c",
+    );
+}
+
+/// The Off dispatch arm shares the gap the `To` arm has: wrap-off mode, the
+/// whole chain spent, no sink — the decision is `Off`, and an explicit switch
+/// released after that decision must still wait out the transaction and land.
+#[test]
+fn an_explicit_switch_cannot_slip_between_the_auto_off_decision_and_its_dispatch() {
+    let _home = HomeSandbox::new();
+    assert_explicit_switch_waits_out_the_auto_transaction(crate::fallback::SwitchAction::Off, "c");
+}
+
+/// CONTROL, green before and after the fix: a healthy active below its
+/// threshold yields no decision, the call dispatches nothing and republishes
+/// nothing, and a following explicit switch lands and stays.
+#[test]
+fn auto_switch_with_headroom_yields_no_dispatch_and_leaves_an_explicit_switch_in_place() {
+    let home = HomeSandbox::new();
+    let config = seed_auto_dispatch_fixture(10.0, 10.0, false);
+
+    let (_config, action) = through_handle(config, |h| {
+        crate::fallback::auto_switch_if_needed(h, None).expect("auto decision")
+    });
+    assert_eq!(action, None, "a healthy active yields no decision");
+    assert!(
+        !home.home().join(".clauth").join("status.json").exists(),
+        "no decision means no dispatch and no republish"
+    );
+
+    let writer_handle = switch_handle_from_disk();
+    switch_profile(&writer_handle, &"c".into()).expect("explicit switch lands");
+    assert_eq!(persisted_active(), "c");
+}
+
 #[test]
 fn edit_profile_env_persists_to_config_toml() {
     let _home = HomeSandbox::new();

@@ -152,9 +152,10 @@ fn switch_profile_synced(
 /// [`switch_profile`]'s locked body: the caller holds the config guard and
 /// receives the did-the-active-move answer so it can gate its own republish.
 /// Guard acquired before the flock — see the wrapper. The daemon's tick drain
-/// is the cross-module caller: it takes the guard first and holds it across
-/// this fn's flock, so its post-switch fingerprint read stays inside the flock
-/// while the config guard stays outer, the ranked order.
+/// and `fallback::auto_switch_if_needed` are the cross-module callers: each
+/// takes the guard first and holds it across this fn's flock (the fallback so
+/// its decision and dispatch share one state hold), keeping the config guard
+/// outer, the ranked order.
 pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
     with_state_lock(|held| {
         ensure_switch_target_ok(config, name)?;
