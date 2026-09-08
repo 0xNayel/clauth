@@ -632,9 +632,12 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
     // Live daemon: the countdown that leg published must reach the feed
     // verbatim — a stamp the mtime derivation could not have produced, so this
     // fails on suppression rather than on the two paths agreeing by accident.
-    let next: std::collections::HashMap<String, u64> = [("litellm".to_string(), 4_102_444_800_000)]
-        .into_iter()
-        .collect();
+    let next: std::collections::HashMap<crate::usage::LegKey, u64> = [(
+        crate::usage::FetchLeg::ThirdParty.key(crate::profile::ProfileName::from("litellm")),
+        4_102_444_800_000,
+    )]
+    .into_iter()
+    .collect();
     let empty_status = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
@@ -671,7 +674,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         state: AppState::default(),
         profiles: vec![oauth_profile("work"), oauth_profile("home")],
     };
-    let next: HashMap<String, u64> = HashMap::new();
+    let next: HashMap<crate::usage::LegKey, u64> = HashMap::new();
     let deep = crate::usage::ACTIVE_CAP_MAX_STREAK + 1;
     let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
         v["profiles"]

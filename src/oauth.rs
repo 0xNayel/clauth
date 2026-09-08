@@ -753,7 +753,8 @@ pub(crate) fn auto_start_kick(
     }
     let refreshed = refresh_result(rt, stored_scopes(config, name).as_deref());
     if let Some(activity) = activity {
-        mark_activity(activity, name, ProfileActivity::Fetching);
+        // This site raised `Refreshing`, so it is the one that may retire it.
+        crate::usage::rotation_into_fetch(activity, name);
     }
     let tok = match refreshed {
         Ok(t) => t,

@@ -51,8 +51,8 @@ use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, OpResult,
-    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
+    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
+    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
     ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
     SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
     UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
@@ -2229,24 +2229,25 @@ impl App {
             // past). The first tick re-marks (idempotent); each worker flips itself
             // to Fetching when its request fires and clears on landing.
             let now = now_ms();
-            let due_now: Vec<String> = match h.last_fetched.lock() {
+            let due_now: Vec<crate::usage::LegKey> = match h.last_fetched.lock() {
                 Ok(lf) => snapshot
                     .iter()
-                    .map(|e| e.name.to_string())
-                    .chain(third_party.iter().map(|e| e.name.to_string()))
-                    .filter(|n| {
-                        lf.get(n)
-                            .is_none_or(|t| t.as_millis().saturating_add(interval_ms) <= now)
+                    .map(|e| FetchLeg::OAuth.key(e.name.clone()))
+                    .chain(
+                        third_party
+                            .iter()
+                            .map(|e| FetchLeg::ThirdParty.key(e.name.clone())),
+                    )
+                    .filter(|key| {
+                        lf.get(key).is_none_or(|stamp| {
+                            stamp.as_millis().saturating_add(interval_ms) <= now
+                        })
                     })
                     .collect(),
                 Err(_) => Vec::new(),
             };
-            for name in &due_now {
-                mark_activity(
-                    &h.activity,
-                    &ProfileName::from(name.clone()),
-                    ProfileActivity::Queued,
-                );
+            for key in &due_now {
+                crate::usage::mark_fetch_activity(&h.activity, key, ProfileActivity::Queued);
             }
         });
     }
@@ -2596,12 +2597,18 @@ impl App {
     /// `/profile` TTL so the next fetch re-pulls plan/tier — set for an explicit
     /// single-profile refresh, cleared for the bulk refresh-all.
     fn enqueue_refetch(&self, name: &ProfileName, refresh_plan: bool) {
-        // Light a pending spinner immediately so the UI reflects the keypress.
-        // Only when idle — don't clobber an in-flight switch/refresh marker. The
-        // next tick's worker flips Queued→Fetching when its request fires; a name
-        // no leg owns is cleared by the tick's orphan sweep.
-        if is_idle(&self.activity, name) {
-            mark_activity(&self.activity, name, ProfileActivity::Queued);
+        // Light the selected cache leg immediately. Account-scoped refresh/switch
+        // work stays untouched and outranks this marker in the render helper.
+        let leg = {
+            let config = self.config();
+            config.find(name).map(crate::usage::FetchLeg::for_profile)
+        };
+        if let Some(leg) = leg {
+            crate::usage::mark_fetch_activity(
+                &self.activity,
+                &leg.key(name.clone()),
+                ProfileActivity::Queued,
+            );
         }
         if refresh_plan {
             crate::usage::expire_profile_ttl(name);
@@ -9650,11 +9657,9 @@ fn update_banner(app: &mut App) {
 fn drain_op_results(app: &mut App) {
     let mut needs_token_snapshot_rebuild = false;
     while let Ok(OpResult { name, outcome }) = app.op_results.try_recv() {
-        if let Ok(mut a) = app.activity.lock()
-            && a.get(&name).copied() == Some(ProfileActivity::Refreshing)
-        {
-            a.remove(&name);
-        }
+        // The rotation marker alone: this result arrives a tick or more after
+        // its worker returned, so the OAuth leg may already belong to a refetch.
+        crate::usage::end_rotation(&app.activity, &ProfileName::from(name.clone()));
         match outcome {
             Ok(()) => {
                 needs_token_snapshot_rebuild = true;

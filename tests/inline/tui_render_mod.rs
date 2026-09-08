@@ -130,6 +130,75 @@ fn dump(app: &App, w: u16, h: u16) -> String {
 }
 
 #[test]
+fn hybrid_renders_the_activity_and_deadline_of_its_provider_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    use crate::tui::app::Tab;
+    use crate::usage::{FetchLeg, ProfileActivity, mark_activity, mark_fetch_activity};
+
+    let mut hybrid = oauth("hybrid", 40.0, 60.0, false);
+    hybrid.base_url = Some("https://api.deepseek.com".to_string());
+    hybrid.api_key = Some("key".to_string());
+    hybrid.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com");
+    hybrid.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "access".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let name = hybrid.name.clone();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![hybrid],
+    });
+    let now = crate::usage::now_ms();
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(FetchLeg::OAuth.key(name.clone()), now + 11_000);
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(FetchLeg::ThirdParty.key(name.clone()), now + 222_000);
+
+    mark_activity(&app.activity, &name, ProfileActivity::Fetching);
+    app.tab = Tab::Usage;
+    let oauth_only_usage = dump(&app, 100, 24);
+    assert!(
+        (oauth_only_usage.contains("refresh in 221s")
+            || oauth_only_usage.contains("refresh in 222s"))
+            && !oauth_only_usage.contains("refresh in 11s"),
+        "provider figures keep their provider countdown while OAuth fetches:\n{oauth_only_usage}"
+    );
+    app.tab = Tab::Overview;
+    let oauth_only_overview = dump(&app, 100, 24);
+    assert!(
+        oauth_only_overview.contains("221s") || oauth_only_overview.contains("222s"),
+        "overview keeps the provider countdown while OAuth fetches:\n{oauth_only_overview}"
+    );
+
+    mark_fetch_activity(
+        &app.activity,
+        &FetchLeg::ThirdParty.key(name),
+        ProfileActivity::Fetching,
+    );
+    for tab in [Tab::Usage, Tab::Overview] {
+        app.tab = tab;
+        let provider_fetch = dump(&app, 100, 24);
+        assert!(
+            provider_fetch.contains(crate::spinner::SPINNER_FRAMES[0]),
+            "the provider fetch replaces its own countdown on {tab:?}:\n{provider_fetch}"
+        );
+    }
+}
+
+#[test]
 fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::ToastKind;

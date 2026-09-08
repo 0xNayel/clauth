@@ -16,7 +16,7 @@ use crate::profile::{
     reload_fingerprint, save_app_state, save_profile,
 };
 use crate::testutil::{HomeSandbox, blank_profile, set_mtime};
-use crate::usage::{ProfileActivity, clear_activity, mark_activity, now_ms};
+use crate::usage::{FetchLeg, ProfileActivity, mark_activity, mark_fetch_activity, now_ms};
 
 use super::Daemon;
 
@@ -570,8 +570,14 @@ fn busy_target_requeued_not_dropped() {
         "the busy switch is re-queued, not dropped after one attempt"
     );
 
-    // Fetch completes → the re-queued switch lands on the next tick.
-    clear_activity(&daemon.activity, &crate::profile::ProfileName::from("beta"));
+    // Fetch completes → the re-queued switch lands on the next tick. The fetch
+    // leg is what `mark_activity(.., Fetching)` opened, so the leg's own
+    // completion boundary is what closes it.
+    mark_fetch_activity(
+        &daemon.activity,
+        &FetchLeg::OAuth.key(crate::profile::ProfileName::from("beta")),
+        ProfileActivity::Idle,
+    );
     daemon.drain_pending_switch();
     assert_eq!(
         active_of(&daemon).as_deref(),

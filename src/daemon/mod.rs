@@ -45,11 +45,11 @@ use crate::profile::{
     mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
-    PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
-    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore,
-    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
-    collect_tokens, spawn_refresher,
+    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
+    PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
+    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
+    UsageStore, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
+    collect_third_party_entries, collect_tokens, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -612,7 +612,7 @@ impl Daemon {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
-        let next_snap: HashMap<String, u64> = self
+        let next_snap: HashMap<LegKey, u64> = self
             .next_refresh_per_profile
             .lock()
             .map(|m| m.clone())

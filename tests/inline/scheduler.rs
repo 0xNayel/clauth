@@ -7,11 +7,12 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, ClaudeRollingPacing, EpochMs, FetchStamp, LastFetchedAt, ProfileActivity,
-    RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, ThirdPartyFetcher, TokenEntry,
-    anchor_post_reset_oauth, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, fetch_third_party_due, filter_suppressed,
-    mark_activity, memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
+    ActivityStore, ClaudeRollingPacing, EpochMs, FetchLeg, FetchStamp, LastFetchedAt, LegKey,
+    ProfileActivity, RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry,
+    ThirdPartyFetcher, TokenEntry, anchor_post_reset_oauth, clear_activity, clear_orphaned_forced,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, fetch_third_party_due,
+    filter_suppressed, generic_slot_deferral, mark_activity, memoized_identity, partition_due,
+    should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -24,6 +25,16 @@ fn token(name: &str) -> TokenEntry {
         auth_broken: false,
         may_open_window: true,
     }
+}
+
+/// The OAuth leg's key for `name` — most scheduler tests drive [`TokenEntry`].
+fn oauth_key(name: &str) -> LegKey {
+    FetchLeg::OAuth.key(crate::profile::ProfileName::from(name))
+}
+
+/// The third-party leg's key for `name`.
+fn tp_key(name: &str) -> LegKey {
+    FetchLeg::ThirdParty.key(crate::profile::ProfileName::from(name))
 }
 
 /// An OAuth-credentialed profile, optionally disabled, for the
@@ -240,13 +251,16 @@ fn partition_due_uses_fixed_interval() {
         &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "a never-fetched profile is due");
-    assert_eq!(next.get("a").copied(), Some(REFRESH_INTERVAL_MS));
+    assert_eq!(
+        next.get(&oauth_key("a")).copied(),
+        Some(REFRESH_INTERVAL_MS)
+    );
 
     // Just fetched: not due one ms later.
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
     let (due, next) = partition_due(
         &snapshot,
         base + 1,
@@ -256,7 +270,10 @@ fn partition_due_uses_fixed_interval() {
         &HashMap::new(),
     );
     assert!(due.is_empty(), "not due one ms after a fetch");
-    assert_eq!(next.get("a").copied(), Some(base + REFRESH_INTERVAL_MS));
+    assert_eq!(
+        next.get(&oauth_key("a")).copied(),
+        Some(base + REFRESH_INTERVAL_MS)
+    );
 
     // Exactly one interval later: due again.
     let (due, _) = partition_due(
@@ -340,15 +357,15 @@ fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
         // "noreset" carries no stamp.
     ]);
     let last_fetched = HashMap::from([
-        ("due".to_string(), last_before),
-        ("excluded".to_string(), last_before),
-        ("already".to_string(), last_before),
-        ("fetched".to_string(), last_after),
-        ("noreset".to_string(), last_before),
+        (oauth_key("due"), last_before),
+        (oauth_key("excluded"), last_before),
+        (oauth_key("already"), last_before),
+        (oauth_key("fetched"), last_after),
+        (oauth_key("noreset"), last_before),
     ]);
     let excluded = HashSet::from(["excluded".to_string()]);
     let mut due = vec![token("already")]; // already scheduled by partition_due
-    let mut next: HashMap<String, u64> = HashMap::new();
+    let mut next: HashMap<LegKey, u64> = HashMap::new();
 
     anchor_post_reset_oauth(
         &snapshot,
@@ -366,7 +383,7 @@ fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
         "eligible post-reset profile is scheduled"
     );
     assert_eq!(
-        next.get("due").copied(),
+        next.get(&oauth_key("due")).copied(),
         Some(now),
         "its countdown is stamped to now"
     );
@@ -388,9 +405,9 @@ fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
         "an already-due profile is not duplicated",
     );
     assert!(
-        !next.contains_key("excluded")
-            && !next.contains_key("fetched")
-            && !next.contains_key("noreset"),
+        !next.contains_key(&oauth_key("excluded"))
+            && !next.contains_key(&oauth_key("fetched"))
+            && !next.contains_key(&oauth_key("noreset")),
         "skipped profiles get no countdown stamp",
     );
 }
@@ -473,7 +490,7 @@ fn partition_due_excludes_refreshing() {
     );
     assert!(due.is_empty(), "refreshing profiles are excluded from due");
     assert!(
-        next.contains_key("a"),
+        next.contains_key(&oauth_key("a")),
         "countdown still publishes for excluded profiles"
     );
 }
@@ -503,8 +520,137 @@ fn partition_due_excludes_switching() {
     );
     assert!(due.is_empty(), "mid-switch profiles are excluded from due");
     assert!(
-        next.contains_key("a"),
+        next.contains_key(&oauth_key("a")),
         "countdown still publishes for excluded profiles"
+    );
+}
+
+/// The OAuth leg's own marks belong to the leg. A rotation that starts between
+/// the partition queue and the throttle gate's `Queued` -> `Fetching` flip keeps
+/// its account-wide marker: erasing it re-admits the profile to the due set
+/// while the rotation is still spending its single-use pair.
+#[test]
+fn an_oauth_fetch_mark_never_retires_a_concurrent_rotation() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    // partition marks the leg due, then a rotation opens on the same profile.
+    mark_activity(&activity, &name, ProfileActivity::Queued);
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    // the queued request clears the per-host gate (`get_json`'s flip).
+    mark_activity(&activity, &name, ProfileActivity::Fetching);
+
+    {
+        let states = activity.lock().unwrap();
+        let state = states.get("a").expect("activity state");
+        assert_eq!(
+            state.account,
+            Some(ProfileActivity::Refreshing),
+            "the fetch leg's flip must leave the rotation marker standing"
+        );
+        assert_eq!(
+            state.fetch(FetchLeg::OAuth),
+            Some(ProfileActivity::Fetching)
+        );
+    }
+
+    let (due, _next) = partition_due(
+        &[token("a")],
+        REFRESH_INTERVAL_MS + 1,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::new(),
+    );
+    assert!(
+        due.is_empty(),
+        "a profile mid-rotation stays excluded after its leg flips to Fetching"
+    );
+}
+
+/// The rotation owner's handoff is one write: the account marker retires and the
+/// OAuth leg opens under a single hold, so `partition_due` never observes the
+/// profile idle between the two.
+#[test]
+fn the_rotation_owner_hands_its_marker_to_the_oauth_leg() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    super::rotation_into_fetch(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    let state = states.get("a").expect("activity state");
+    assert_eq!(state.account, None, "the rotation marker retires");
+    assert_eq!(
+        state.fetch(FetchLeg::OAuth),
+        Some(ProfileActivity::Fetching)
+    );
+}
+
+/// `end_rotation` retires the rotation marker alone. A rotation result drains on
+/// the UI thread a tick or more after its worker returned, by which time an
+/// unrelated refetch may already own the OAuth leg.
+#[test]
+fn end_rotation_leaves_a_later_oauth_refetch_standing() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    mark_activity(&activity, &name, ProfileActivity::Fetching);
+    super::end_rotation(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    let state = states.get("a").expect("activity state");
+    assert_eq!(state.account, None);
+    assert_eq!(
+        state.fetch(FetchLeg::OAuth),
+        Some(ProfileActivity::Fetching),
+        "the refetch spinner outlives the rotation result it did not belong to"
+    );
+}
+
+/// `Switching` belongs to the switch gate, not to a rotation result. Only
+/// `Refreshing` retires here, so a switch opened after the rotation survives.
+#[test]
+fn end_rotation_leaves_a_switch_gate_standing() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Switching);
+    super::end_rotation(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    assert_eq!(
+        states.get("a").expect("activity state").account,
+        Some(ProfileActivity::Switching)
+    );
+}
+
+/// An account-level owner clears its own slot only. Both fetch legs open and
+/// close at their own completion boundaries (`clear_fetch_activity`), so a clear
+/// that reached into them would drop a spinner it never raised.
+#[test]
+fn clear_activity_leaves_both_fetch_legs_to_their_owners() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    mark_activity(&activity, &name, ProfileActivity::Fetching);
+    super::mark_fetch_activity(&activity, &tp_key("a"), ProfileActivity::Fetching);
+    clear_activity(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    let state = states.get("a").expect("activity state");
+    assert_eq!(state.account, None);
+    assert_eq!(
+        state.fetch(FetchLeg::OAuth),
+        Some(ProfileActivity::Fetching)
+    );
+    assert_eq!(
+        state.fetch(FetchLeg::ThirdParty),
+        Some(ProfileActivity::Fetching)
     );
 }
 
@@ -522,7 +668,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
 
     let mut flagged = token("a");
     flagged.auth_broken = true;
@@ -540,7 +686,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     );
     assert!(due.is_empty(), "flagged profile skips the plain cadence");
     assert_eq!(
-        next["a"],
+        next[&oauth_key("a")],
         base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "published countdown shows the widened deadline"
     );
@@ -576,7 +722,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
         1,
         "an unflagged profile snaps back to the cadence"
     );
-    assert_eq!(next["a"], base + REFRESH_INTERVAL_MS);
+    assert_eq!(next[&oauth_key("a")], base + REFRESH_INTERVAL_MS);
 }
 
 /// The sibling of the `auth_broken` widen above, for the failure it can NEVER
@@ -595,7 +741,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
 
     let snapshot = vec![token("a")];
     let streaks = |refresh_fail: u32| {
@@ -616,7 +762,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
             REFRESH_INTERVAL_MS,
             streaks,
         )
-        .1["a"]
+        .1[&oauth_key("a")]
     };
 
     // Streak 0 is the plain cadence — `rate_limit_backoff_ms(0)` returns a full
@@ -654,7 +800,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
         &streaks(1),
     );
     assert_eq!(
-        next["a"],
+        next[&oauth_key("a")],
         base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "a confirmed-dead token outranks the refresh-fail ladder"
     );
@@ -674,7 +820,7 @@ fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
     let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
     // The stamp already carries the deep 429 extra (`apply_outcome` recorded it).
     last_fetched.lock().unwrap().insert(
-        "a".to_string(),
+        oauth_key("a"),
         FetchStamp {
             due: EpochMs::from_millis(base + floor),
             ladder_ms: floor,
@@ -701,7 +847,7 @@ fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
     // The recorded 429 extra already sits in the stamp, so a correctly clamped
     // partition adds nothing: the next poll lands one interval past the stamp.
     assert_eq!(
-        next["a"],
+        next[&oauth_key("a")],
         base + floor + REFRESH_INTERVAL_MS,
         "a deep-both profile polls one interval past its stamp, never the stacked 8.5 min"
     );
@@ -758,7 +904,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         let stamp = last_fetched
             .lock()
             .unwrap()
-            .get("storm")
+            .get(&oauth_key("storm"))
             .copied()
             .expect("the 429 outcome stamps");
         (stamp.due, stamp.ladder_ms)
@@ -781,7 +927,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         &live_streaks,
     );
     assert_eq!(
-        next["storm"],
+        next[&oauth_key("storm")],
         due.as_millis() + REFRESH_INTERVAL_MS,
         "the recorded ladder must carry the compose; a zero recording stacks the refresh ladder on top"
     );
@@ -802,7 +948,7 @@ fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
 
     let snapshot = vec![token("a")];
     let streaks = HashMap::from([(
@@ -822,7 +968,7 @@ fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
         &streaks,
     );
     assert_eq!(
-        next["a"],
+        next[&oauth_key("a")],
         base + REFRESH_INTERVAL_MS + floor,
         "a bare stamp with a deep refresh-fail streak keeps its full partition ladder"
     );
@@ -839,7 +985,7 @@ fn partition_due_clamps_the_active_capped_bake_exactly() {
     // `next_slot_deferral`'s cap: active streak 5 ladders to 2*interval, so the
     // recorded bake is one interval (2*interval - interval), not the raw floor.
     last_fetched.lock().unwrap().insert(
-        "a".to_string(),
+        oauth_key("a"),
         FetchStamp {
             due: EpochMs::from_millis(base + REFRESH_INTERVAL_MS),
             ladder_ms: REFRESH_INTERVAL_MS,
@@ -866,7 +1012,7 @@ fn partition_due_clamps_the_active_capped_bake_exactly() {
     // recorded bake (interval) + refresh ladder (floor) clamp to the floor, so
     // the partition adds floor - interval and the total gap is the degraded floor.
     assert_eq!(
-        next["a"],
+        next[&oauth_key("a")],
         base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "an active-capped bake clamps exactly against its recorded ladder"
     );
@@ -884,7 +1030,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
 
     // 429-only: the extra is baked into the stamp, the partition adds nothing.
     last_fetched.lock().unwrap().insert(
-        "rl".to_string(),
+        oauth_key("rl"),
         FetchStamp {
             due: EpochMs::from_millis(base + baked_extra),
             ladder_ms: baked_extra,
@@ -905,7 +1051,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
         )]),
     );
     assert_eq!(
-        next["rl"],
+        next[&oauth_key("rl")],
         base + baked_extra + REFRESH_INTERVAL_MS,
         "a 429-only stamp keeps its baked deferral, never narrowed"
     );
@@ -914,7 +1060,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("rf".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+        .insert(oauth_key("rf"), FetchStamp::at(EpochMs::from_millis(base)));
     let (_, next) = partition_due(
         &[token("rf")],
         base,
@@ -930,7 +1076,7 @@ fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
         )]),
     );
     assert_eq!(
-        next["rf"],
+        next[&oauth_key("rf")],
         base + baked_extra + REFRESH_INTERVAL_MS,
         "a refresh-fail-only profile keeps its partition ladder, never narrowed"
     );
@@ -947,12 +1093,12 @@ fn partition_due_clamp_leaves_third_party_untouched() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("tp".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+        .insert(tp_key("tp"), FetchStamp::at(EpochMs::from_millis(base)));
 
     let snapshot = vec![tp_entry("tp")];
-    // A deep streak for another name is never read for "tp".
+    // A deep same-name OAuth streak must remain irrelevant to provider cadence.
     let streaks = HashMap::from([(
-        "other".to_string(),
+        "tp".to_string(),
         super::StreakCounts {
             rate_limit: 50,
             refresh_fail: 50,
@@ -968,9 +1114,268 @@ fn partition_due_clamp_leaves_third_party_untouched() {
         &streaks,
     );
     assert_eq!(
-        next["tp"],
+        next[&tp_key("tp")],
         base + REFRESH_INTERVAL_MS,
         "a third-party deadline is untouched by the composed clamp"
+    );
+}
+
+/// #74: a GENERIC provider's 429 with no usable `retry-after` lands the flat
+/// degraded floor `max(interval, DEGRADED_GAP_CEILING_MS)` — its scan has no
+/// per-account streak to ramp — while an explicit (non-zero) hint stays
+/// verbatim. A `0` hint names no wait, so it takes the floor too.
+#[test]
+fn generic_no_hint_429_lands_the_flat_floor_and_a_hint_stays_verbatim() {
+    use std::time::Duration;
+
+    let floor_gap = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
+    let total_gap = |hint: Option<Duration>| {
+        generic_slot_deferral(hint, REFRESH_INTERVAL_MS).as_millis() + REFRESH_INTERVAL_MS
+    };
+
+    assert_eq!(
+        total_gap(None),
+        floor_gap,
+        "a generic no-hint 429 must land on the flat floor, not a streak rung"
+    );
+    assert_eq!(
+        total_gap(Some(Duration::ZERO)),
+        floor_gap,
+        "retry-after: 0 names no wait and must take the same floor"
+    );
+    assert_eq!(
+        total_gap(Some(Duration::from_secs(240))),
+        240_000,
+        "an explicit generic hint is honored verbatim, even below the floor"
+    );
+    assert_eq!(
+        total_gap(Some(Duration::from_secs(20 * 60))),
+        super::MAX_RETRY_AFTER_MS,
+        "a long generic hint is capped at 15 minutes"
+    );
+    let wide = 10 * 60_000;
+    assert_eq!(
+        generic_slot_deferral(None, wide).as_millis() + wide,
+        wide,
+        "a no-hint 429 never extends an interval already above the floor"
+    );
+}
+
+/// One name keys both fetch legs' `last_fetched` stamp; a hybrid profile (an
+/// OAuth identity AND a third-party provider) must keep one stamp per leg. A
+/// shared name-keyed map lets the later bootstrap overwrite the earlier, so
+/// this reds while the OAuth stamp is clobbered by the third-party seed.
+#[test]
+fn bootstrap_legs_keep_separate_stamps_for_a_hybrid_profile() {
+    use crate::profile_cache::{
+        THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, profile_cache_path, write_profile_cache,
+    };
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::UsageInfo;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = crate::profile::ProfileName::from("hybrid");
+    crate::testutil::register_names(&["hybrid"]);
+
+    let oauth_mtime = 1_700_000_000_000u64;
+    let tp_mtime = oauth_mtime + 600_000;
+
+    write_profile_cache(&name, USAGE_CACHE_FILE, &UsageInfo::default());
+    crate::testutil::set_mtime(
+        &profile_cache_path(&name, USAGE_CACHE_FILE).expect("usage cache path"),
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(oauth_mtime),
+    );
+    write_profile_cache(
+        &name,
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    crate::testutil::set_mtime(
+        &profile_cache_path(&name, THIRD_PARTY_CACHE_FILE).expect("third-party cache path"),
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(tp_mtime),
+    );
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // OAuth seed lands first, then the third-party seed.
+    super::bootstrap_fetch(
+        &store,
+        &status,
+        &last_fetched,
+        &["hybrid".to_string()],
+        REFRESH_INTERVAL_MS,
+    );
+    super::bootstrap_third_party(
+        &tp_store,
+        &tp_status,
+        &last_fetched,
+        &[tp_entry("hybrid")],
+        REFRESH_INTERVAL_MS,
+    );
+
+    let oauth_stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&oauth_key("hybrid"))
+        .copied()
+        .expect("hybrid OAuth stamp");
+    assert_eq!(
+        oauth_stamp.as_millis(),
+        oauth_mtime,
+        "the OAuth leg's stamp must survive the third-party seed (no shared-key clobber)"
+    );
+    let tp_stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&tp_key("hybrid"))
+        .copied()
+        .expect("hybrid third-party stamp");
+    assert_eq!(
+        tp_stamp.as_millis(),
+        tp_mtime,
+        "the third-party leg's stamp keeps its own slot alongside the OAuth one"
+    );
+}
+
+/// `selected_next_refresh` is the shared display selector: a hybrid profile's
+/// third-party-cached row must read the provider leg's countdown, its OAuth row
+/// its own. A map holding both keys resolves each side to the matching key, so
+/// a surface swapping in the wrong leg reds this.
+#[test]
+fn selected_next_refresh_picks_the_provider_leg_for_a_hybrid() {
+    use super::selected_next_refresh;
+
+    let name = crate::profile::ProfileName::from("hybrid");
+    let mut next: HashMap<LegKey, u64> = HashMap::new();
+    next.insert(oauth_key("hybrid"), 111);
+    next.insert(tp_key("hybrid"), 222);
+
+    let oauth = crate::testutil::blank_profile(&name);
+    assert_eq!(
+        selected_next_refresh(&next, &oauth),
+        Some(111),
+        "an OAuth-cached row reads the OAuth leg"
+    );
+
+    let mut provider = oauth_profile_disabled("hybrid", false);
+    provider.base_url = Some("https://api.deepseek.com".to_string());
+    provider.api_key = Some("key".to_string());
+    provider.provider = crate::providers::Provider::from_base_url(
+        provider.base_url.as_deref().expect("hybrid base url"),
+    );
+    assert!(
+        provider.credentials.is_some(),
+        "fixture keeps its OAuth pair"
+    );
+    assert_eq!(
+        selected_next_refresh(&next, &provider),
+        Some(222),
+        "a hybrid provider-cached row reads the provider leg"
+    );
+}
+
+/// A panicking OAuth worker owns BOTH slots at the moment it dies: the leg it
+/// was queued on, and the account marker its own rotation raised inside
+/// `poll_one`. The join loop is the only site left to free either, so it frees
+/// both. Freeing the leg alone strands `Refreshing`, and `partition_due`
+/// excludes the profile from every later tick.
+#[test]
+fn a_panicking_oauth_worker_strands_neither_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["boom"]);
+    let state = completion_order_state();
+    let activity = Arc::clone(&state.activity);
+    let name = crate::profile::ProfileName::from("boom");
+
+    super::fetch_oauth_due_with(
+        &state,
+        vec![token("boom")],
+        REFRESH_INTERVAL_MS,
+        move |_| {
+            // What `poll_one` does before it reaches its rotation handoff.
+            mark_activity(
+                &activity,
+                &crate::profile::ProfileName::from("boom"),
+                ProfileActivity::Refreshing,
+            );
+            panic!("simulated worker panic mid-rotation")
+        },
+    );
+
+    assert!(
+        super::is_idle(&state.activity, &name),
+        "the join loop frees the dead worker's account marker as well as its leg"
+    );
+}
+
+/// The production completion boundaries clear only their own leg. Each leaves
+/// the sibling fetch visible and publishes its own exact cadence deadline.
+#[test]
+fn oauth_and_provider_completions_clear_only_their_own_activity() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["hybrid"]);
+    let before = super::now_ms();
+
+    let oauth = completion_order_state();
+    super::mark_fetch_activity(
+        &oauth.activity,
+        &tp_key("hybrid"),
+        ProfileActivity::Fetching,
+    );
+    super::fetch_oauth_due_with(
+        &oauth,
+        vec![token("hybrid")],
+        REFRESH_INTERVAL_MS,
+        |entry| cached_outcome(&entry.name),
+    );
+    {
+        let activity = oauth.activity.lock().unwrap();
+        let state = activity.get("hybrid").expect("provider activity survives");
+        assert_eq!(state.fetch(FetchLeg::OAuth), None);
+        assert_eq!(
+            state.fetch(FetchLeg::ThirdParty),
+            Some(ProfileActivity::Fetching)
+        );
+    }
+    let oauth_next = oauth.next_refresh_per_profile.lock().unwrap()[&oauth_key("hybrid")];
+    assert!(
+        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000).contains(&oauth_next),
+        "OAuth completion publishes its own cadence deadline: {oauth_next}"
+    );
+
+    let provider = third_party_state(stub_ok_stats);
+    mark_activity(
+        &provider.activity,
+        &crate::profile::ProfileName::from("hybrid"),
+        ProfileActivity::Fetching,
+    );
+    let before = super::now_ms();
+    fetch_third_party_due(&provider, vec![tp_entry("hybrid")]);
+    {
+        let activity = provider.activity.lock().unwrap();
+        let state = activity.get("hybrid").expect("OAuth activity survives");
+        assert_eq!(
+            state.fetch(FetchLeg::OAuth),
+            Some(ProfileActivity::Fetching)
+        );
+        assert_eq!(state.fetch(FetchLeg::ThirdParty), None);
+    }
+    let provider_next = provider.next_refresh_per_profile.lock().unwrap()[&tp_key("hybrid")];
+    assert!(
+        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000)
+            .contains(&provider_next),
+        "provider completion publishes its own cadence deadline: {provider_next}"
     );
 }
 
@@ -1048,7 +1453,7 @@ fn merge_forced_skips_switching() {
         .map(|s| s.to_string())
         .collect();
     let mut due: Vec<TokenEntry> = Vec::new();
-    let mut next: HashMap<String, u64> = HashMap::new();
+    let mut next: HashMap<LegKey, u64> = HashMap::new();
 
     super::merge_forced(&snapshot, &forced, &mut due, &mut next, &activity, 1);
 
@@ -1135,7 +1540,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
     let stamp = last_fetched
         .lock()
         .unwrap()
-        .get("u")
+        .get(&oauth_key("u"))
         .copied()
         .expect("stamp present")
         .as_millis();
@@ -1194,19 +1599,20 @@ fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let scheduled: HashSet<String> = ["scheduled"].iter().map(|s| s.to_string()).collect();
+    let scheduled: HashSet<LegKey> = [oauth_key("scheduled")].into_iter().collect();
 
     clear_orphaned_forced(&activity, &forced, &scheduled);
 
     let a = activity.lock().unwrap();
     assert!(!a.contains_key("orphan"), "orphaned forced name is cleared");
     assert_eq!(
-        a.get("scheduled").copied(),
+        a.get("scheduled")
+            .and_then(|state| state.fetch(FetchLeg::OAuth)),
         Some(ProfileActivity::Queued),
         "a scheduled name keeps its mark"
     );
     assert_eq!(
-        a.get("rotating").copied(),
+        a.get("rotating").and_then(|state| state.account),
         Some(ProfileActivity::Refreshing),
         "a refreshing name is owned by the rotate worker, left alone"
     );
@@ -1214,35 +1620,38 @@ fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
 
 // ── Panic-clear discipline ────────────────────────────────────────────────────
 
-/// The scheduler tick's mark/join/clear discipline must clear the ActivityStore
-/// slot even when a fetch worker panics — exercises the `Err(_)` arm of
-/// `h.join()` without real HTTP or a full scheduler.
+/// `refresh_all`'s join loop frees a panicked rotation worker's account slot.
+/// Its production form spawns real HTTP workers, so this is a hand-written stand
+/// in for that arm alone: it pins that the arm's `clear_activity` frees the
+/// account marker and that a concurrent fetch keeps the leg its OWN join loop
+/// frees. The real loop is driven by
+/// `a_panicking_oauth_worker_strands_neither_slot`.
 #[test]
-fn activity_cleared_on_worker_panic() {
+fn refresh_all_panic_arm_frees_the_account_slot_alone() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    let name = "test-profile";
+    let name = crate::profile::ProfileName::from("test-profile");
 
-    mark_activity(
-        &activity,
-        &crate::profile::ProfileName::from(name),
-        ProfileActivity::Fetching,
-    );
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    mark_activity(&activity, &name, ProfileActivity::Queued);
     assert!(
         !activity.lock().unwrap().is_empty(),
         "slot must be set after mark_activity"
     );
-
-    let h = std::thread::spawn(|| -> () { panic!("simulated worker panic") });
-
-    // join loop Err arm: clear slot on panic
-    match h.join() {
-        Ok(_) => panic!("expected panic in worker"),
-        Err(_) => clear_activity(&activity, &crate::profile::ProfileName::from(name)),
+    clear_activity(&activity, &name);
+    {
+        let states = activity.lock().unwrap();
+        let state = states.get("test-profile").expect("the fetch leg survives");
+        assert_eq!(state.account, None, "the panicked rotation's slot is freed");
+        assert_eq!(
+            state.fetch(FetchLeg::OAuth),
+            Some(ProfileActivity::Queued),
+            "a concurrent fetch keeps the leg its own join loop will free"
+        );
     }
-
+    super::clear_fetch_activity(&activity, &oauth_key("test-profile"));
     assert!(
         activity.lock().unwrap().is_empty(),
-        "activity slot must be cleared after worker panic"
+        "both slots freed leaves no entry behind"
     );
 }
 
@@ -3634,7 +4043,7 @@ fn retry_after_defers_next_fetch_slot() {
         last_fetched
             .lock()
             .unwrap()
-            .get(name)
+            .get(&oauth_key(name))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -3673,7 +4082,7 @@ fn retry_after_defers_next_fetch_slot() {
     );
     assert!(due.is_empty(), "not due before the deferred slot");
     assert_eq!(
-        next.get("a").copied(),
+        next.get(&oauth_key("a")).copied(),
         Some(a + REFRESH_INTERVAL_MS),
         "countdown publishes the deferred slot"
     );
@@ -3799,7 +4208,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
         last_fetched
             .lock()
             .unwrap()
-            .get("a")
+            .get(&oauth_key("a"))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -3898,7 +4307,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         last_fetched
             .lock()
             .unwrap()
-            .get("a")
+            .get(&oauth_key("a"))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -3969,7 +4378,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         last_fetched
             .lock()
             .unwrap()
-            .get("a")
+            .get(&oauth_key("a"))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -4107,7 +4516,7 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
     let stamp = last_fetched
         .lock()
         .unwrap()
-        .get("idle")
+        .get(&oauth_key("idle"))
         .copied()
         .unwrap()
         .as_millis();
@@ -4369,7 +4778,7 @@ fn stamped_gap_ms_at(
         .last_fetched
         .lock()
         .unwrap()
-        .get(name)
+        .get(&tp_key(name))
         .copied()
         .unwrap()
         .as_millis()
@@ -4543,6 +4952,39 @@ fn fetch_third_party_due_typed_no_data_keeps_cadence() {
     assert!(
         gap < REFRESH_INTERVAL_MS + 2_000,
         "typed no-data must not floor, got gap {gap}ms"
+    );
+}
+
+#[test]
+fn fetch_third_party_due_generic_no_hint_429_uses_the_floor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-limited"]);
+    let state = third_party_state(stub_rate_limited);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![tp_entry("generic-limited")]);
+    let gap = stamped_gap_ms(&state, "generic-limited", before);
+    let expected = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
+    assert!(
+        (expected..expected + 2_000).contains(&gap),
+        "generic no-hint 429 uses the rescan floor, got {gap}ms"
+    );
+}
+
+#[test]
+fn fetch_third_party_due_typed_no_hint_429_keeps_the_flat_rung() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-limited"]);
+    let entry = alibaba_entry("qwen-limited", "console-token");
+    let state = third_party_state(stub_rate_limited);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "qwen-limited", before);
+    let expected = REFRESH_INTERVAL_MS + super::RATE_LIMIT_MIN_BACKOFF_MS;
+    assert!(
+        (expected..expected + 2_000).contains(&gap),
+        "typed no-hint 429 keeps its flat rung, got {gap}ms"
     );
 }
 
@@ -4720,7 +5162,10 @@ fn bootstrap_third_party_seeds_any_cache() {
         "a third-party cache older than one interval surfaces as Cached"
     );
     assert!(
-        !last_fetched.lock().unwrap().contains_key("missing"),
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key("missing")),
         "a no-cache profile is left unstamped so it fetches on the first tick"
     );
     // Stamped at the cache mtime (~now, just written), so the cadence resumes.
@@ -4728,7 +5173,7 @@ fn bootstrap_third_party_seeds_any_cache() {
     let stamp = last_fetched
         .lock()
         .unwrap()
-        .get("cached")
+        .get(&tp_key("cached"))
         .copied()
         .unwrap()
         .as_millis();
@@ -5199,7 +5644,11 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         status.lock().unwrap().get("kitty").copied(),
         Some(super::FetchStatus::Fresh),
     );
-    let stamp = last_fetched.lock().unwrap().get("kitty").copied();
+    let stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&oauth_key("kitty"))
+        .copied();
     let now = super::now_ms();
     assert!(
         stamp.is_some_and(|s| now.saturating_sub(s.as_millis()) < 30_000),
@@ -5210,7 +5659,13 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
     // synthetic entry that would render as data.
     assert!(store.lock().unwrap().get("cacheless").is_none());
     assert!(status.lock().unwrap().get("cacheless").is_none());
-    assert!(last_fetched.lock().unwrap().get("cacheless").is_none());
+    assert!(
+        last_fetched
+            .lock()
+            .unwrap()
+            .get(&oauth_key("cacheless"))
+            .is_none()
+    );
 }
 
 /// Re-hydrating every tick must track the daemon's writes: a NEWER cache body
@@ -5348,13 +5803,13 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         .next_refresh_per_profile
         .lock()
         .unwrap()
-        .get("kitty")
+        .get(&oauth_key("kitty"))
         .copied();
     let stamp = state
         .last_fetched
         .lock()
         .unwrap()
-        .get("kitty")
+        .get(&oauth_key("kitty"))
         .map(|e| e.as_millis());
     assert_eq!(
         next,
@@ -5435,8 +5890,9 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         a.get("stale").is_none(),
         "an un-owned Queued mark is swept — no frozen spinner"
     );
-    assert!(
-        matches!(a.get("kitty"), Some(ProfileActivity::Refreshing)),
+    assert_eq!(
+        a.get("kitty").and_then(|state| state.account),
+        Some(ProfileActivity::Refreshing),
         "an in-flight worker's mark survives (it clears itself on landing)"
     );
 }
@@ -5517,7 +5973,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     // would then fetch nothing (no live request on a regression) and leave the
     // marks/store below untouched, which is what makes each assert discriminate.
     state.last_fetched.lock().unwrap().insert(
-        "kitty".to_string(),
+        oauth_key("kitty"),
         FetchStamp::at(EpochMs::from_millis(super::now_ms())),
     );
 
@@ -5650,7 +6106,11 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         "a landed body is Fresh, not a cache fallback"
     );
     assert!(
-        state.last_fetched.lock().unwrap().contains_key(name),
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key(name)),
         "the fetch stamps its slot, or the profile re-fetches every tick"
     );
     assert!(
@@ -5739,7 +6199,11 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         "the history prune leg advanced the stale stamp"
     );
     assert!(
-        state.last_fetched.lock().unwrap().contains_key(name),
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key(name)),
         "the first tick stamped last_fetched"
     );
 
@@ -6369,7 +6833,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         last_fetched
             .lock()
             .unwrap()
-            .get(name)
+            .get(&oauth_key(name))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -6499,7 +6963,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
             .next_refresh_per_profile
             .lock()
             .unwrap()
-            .contains_key("fast")
+            .contains_key(&oauth_key("fast"))
         {
             assert!(
                 Instant::now() < deadline,
@@ -6518,8 +6982,11 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
                 activity.get("fast").is_none(),
                 "`fast` spinner cleared on its own completion"
             );
-            assert!(
-                matches!(activity.get("slow"), Some(ProfileActivity::Queued)),
+            assert_eq!(
+                activity
+                    .get("slow")
+                    .and_then(|state| state.fetch(FetchLeg::OAuth)),
+                Some(ProfileActivity::Queued),
                 "`slow` is still queued — it did not gate `fast`"
             );
         }
@@ -6528,7 +6995,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
                 .next_refresh_per_profile
                 .lock()
                 .unwrap()
-                .contains_key("slow"),
+                .contains_key(&oauth_key("slow")),
             "`slow` countdown is not yet published — it lands after `fast`"
         );
     });
@@ -6542,7 +7009,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
     );
     let nrpp = state.next_refresh_per_profile.lock().unwrap();
     assert!(
-        nrpp.contains_key("fast") && nrpp.contains_key("slow"),
+        nrpp.contains_key(&oauth_key("fast")) && nrpp.contains_key(&oauth_key("slow")),
         "both countdowns published by batch end"
     );
 }

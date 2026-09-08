@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::usage::{ActivityStore, ProfileActivity, any_busy};
 
 fn make_activity(entries: &[(&str, ProfileActivity)]) -> ActivityStore {
-    let mut map = HashMap::new();
+    let store = Arc::new(RankedMutex::new(HashMap::new()));
     for (name, activity) in entries {
-        map.insert(name.to_string(), *activity);
+        crate::usage::mark_activity(&store, &crate::profile::ProfileName::from(*name), *activity);
     }
-    Arc::new(RankedMutex::new(map))
+    store
 }
 
 fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
@@ -73,6 +73,62 @@ fn bootstrap_active_false_with_refreshing_slot_still_busy() {
     let flag = Arc::new(AtomicBool::new(false));
     let activity = make_activity(&[("alice", ProfileActivity::Refreshing)]);
     assert!(bootstrap_busy(&flag, &activity));
+}
+
+/// A rotation result reaches the UI thread a tick or more after its worker
+/// returned. Clearing the whole profile there drops an OAuth refetch spinner the
+/// rotation never raised, so the drain retires the rotation marker alone.
+#[test]
+fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("alice");
+
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
+    // the scheduler re-opens the OAuth leg before the UI drains the result.
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Fetching);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        !crate::usage::is_idle(&app.activity, &name),
+        "the refetch spinner outlives the rotation result it did not belong to"
+    );
+
+    // Control: with no later refetch the drain leaves the profile idle, so the
+    // assert above cannot pass on a drain that clears nothing at all.
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        crate::usage::is_idle(&app.activity, &name),
+        "the rotation marker itself retires on its own result"
+    );
+
+    // A switch gate opened after the rotation belongs to the gate's own drain.
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Switching);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        !crate::usage::is_idle(&app.activity, &name),
+        "a pending switch outlives an unrelated rotation result"
+    );
 }
 
 // ── compact mode ─────────────────────────────────────────────────────────

@@ -23,7 +23,8 @@ use crate::profile_json::{
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
-    FetchStatus, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms, windows_maxed,
+    FetchStatus, LegKey, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms,
+    selected_next_refresh, windows_maxed,
 };
 
 /// Bump when the JSON shape changes in a way readers must branch on. 2: the
@@ -47,7 +48,7 @@ pub(crate) struct LiveSignals<'a> {
     /// into `status`: `stale`'s stuck arm is contracted as a stuck 429 read off
     /// the OAuth store, and folding the two would silently retarget it.
     pub(crate) third_party_status: &'a HashMap<String, FetchStatus>,
-    pub(crate) next_refresh: &'a HashMap<String, u64>,
+    pub(crate) next_refresh: &'a HashMap<LegKey, u64>,
     /// Consecutive-429 streaks, so a profile whose live `status` is `RateLimited`
     /// AND whose streak has passed the active cap can be published as `stale` (a
     /// deep-slot stuck read the daemon distrusts — the same judgment
@@ -361,11 +362,7 @@ pub(crate) fn build_profile_entries(
                 None
             } else {
                 match live {
-                    Some(sig) => sig
-                        .next_refresh
-                        .get(name.as_str())
-                        .copied()
-                        .or_else(derived_next),
+                    Some(sig) => selected_next_refresh(sig.next_refresh, p).or_else(derived_next),
                     None => derived_next(),
                 }
             };

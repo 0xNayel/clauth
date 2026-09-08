@@ -27,7 +27,7 @@ use crate::providers::{Provider, StatRowKind};
 use crate::usage::{
     ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, QueueSlot, StreakCounts, UsageWindow,
     WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak, kick_block_switch_grade,
-    now_epoch_secs, now_ms, queue_anchor_cached, switch_grade_kick_lifts,
+    now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh, switch_grade_kick_lifts,
 };
 
 const KEY_W: usize = 8;
@@ -137,13 +137,13 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(profile.name.as_str()).copied())
+            .map(|activity| crate::usage::selected_activity(&activity, profile))
             .unwrap_or(ProfileActivity::Idle),
         next_refresh_ms: app
             .next_refresh_per_profile
             .lock()
             .ok()
-            .and_then(|m| m.get(profile.name.as_str()).copied()),
+            .and_then(|m| selected_next_refresh(&m, profile)),
         tick: app.tick_count,
         streaks: streaks
             .get(profile.name.as_str())

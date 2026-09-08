@@ -145,9 +145,44 @@ pub(crate) type UsageStore = Arc<RankedMutex<HashMap<String, UsageInfo>, rank::U
 pub(crate) type StatusStore = Arc<RankedMutex<HashMap<String, FetchStatus>, rank::UsageStatus>>;
 pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, rank::Tokens>>;
 
+/// Which fetch leg a stamp or countdown belongs to. One profile can be both an
+/// OAuth identity and a third-party provider, and the two legs fetch
+/// concurrently, so a name alone can no longer key the shared cadence stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FetchLeg {
+    OAuth,
+    ThirdParty,
+}
+
+impl FetchLeg {
+    /// The fetch leg whose cache supplies this profile's displayed figures.
+    pub(crate) fn for_profile(profile: &crate::profile::Profile) -> Self {
+        if profile.usage_cache_is_third_party() {
+            Self::ThirdParty
+        } else {
+            Self::OAuth
+        }
+    }
+
+    /// Build the key this leg stores under for `name`.
+    pub(crate) fn key(self, name: ProfileName) -> LegKey {
+        LegKey { leg: self, name }
+    }
+}
+
+/// Key for the stores both fetch legs share ([`LastFetchedAt`],
+/// [`NextRefreshPerProfile`]): the leg plus the profile name. A hybrid profile
+/// appears once per leg, so a bare name would let the two legs overwrite each
+/// other's stamp and countdown.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LegKey {
+    pub(crate) leg: FetchLeg,
+    pub(crate) name: ProfileName,
+}
+
 /// Per-profile stamp of the last fetch attempt (cadence gating): the due instant
 /// plus the ladder deferral baked into it.
-pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, FetchStamp>, rank::LastFetched>>;
+pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<LegKey, FetchStamp>, rank::LastFetched>>;
 
 /// One profile's consecutive-failure counters. Both ladder off
 /// [`rate_limit_backoff_ms`] and both clear on the next live fetch, but they stay
@@ -322,6 +357,16 @@ impl ThirdPartyEntry {
 /// `partition_due` / `merge_forced` run identically over both.
 trait NamedEntry {
     fn name(&self) -> &str;
+    /// The fetch leg this entry belongs to; routes its stamp and countdown to
+    /// the right [`LegKey`] side of the shared stores.
+    fn leg(&self) -> FetchLeg;
+    /// The key this entry's stamp and countdown live under.
+    fn key(&self) -> LegKey {
+        LegKey {
+            leg: self.leg(),
+            name: ProfileName::from(self.name()),
+        }
+    }
     /// Widen-only extra deferral added to the fixed cadence at partition time.
     /// Zero for everything but a quarantined or refresh-failing OAuth profile;
     /// clamped to the #74 degraded floor ([`degraded_extra`]).
@@ -334,6 +379,10 @@ trait NamedEntry {
 impl NamedEntry for TokenEntry {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn leg(&self) -> FetchLeg {
+        FetchLeg::OAuth
     }
 
     fn poll_backoff_ms(&self, streaks: StreakCounts, interval_ms: u64) -> u64 {
@@ -364,6 +413,10 @@ impl NamedEntry for ThirdPartyEntry {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn leg(&self) -> FetchLeg {
+        FetchLeg::ThirdParty
+    }
 }
 
 pub(crate) type ThirdPartyList = Arc<RankedMutex<Vec<ThirdPartyEntry>, rank::ThirdParty>>;
@@ -390,11 +443,54 @@ pub(crate) type SuppressedGenericStore =
 
 /// Per-profile next-fetch epoch-ms. Written after each `partition_due` run for
 /// overview countdown display without re-running the partition math on the render thread.
-pub(crate) type NextRefreshPerProfile = Arc<RankedMutex<HashMap<String, u64>, rank::NextRefresh>>;
+pub(crate) type NextRefreshPerProfile = Arc<RankedMutex<HashMap<LegKey, u64>, rank::NextRefresh>>;
 
-/// In-flight op per profile. Overview shows a spinner instead of a countdown when non-`Idle`.
-/// Map omits `Idle` entries — absent == `Idle`. Leaf-level: never held across HTTP.
-pub(crate) type ActivityStore = Arc<RankedMutex<HashMap<String, ProfileActivity>, rank::Activity>>;
+/// In-flight work for one profile. Account work blocks every fetch leg. Fetch
+/// work stays per leg so one hybrid leg cannot clear the other's spinner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProfileActivityState {
+    account: Option<ProfileActivity>,
+    oauth: Option<ProfileActivity>,
+    third_party: Option<ProfileActivity>,
+}
+
+impl ProfileActivityState {
+    fn fetch(&self, leg: FetchLeg) -> Option<ProfileActivity> {
+        match leg {
+            FetchLeg::OAuth => self.oauth,
+            FetchLeg::ThirdParty => self.third_party,
+        }
+    }
+
+    fn fetch_mut(&mut self, leg: FetchLeg) -> &mut Option<ProfileActivity> {
+        match leg {
+            FetchLeg::OAuth => &mut self.oauth,
+            FetchLeg::ThirdParty => &mut self.third_party,
+        }
+    }
+
+    fn selected(&self, leg: FetchLeg) -> ProfileActivity {
+        self.account
+            .or_else(|| self.fetch(leg))
+            .unwrap_or(ProfileActivity::Idle)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.account.is_none() && self.oauth.is_none() && self.third_party.is_none()
+    }
+
+    /// Retire the rotation marker, and only that one. `Switching` belongs to the
+    /// switch gate, which clears it when its own answer drains.
+    fn end_rotation(&mut self) {
+        if matches!(self.account, Some(ProfileActivity::Refreshing)) {
+            self.account = None;
+        }
+    }
+}
+
+/// In-flight work keyed by profile, with independent OAuth and provider slots.
+pub(crate) type ActivityStore =
+    Arc<RankedMutex<HashMap<String, ProfileActivityState>, rank::Activity>>;
 
 /// In-flight op for one profile. Non-`Idle` shows a spinner in the overview timer slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,28 +541,118 @@ pub(crate) enum StartupSignal {
 pub(crate) type StartupSender = Sender<StartupSignal>;
 pub(crate) type StartupReceiver = Receiver<StartupSignal>;
 
-/// Mark a profile's activity. Idempotent; pair with [`clear_activity`] on every exit path.
+/// Mark OAuth or account-wide activity. `Queued`/`Fetching` belong to the OAuth
+/// leg. `Refreshing`/`Switching` block both legs.
+///
+/// Each slot is written by its own owner and by nobody else: a leg mark leaves a
+/// concurrent rotation standing, or `partition_due` re-admits the profile while
+/// the rotation is still spending its single-use pair. The rotation owner hands
+/// its marker over through [`rotation_into_fetch`], the one site that may.
 pub(crate) fn mark_activity(store: &ActivityStore, name: &ProfileName, activity: ProfileActivity) {
-    if let Ok(mut g) = store.lock() {
-        if matches!(activity, ProfileActivity::Idle) {
-            g.remove(name.as_str());
-        } else {
-            g.insert(name.to_string(), activity);
+    match activity {
+        // No production caller marks `Idle`; the arm keeps the match exhaustive
+        // and means the same as the account owner's own clear.
+        ProfileActivity::Idle => clear_activity(store, name),
+        ProfileActivity::Queued | ProfileActivity::Fetching => {
+            if let Ok(mut states) = store.lock() {
+                *states
+                    .entry(name.to_string())
+                    .or_default()
+                    .fetch_mut(FetchLeg::OAuth) = Some(activity);
+            }
+        }
+        ProfileActivity::Refreshing | ProfileActivity::Switching => {
+            if let Ok(mut states) = store.lock() {
+                states.entry(name.to_string()).or_default().account = Some(activity);
+            }
         }
     }
 }
 
-/// Drop a profile to `Idle` (removes the entry; absent == `Idle`).
-pub(crate) fn clear_activity(store: &ActivityStore, name: &ProfileName) {
-    if let Ok(mut g) = store.lock() {
-        g.remove(name.as_str());
+/// Hand the rotation owner's account-wide marker to the OAuth leg under one
+/// hold. Atomic on purpose: between two separate writes `partition_due` reads
+/// the profile as idle and re-admits it while the rotation's own fetch is still
+/// to come. Nothing enforces that the caller raised the `Refreshing` it retires;
+/// called from elsewhere it costs one spurious re-poll, and `RotationGuard`
+/// still blocks the double-spend that would otherwise follow.
+pub(crate) fn rotation_into_fetch(store: &ActivityStore, name: &ProfileName) {
+    if let Ok(mut states) = store.lock() {
+        let state = states.entry(name.to_string()).or_default();
+        state.end_rotation();
+        *state.fetch_mut(FetchLeg::OAuth) = Some(ProfileActivity::Fetching);
     }
 }
 
-/// True iff the profile has no in-flight op. Poisoned mutex fails safe to "busy".
+/// Retire a rotation marker whose result has landed, leaving both fetch legs to
+/// their own completion boundaries. A rotation result drains on the UI thread a
+/// tick or more after its worker returned, so an unrelated refetch may already
+/// own the OAuth leg by then.
+pub(crate) fn end_rotation(store: &ActivityStore, name: &ProfileName) {
+    if let Ok(mut states) = store.lock()
+        && let Some(state) = states.get_mut(name.as_str())
+    {
+        state.end_rotation();
+        if state.is_idle() {
+            states.remove(name.as_str());
+        }
+    }
+}
+
+/// Clear account-wide activity. Each fetch leg is left to its own completion
+/// boundary ([`clear_fetch_activity`]): the OAuth leg opens in
+/// [`fetch_oauth_due_with`] and closes on every path out of it, panic included,
+/// so reaching in here only ever drops a spinner this owner never raised.
+pub(crate) fn clear_activity(store: &ActivityStore, name: &ProfileName) {
+    if let Ok(mut states) = store.lock()
+        && let Some(state) = states.get_mut(name.as_str())
+    {
+        state.account = None;
+        if state.is_idle() {
+            states.remove(name.as_str());
+        }
+    }
+}
+
+pub(crate) fn mark_fetch_activity(store: &ActivityStore, key: &LegKey, activity: ProfileActivity) {
+    if let Ok(mut states) = store.lock() {
+        if matches!(activity, ProfileActivity::Idle) {
+            if let Some(state) = states.get_mut(key.name.as_str()) {
+                *state.fetch_mut(key.leg) = None;
+                if state.is_idle() {
+                    states.remove(key.name.as_str());
+                }
+            }
+        } else {
+            *states
+                .entry(key.name.to_string())
+                .or_default()
+                .fetch_mut(key.leg) = Some(activity);
+        }
+    }
+}
+
+fn clear_fetch_activity(store: &ActivityStore, key: &LegKey) {
+    mark_fetch_activity(store, key, ProfileActivity::Idle);
+}
+
+/// Activity shown beside the cache that supplies `profile`'s figures.
+pub(crate) fn selected_activity(
+    activity: &HashMap<String, ProfileActivityState>,
+    profile: &crate::profile::Profile,
+) -> ProfileActivity {
+    activity
+        .get(profile.name.as_str())
+        .map_or(ProfileActivity::Idle, |state| {
+            state.selected(FetchLeg::for_profile(profile))
+        })
+}
+
+/// True iff the profile has no account or fetch work. Poison fails closed.
 pub(crate) fn is_idle(store: &ActivityStore, name: &ProfileName) -> bool {
     match store.lock() {
-        Ok(g) => !g.contains_key(name.as_str()),
+        Ok(states) => states
+            .get(name.as_str())
+            .is_none_or(ProfileActivityState::is_idle),
         Err(_) => false,
     }
 }
@@ -474,18 +660,17 @@ pub(crate) fn is_idle(store: &ActivityStore, name: &ProfileName) -> bool {
 /// True iff any profile has an in-flight op. Gates global actions like "rotate all".
 pub(crate) fn any_busy(store: &ActivityStore) -> bool {
     match store.lock() {
-        Ok(g) => !g.is_empty(),
+        Ok(states) => states.values().any(|state| !state.is_idle()),
         Err(_) => true,
     }
 }
 
-/// True iff any profile's switch gate is in flight. Poisoned mutex fails safe
-/// to "busy". Switch entry points refuse while one is pending: a second switch
-/// spawned mid-gate could land first and be overturned by the older gate's
-/// completion.
+/// True iff any profile's switch gate is in flight. Poison fails closed.
 pub(crate) fn switch_gate_in_flight(store: &ActivityStore) -> bool {
     match store.lock() {
-        Ok(g) => g.values().any(|a| matches!(a, ProfileActivity::Switching)),
+        Ok(states) => states
+            .values()
+            .any(|state| matches!(state.account, Some(ProfileActivity::Switching))),
         Err(_) => true,
     }
 }
@@ -959,7 +1144,9 @@ fn fetch_with_rotation(
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
     let rotation =
         crate::oauth::refresh_result(rt, crate::oauth::stored_scopes(config, name).as_deref());
-    mark_activity(activity, name, ProfileActivity::Fetching);
+    // This site raised `Refreshing`, so it is the one that may retire it. One
+    // hold, so partition never reads the profile idle between the two writes.
+    rotation_into_fetch(activity, name);
     let tok = match rotation {
         Ok(t) => t,
         Err(e) => {
@@ -1837,6 +2024,27 @@ fn next_slot_deferral(
     )
 }
 
+/// The GENERIC third-party outcome's flat #74 floor: a 429 with no usable
+/// `retry-after` (including a `0` hint, which names no wait) lands the next
+/// slot on `max(interval, [`DEGRADED_GAP_CEILING_MS`])` instead of a streak
+/// ladder — a generic endpoint has no per-account streak to ramp, and its scan
+/// must rescan at the degraded cadence. A real hint still wins verbatim up to
+/// [`MAX_RETRY_AFTER_MS`]. Non-429 outcomes: no defer.
+fn generic_slot_deferral(retry_after: Option<Duration>, interval_ms: u64) -> IntervalMs {
+    let hint = retry_after
+        .map(|ra| ra.as_millis() as u64)
+        .filter(|ms| *ms > 0);
+    let target_ms = match hint {
+        Some(h) => h,
+        None => interval_ms.max(DEGRADED_GAP_CEILING_MS),
+    };
+    IntervalMs::from_millis(
+        target_ms
+            .min(MAX_RETRY_AFTER_MS)
+            .saturating_sub(interval_ms),
+    )
+}
+
 /// Deterministic per-profile spread (phase offset + per-cycle jitter) added to a
 /// live fetch's `last_fetched` stamp so distinct profiles don't fall due on the
 /// same tick — avoiding a same-instant request burst against the shared host.
@@ -2072,7 +2280,7 @@ fn apply_outcome(
     // Both in one critical section — ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(
-            outcome.name.to_string(),
+            FetchLeg::OAuth.key(outcome.name.clone()),
             FetchStamp {
                 due: stamped,
                 ladder_ms: defer.as_millis(),
@@ -2210,7 +2418,7 @@ fn try_seed_cache(
     // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350) — matches `apply_outcome`.
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(
-            name.to_string(),
+            FetchLeg::OAuth.key(name.clone()),
             FetchStamp::at(EpochMs::from_millis(mtime)),
         );
         if let Ok(mut st) = status.lock() {
@@ -2250,7 +2458,7 @@ pub(crate) fn bootstrap_third_party(
         // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
         if let Ok(mut lf) = last_fetched.lock() {
             lf.insert(
-                entry.name.to_string(),
+                FetchLeg::ThirdParty.key(entry.name.clone()),
                 FetchStamp::at(EpochMs::from_millis(mtime)),
             );
             if let Ok(mut st) = status.lock() {
@@ -2481,11 +2689,15 @@ where
 
         drain_oauth_completions(state, &rx, expected, interval_ms);
 
-        // Reap the workers; a panicked worker sent nothing, so its slot may still
-        // read `Queued` — clear it here so the spinner doesn't freeze.
+        // Reap the workers. A panicked worker sent nothing, so BOTH slots it
+        // owned may still be set: the leg it was queued on, and the account
+        // marker `poll_one`'s rotation raised before it died. This is the only
+        // site left to free either, and a stranded `Refreshing` excludes the
+        // profile from `partition_due` on every later tick.
         for (name, h) in handles {
             if h.join().is_err() {
                 clear_activity(&state.activity, &name);
+                clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(name));
             }
         }
     });
@@ -2505,7 +2717,7 @@ fn drain_oauth_completions(
 ) {
     for _ in 0..expected {
         let Ok(outcome) = rx.recv() else { break };
-        clear_activity(&state.activity, &outcome.name);
+        clear_fetch_activity(&state.activity, &FetchLeg::OAuth.key(outcome.name.clone()));
         // Propagate rotated tokens back into the live snapshot — otherwise
         // tick N+1 reuses the stale access token, 401s, and double-burns the chain.
         if let Some((new_access, new_refresh)) = &outcome.rotated
@@ -2545,7 +2757,12 @@ fn drain_oauth_completions(
             auto_start,
             &state.weekly_reset_kicks,
         );
-        publish_one_countdown(&state.next_refresh_per_profile, &name, stamped, interval_ms);
+        publish_one_countdown(
+            &state.next_refresh_per_profile,
+            &FetchLeg::OAuth.key(name),
+            stamped,
+            interval_ms,
+        );
     }
 }
 
@@ -2555,10 +2772,11 @@ fn drain_oauth_completions(
 fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
     let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
     for entry in &due {
-        // `Queued`, not `Fetching`: same-host accounts wait behind the per-host
-        // spacing slot, so each worker flips itself to `Fetching` only once its
-        // request clears the gate (mirrors the OAuth leg's `get_json` flip).
-        mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
+        mark_fetch_activity(
+            &state.activity,
+            &FetchLeg::ThirdParty.key(entry.name.clone()),
+            ProfileActivity::Queued,
+        );
     }
 
     let fetcher = state.fetcher;
@@ -2584,10 +2802,10 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
             // serialize, distinct hosts (and the Anthropic OAuth leg) run in parallel.
             let host = entry.target.throttle_key();
             let activity = Arc::clone(&state.activity);
-            let worker_name = entry.name.clone();
+            let worker_key = FetchLeg::ThirdParty.key(entry.name.clone());
             let h = std::thread::spawn(move || {
                 await_request_slot(&host);
-                mark_activity(&activity, &worker_name, ProfileActivity::Fetching);
+                mark_fetch_activity(&activity, &worker_key, ProfileActivity::Fetching);
                 fetcher(&entry.target, &entry.api_key, hint.as_deref())
             });
             (name, fingerprint, is_generic, h)
@@ -2597,7 +2815,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
     for (name, fingerprint, is_generic, h) in handles {
         match h.join() {
             Ok(Ok(stats)) => {
-                clear_activity(&state.activity, &name);
+                clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
                 // A live body retires any dead-credential record: the surfaces
                 // that read it have no other way to learn the session came back.
                 crate::profile_cache::clear_auth_expired(&name);
@@ -2612,14 +2830,12 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     &state.last_fetched,
                     &state.next_refresh_per_profile,
                     &name,
-                    None,
-                    false,
                     interval_ms,
-                    0,
+                    ThirdPartyDeferral::Standard,
                 );
             }
             Ok(Err(err)) => {
-                clear_activity(&state.activity, &name);
+                clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
                 // Cache cold-fills an absent entry only — never overwrites live
                 // store data with disk state (same rule as the OAuth path).
                 let cached = load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE);
@@ -2672,67 +2888,85 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 } else {
                     crate::profile_cache::clear_auth_expired(&name);
                 }
-                // A generic scan that found nothing re-probes every candidate
-                // path; the floor keeps that rescan off the bare cadence. Only
-                // the generic arm gets it: a typed provider's error cadence is
-                // its own, and a 429/AuthExpired keeps its existing deferral.
-                let extra_deferral_ms = if is_generic
-                    && !matches!(status, FetchStatus::RateLimited | FetchStatus::AuthExpired)
-                {
-                    degraded_extra(interval_ms, DEGRADED_GAP_CEILING_MS)
+                let deferral = if matches!(status, FetchStatus::RateLimited) {
+                    ThirdPartyDeferral::RateLimited {
+                        retry_after,
+                        is_generic,
+                    }
+                } else if is_generic && !matches!(status, FetchStatus::AuthExpired) {
+                    ThirdPartyDeferral::GenericNoData
                 } else {
-                    0
+                    ThirdPartyDeferral::Standard
                 };
                 stamp_last_fetched(
                     &state.last_fetched,
                     &state.next_refresh_per_profile,
                     &name,
-                    retry_after,
-                    matches!(status, FetchStatus::RateLimited),
                     interval_ms,
-                    extra_deferral_ms,
+                    deferral,
                 );
             }
             Err(_) => {
                 // Worker panicked — clear slot so the spinner doesn't freeze.
-                clear_activity(&state.activity, &name);
+                clear_fetch_activity(&state.activity, &FetchLeg::ThirdParty.key(name.clone()));
             }
         }
     }
 }
 
-/// Stamp a profile's fetch slot. Normally `now` (so the next deadline reflects
-/// fetch duration, mirroring OAuth `apply_outcome`); a 429's `retry-after`
-/// stamps `retry_after - interval` ahead so `partition_due`'s fixed
-/// `stamp + interval_ms` math lands the next slot on `now + retry_after`
-/// (capped by [`MAX_RETRY_AFTER_MS`]). `extra_deferral_ms` is a non-hint,
-/// non-429 deferral added verbatim: the generic no-data rescan passes
-/// [`degraded_extra(interval_ms, DEGRADED_GAP_CEILING_MS)`] there.
+/// One provider outcome's cadence policy. The enum excludes impossible mixes
+/// such as a server hint plus the generic no-data floor.
+#[derive(Clone, Copy)]
+enum ThirdPartyDeferral {
+    Standard,
+    GenericNoData,
+    RateLimited {
+        retry_after: Option<Duration>,
+        is_generic: bool,
+    },
+}
+
+/// Stamp a profile's provider-fetch slot. The policy computes every added delay
+/// in one place before the shared stores receive the typed provider key.
 fn stamp_last_fetched(
     last_fetched: &LastFetchedAt,
     next_refresh: &NextRefreshPerProfile,
     name: &ProfileName,
-    retry_after: Option<Duration>,
-    rate_limited: bool,
     interval_ms: u64,
-    extra_deferral_ms: u64,
+    policy: ThirdPartyDeferral,
 ) {
-    // Third-party providers are independent hosts with their own limits; keep the
-    // flat base backoff (streak 1) rather than the per-account exponential ramp.
-    let defer = next_slot_deferral(rate_limited, retry_after, 1, interval_ms, false);
+    let key = FetchLeg::ThirdParty.key(name.clone());
+    let (defer, extra_deferral_ms) = match policy {
+        ThirdPartyDeferral::Standard => (IntervalMs::default(), 0),
+        ThirdPartyDeferral::GenericNoData => (
+            IntervalMs::default(),
+            degraded_extra(interval_ms, DEGRADED_GAP_CEILING_MS),
+        ),
+        ThirdPartyDeferral::RateLimited {
+            retry_after,
+            is_generic,
+        } => {
+            let defer = if is_generic {
+                generic_slot_deferral(retry_after, interval_ms)
+            } else {
+                next_slot_deferral(true, retry_after, 1, interval_ms, false)
+            };
+            (defer, 0)
+        }
+    };
     let stamped = EpochMs::from_millis(now_ms())
         .saturating_add(defer)
         .saturating_add(IntervalMs::from_millis(extra_deferral_ms));
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(
-            name.to_string(),
+            key.clone(),
             FetchStamp {
                 due: stamped,
                 ladder_ms: defer.as_millis(),
             },
         );
     }
-    publish_one_countdown(next_refresh, name, stamped, interval_ms);
+    publish_one_countdown(next_refresh, &key, stamped, interval_ms);
 }
 
 /// Partition a leg's snapshot into due entries + per-profile countdowns, with
@@ -2744,7 +2978,7 @@ fn partition_and_merge<T: NamedEntry + Clone>(
     state: &SchedulerState,
     now: u64,
     interval_ms: u64,
-) -> (Vec<T>, HashMap<String, u64>) {
+) -> (Vec<T>, HashMap<LegKey, u64>) {
     if snapshot.is_empty() {
         return (Vec::new(), HashMap::new());
     }
@@ -2762,11 +2996,12 @@ fn partition_and_merge<T: NamedEntry + Clone>(
 
 /// Full-replace publish of both legs' countdowns in one lock window. `clear`
 /// before `extend` drops any deleted profile's stale key and avoids the
-/// mid-tick window where one leg's countdowns are momentarily missing.
+/// mid-tick window where one leg's countdowns are momentarily missing. The two
+/// maps key on different legs, so a hybrid profile's countdowns never collide.
 fn publish_countdowns(
     nrpp: &NextRefreshPerProfile,
-    oauth: HashMap<String, u64>,
-    third_party: HashMap<String, u64>,
+    oauth: HashMap<LegKey, u64>,
+    third_party: HashMap<LegKey, u64>,
 ) {
     if let Ok(mut map) = nrpp.lock() {
         map.clear();
@@ -2783,16 +3018,28 @@ fn publish_countdowns(
 /// (1100) is acquired alone, after the caller's lower-ranked locks — rank-safe.
 fn publish_one_countdown(
     nrpp: &NextRefreshPerProfile,
-    name: &ProfileName,
+    key: &LegKey,
     stamped: EpochMs,
     interval_ms: u64,
 ) {
     if let Ok(mut map) = nrpp.lock() {
-        map.insert(
-            name.to_string(),
-            stamped.as_millis().saturating_add(interval_ms),
-        );
+        map.insert(key.clone(), stamped.as_millis().saturating_add(interval_ms));
     }
+}
+
+/// The next-refresh countdown a display surface should show for `profile`: the
+/// third-party leg's value when the profile's usage cache is third-party, else
+/// the OAuth leg's. The two legs key [`NextRefreshPerProfile`] separately (a
+/// hybrid profile appears once per leg), and each display surface must pick the
+/// side its own cache selector reads — the three call sites share this so they
+/// cannot drift.
+pub(crate) fn selected_next_refresh(
+    next_refresh: &HashMap<LegKey, u64>,
+    profile: &crate::profile::Profile,
+) -> Option<u64> {
+    next_refresh
+        .get(&FetchLeg::for_profile(profile).key(profile.name.clone()))
+        .copied()
 }
 
 /// Every profile that could own a `usage_history.jsonl`, disabled and
@@ -3050,8 +3297,11 @@ fn tick(state: &SchedulerState) {
         let excluded: HashSet<String> = match state.activity.lock() {
             Ok(a) => a
                 .iter()
-                .filter(|(_, v)| {
-                    matches!(v, ProfileActivity::Refreshing | ProfileActivity::Switching)
+                .filter(|(_, state)| {
+                    matches!(
+                        state.account,
+                        Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
+                    )
                 })
                 .map(|(n, _)| n.clone())
                 .collect(),
@@ -3078,10 +3328,10 @@ fn tick(state: &SchedulerState) {
     // from both (e.g. a profile whose creds were removed between the UI `r` and
     // this tick) was marked Queued by `enqueue_refetch` but no worker owns it, so
     // the orphan sweep at the tick's end clears it — otherwise its spinner freezes.
-    let scheduled: HashSet<String> = oauth_due
+    let scheduled: HashSet<LegKey> = oauth_due
         .iter()
-        .map(|e| e.name.to_string())
-        .chain(tp_due.iter().map(|e| e.name.to_string()))
+        .map(NamedEntry::key)
+        .chain(tp_due.iter().map(NamedEntry::key))
         .collect();
 
     // Both legs fan out concurrently so the third-party leg no longer waits behind
@@ -3223,7 +3473,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .unwrap_or(true);
     if !refresh_spent && let Ok(store) = state.store.lock() {
         let skip = spent_skip_set(&oauth_snapshot, &forced, &store, now_epoch_secs());
-        oauth_next.retain(|name, _| !skip.contains(name));
+        oauth_next.retain(|key, _| !skip.contains(key.name.as_str()));
     }
     let (_, tp_next) = partition_due(
         &tp_snapshot,
@@ -3243,8 +3493,16 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // does, and the row would spin forever where the daemon-fed countdown
     // belongs. Fetching/Refreshing/Switching stay — a worker from the last
     // armed tick may genuinely still be in flight and clears itself.
-    if let Ok(mut a) = state.activity.lock() {
-        a.retain(|_, act| !matches!(act, ProfileActivity::Queued));
+    if let Ok(mut activity) = state.activity.lock() {
+        activity.retain(|_, state| {
+            state.oauth = state
+                .oauth
+                .filter(|value| !matches!(value, ProfileActivity::Queued));
+            state.third_party = state
+                .third_party
+                .filter(|value| !matches!(value, ProfileActivity::Queued));
+            !state.is_idle()
+        });
     }
 }
 
@@ -3854,7 +4112,7 @@ fn partition_due<T: NamedEntry + Clone>(
     activity: &ActivityStore,
     interval_ms: u64,
     streaks: &HashMap<String, StreakCounts>,
-) -> (Vec<T>, HashMap<String, u64>) {
+) -> (Vec<T>, HashMap<LegKey, u64>) {
     let now = EpochMs::from_millis(now);
     let Ok(lf) = last_fetched.lock() else {
         return (Vec::new(), HashMap::new());
@@ -3865,7 +4123,7 @@ fn partition_due<T: NamedEntry + Clone>(
     let mut due = Vec::new();
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
-        let last = lf.get(entry.name()).copied().unwrap_or_default();
+        let last = lf.get(&entry.key()).copied().unwrap_or_default();
         let counts = streaks.get(entry.name()).copied().unwrap_or_default();
         let backoff = entry.poll_backoff_ms(counts, interval_ms);
         // `last.ladder_ms` is the true deferral the stamp site computed
@@ -3878,12 +4136,14 @@ fn partition_due<T: NamedEntry + Clone>(
             .due
             .saturating_add(interval)
             .saturating_add(IntervalMs::from_millis(partition_extra));
-        per_profile.insert(entry.name().to_string(), next.as_millis());
+        per_profile.insert(entry.key(), next.as_millis());
         let excluded = match act.as_ref() {
-            Ok(a) => matches!(
-                a.get(entry.name()),
-                Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
-            ),
+            Ok(activity) => activity.get(entry.name()).is_some_and(|state| {
+                matches!(
+                    state.account,
+                    Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
+                )
+            }),
             Err(_) => true, // Poisoned: fail safe to excluded.
         };
         if excluded {
@@ -3903,7 +4163,7 @@ fn merge_forced<T: NamedEntry + Clone>(
     snapshot: &[T],
     forced: &HashSet<String>,
     due: &mut Vec<T>,
-    per_profile_next: &mut HashMap<String, u64>,
+    per_profile_next: &mut HashMap<LegKey, u64>,
     activity: &ActivityStore,
     now: u64,
 ) {
@@ -3911,9 +4171,14 @@ fn merge_forced<T: NamedEntry + Clone>(
         return;
     }
     let switching: HashSet<String> = match activity.lock() {
-        Ok(a) => a
+        Ok(activity) => activity
             .iter()
-            .filter(|(_, v)| matches!(v, ProfileActivity::Refreshing | ProfileActivity::Switching))
+            .filter(|(_, state)| {
+                matches!(
+                    state.account,
+                    Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
+                )
+            })
             .map(|(n, _)| n.clone())
             .collect(),
         Err(_) => snapshot.iter().map(|e| e.name().to_string()).collect(),
@@ -3924,7 +4189,7 @@ fn merge_forced<T: NamedEntry + Clone>(
             && !switching.contains(e.name())
             && !due.iter().any(|d| d.name() == e.name())
     }) {
-        per_profile_next.insert(entry.name().to_string(), now);
+        per_profile_next.insert(entry.key(), now);
         extras.push(entry.clone());
     }
     due.extend(extras);
@@ -3942,7 +4207,7 @@ fn drop_spent_oauth(
     state: &SchedulerState,
     snapshot: &[TokenEntry],
     due: &mut Vec<TokenEntry>,
-    next: &mut HashMap<String, u64>,
+    next: &mut HashMap<LegKey, u64>,
     forced: &HashSet<String>,
 ) {
     let now_secs = now_epoch_secs();
@@ -3956,14 +4221,19 @@ fn drop_spent_oauth(
         return;
     }
     due.retain(|entry| !skip.contains(entry.name.as_str()));
-    next.retain(|name, _| !skip.contains(name));
+    next.retain(|key, _| !skip.contains(key.name.as_str()));
     // Clear a stranded bootstrap `Queued` mark so the row stops spinning on a
     // fetch that never runs. `Fetching`/`Refreshing`/`Switching` are worker-owned
     // and left alone — one may still be in flight and clears itself on landing.
-    if let Ok(mut act) = state.activity.lock() {
+    if let Ok(mut activity) = state.activity.lock() {
         for name in &skip {
-            if matches!(act.get(name), Some(ProfileActivity::Queued)) {
-                act.remove(name);
+            if let Some(state) = activity.get_mut(name) {
+                state.oauth = state
+                    .oauth
+                    .filter(|value| !matches!(value, ProfileActivity::Queued));
+                if state.is_idle() {
+                    activity.remove(name);
+                }
             }
         }
     }
@@ -4030,26 +4300,24 @@ fn should_anchor_fetch(
 fn anchor_post_reset_oauth(
     snapshot: &[TokenEntry],
     resets: &HashMap<String, u64>,
-    last_fetched: &HashMap<String, FetchStamp>,
+    last_fetched: &HashMap<LegKey, FetchStamp>,
     excluded: &HashSet<String>,
     due: &mut Vec<TokenEntry>,
-    next: &mut HashMap<String, u64>,
+    next: &mut HashMap<LegKey, u64>,
     now_ms: u64,
 ) {
     for entry in snapshot {
         if excluded.contains(entry.name.as_str()) || due.iter().any(|d| d.name == entry.name) {
             continue;
         }
-        let last = last_fetched
-            .get(entry.name.as_str())
-            .map_or(0, |e| e.as_millis());
+        let last = last_fetched.get(&entry.key()).map_or(0, |e| e.as_millis());
         if should_anchor_fetch(
             resets.get(entry.name.as_str()).copied(),
             last,
             now_ms,
             RESET_ANCHOR_GRACE_MS,
         ) {
-            next.insert(entry.name.to_string(), now_ms);
+            next.insert(entry.key(), now_ms);
             due.push(entry.clone());
         }
     }
@@ -4062,20 +4330,29 @@ fn anchor_post_reset_oauth(
 fn clear_orphaned_forced(
     activity: &ActivityStore,
     forced: &HashSet<String>,
-    scheduled: &HashSet<String>,
+    scheduled: &HashSet<LegKey>,
 ) {
     if forced.is_empty() {
         return;
     }
-    if let Ok(mut a) = activity.lock() {
+    if let Ok(mut activity) = activity.lock() {
         for name in forced {
-            if !scheduled.contains(name)
-                && !matches!(
-                    a.get(name),
-                    Some(ProfileActivity::Refreshing | ProfileActivity::Switching)
-                )
-            {
-                a.remove(name);
+            let oauth = FetchLeg::OAuth.key(ProfileName::from(name.as_str()));
+            let third_party = FetchLeg::ThirdParty.key(ProfileName::from(name.as_str()));
+            if let Some(state) = activity.get_mut(name) {
+                if !scheduled.contains(&oauth) {
+                    state.oauth = state
+                        .oauth
+                        .filter(|value| !matches!(value, ProfileActivity::Queued));
+                }
+                if !scheduled.contains(&third_party) {
+                    state.third_party = state
+                        .third_party
+                        .filter(|value| !matches!(value, ProfileActivity::Queued));
+                }
+                if state.is_idle() {
+                    activity.remove(name);
+                }
             }
         }
     }

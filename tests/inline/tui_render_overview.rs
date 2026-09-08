@@ -8,7 +8,7 @@ use ratatui::style::Modifier;
 
 use crate::fallback::BlockedReason;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
-use crate::usage::{FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
+use crate::usage::{FetchLeg, FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
 
 /// ISO reset `secs` in the future.
@@ -594,10 +594,10 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
     a.fetch_status = Some(FetchStatus::Cached);
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    app.next_refresh_per_profile
-        .lock()
-        .unwrap()
-        .insert("a".to_string(), now_ms() + 30_000);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() + 30_000,
+    );
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     assert!(
@@ -628,10 +628,10 @@ fn failed_row_colors_countdown_red() {
     a.fetch_status = Some(FetchStatus::Failed);
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    app.next_refresh_per_profile
-        .lock()
-        .unwrap()
-        .insert("a".to_string(), now_ms() + 30_000);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() + 30_000,
+    );
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     let bracket = line
@@ -1179,8 +1179,14 @@ fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
     let app = App::new(config);
     // Both profiles carry a live countdown in the shared map.
     if let Ok(mut m) = app.next_refresh_per_profile.lock() {
-        m.insert("a".to_string(), now_ms() + 42_000);
-        m.insert("b".to_string(), now_ms() + 42_000);
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("a")),
+            now_ms() + 42_000,
+        );
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("b")),
+            now_ms() + 42_000,
+        );
     }
     let widths = OverviewWidths::new(110, &app);
 
