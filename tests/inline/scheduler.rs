@@ -510,9 +510,10 @@ fn partition_due_excludes_switching() {
 
 /// A quarantined (`auth_broken`) profile's poll spends a guaranteed-dead
 /// 401 → refresh → 400 pair against the token endpoint, so partition widens
-/// its cadence by `AUTH_BROKEN_BACKOFF_MS` — computed from the live flag,
-/// never baked into the `last_fetched` stamp, so any flag lift (login, adopt,
-/// carry) snaps the cadence back on the very next tick.
+/// its cadence to the degraded floor `max(interval, DEGRADED_GAP_CEILING_MS)`
+/// — computed from the live flag, never baked into the `last_fetched` stamp,
+/// so any flag lift (login, adopt, carry) snaps the cadence back on the very
+/// next tick.
 #[test]
 fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -540,7 +541,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     assert!(due.is_empty(), "flagged profile skips the plain cadence");
     assert_eq!(
         next["a"],
-        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "published countdown shows the widened deadline"
     );
 
@@ -548,7 +549,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     // attempt stays a (slow) recovery path.
     let (due, _) = partition_due(
         &snapshot,
-        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
@@ -631,16 +632,17 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     assert_eq!(next_at(&streaks(2)), base + REFRESH_INTERVAL_MS + 30_000);
     assert_eq!(next_at(&streaks(3)), base + REFRESH_INTERVAL_MS + 90_000);
 
-    // …and stops at the same 15-minute ceiling the 429 ladder honors, rather
+    // …and stops at the degraded floor the 429 ladder converges to, rather
     // than running away to hours (`rate_limit_backoff_ms` alone is unbounded).
     assert_eq!(
         next_at(&streaks(50)),
-        base + REFRESH_INTERVAL_MS + super::MAX_RETRY_AFTER_MS,
-        "a deep refresh-fail streak caps at MAX_RETRY_AFTER_MS",
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
+        "a deep refresh-fail streak caps at the degraded floor",
     );
 
-    // A quarantined profile keeps the wider `auth_broken` deferral: that flag
-    // means the token is confirmed dead, which outranks "might be a blip".
+    // A quarantined profile lands on the floor immediately: that flag means
+    // the token is confirmed dead, which outranks "might be a blip" and the
+    // shallow 10s rung the same streak would otherwise give.
     let mut flagged = token("a");
     flagged.auth_broken = true;
     let (_, next) = partition_due(
@@ -653,7 +655,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     );
     assert_eq!(
         next["a"],
-        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "a confirmed-dead token outranks the refresh-fail ladder"
     );
 }
@@ -5562,12 +5564,12 @@ fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick()
 
 #[test]
 fn active_profile_rate_limit_ladder_caps_at_one_extra_interval() {
-    use super::{IntervalMs, MAX_RETRY_AFTER_MS, next_slot_deferral};
+    use super::{DEGRADED_GAP_CEILING_MS, IntervalMs, next_slot_deferral};
     let interval = 90_000u64;
-    // Deep streak: the idle ladder pushes the slot to the 15-min ceiling.
+    // Deep streak: the idle ladder clamps its total gap to the 5-min floor.
     assert_eq!(
         next_slot_deferral(true, None, 6, interval, false),
-        IntervalMs::from_millis(MAX_RETRY_AFTER_MS - interval),
+        IntervalMs::from_millis(DEGRADED_GAP_CEILING_MS - interval),
         "idle keeps the full drain ladder"
     );
     // Active: the slot lands at most one extra interval out (2x cadence).
@@ -5608,13 +5610,28 @@ fn active_profile_cap_leaves_shallow_streaks_alone() {
     );
 }
 
+/// The flat base rung a third-party 429 gets (`stamp_last_fetched` always
+/// passes streak 1) sits UNDER the #74 floor at a sub-cadence interval: 90s
+/// cadence + 10s = 100s total gap, so the floor clamp must raise nothing. The
+/// clamp only narrows a gap that exceeds `max(interval, 5min)`.
+#[test]
+fn third_party_flat_rung_stays_under_the_floor_at_a_sub_cadence_interval() {
+    use super::{IntervalMs, RATE_LIMIT_MIN_BACKOFF_MS, next_slot_deferral};
+    let interval = 90_000u64;
+    assert_eq!(
+        next_slot_deferral(true, None, 1, interval, false),
+        IntervalMs::from_millis(RATE_LIMIT_MIN_BACKOFF_MS),
+        "a 90s cadence keeps its 100s flat gap"
+    );
+}
+
 /// Pins where the cap first bites and where it releases, so a drift in either
 /// boundary fails loudly. At 90s cadence: streak 3's ladder (90s + 90s) equals
 /// the 2× cap exactly (a no-op), streak 4 (90s + 270s) is the first capped
 /// step, streak 6 the last, and streak 7 releases to the idle drain ladder.
 #[test]
 fn active_profile_cap_bites_at_streak_4_and_releases_past_6() {
-    use super::{IntervalMs, MAX_RETRY_AFTER_MS, next_slot_deferral};
+    use super::{DEGRADED_GAP_CEILING_MS, IntervalMs, next_slot_deferral};
     let interval = 90_000u64;
     // streak 3: ladder == cap, active and idle agree.
     assert_eq!(
@@ -5642,8 +5659,8 @@ fn active_profile_cap_bites_at_streak_4_and_releases_past_6() {
     );
     assert_eq!(
         next_slot_deferral(true, None, 7, interval, true),
-        IntervalMs::from_millis(MAX_RETRY_AFTER_MS - interval),
-        "a released deep streak sits at the 15-min ceiling"
+        IntervalMs::from_millis(DEGRADED_GAP_CEILING_MS - interval),
+        "a released deep streak sits at the 5-min floor"
     );
 }
 
@@ -5717,8 +5734,8 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp("act")),
         "active stamp must carry the 2x-cadence cap"
     );
-    // Idle at streak 6: full ladder → the 15-min ceiling.
-    let idle_extra = super::MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;
+    // Idle at streak 6: full ladder → the 5-min degraded floor.
+    let idle_extra = super::DEGRADED_GAP_CEILING_MS - REFRESH_INTERVAL_MS;
     assert!(
         (before + idle_extra..=after + idle_extra).contains(&stamp("idle")),
         "idle stamp must carry the full drain ladder"

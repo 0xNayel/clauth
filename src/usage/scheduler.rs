@@ -30,10 +30,11 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const HISTORY_PRUNE_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// Hard ceiling on a server-provided `retry-after` so a bogus huge value
-/// can't starve a profile's refresh slot. Also the ceiling on the widen-only
-/// poll backoff `partition_due` adds on top of the interval, which is what
-/// bounds the longest gap a live scheduler can leave between two cache writes
-/// (`profile_json::MAX_LIVE_REFRESH_GAP_MS` reads it for exactly that).
+/// can't starve a profile's refresh slot: a hint up to this value is honored
+/// verbatim, a wider one is shortened to it. It no longer bounds the widest
+/// non-hint gap — the #74 degraded floor ([`DEGRADED_GAP_CEILING_MS`]) does —
+/// so `profile_json::MAX_LIVE_REFRESH_GAP_MS` derives from the ceiling
+/// interval instead.
 pub(crate) const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 
 /// Longest gap a degraded fetch can leave to a NON-TERMINAL profile's next poll
@@ -45,15 +46,6 @@ pub(crate) const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 /// (`AuthExpired` — dead api key, lapsed console) stop outright instead.
 pub(crate) const DEGRADED_GAP_CEILING_MS: u64 = 5 * 60 * 1000;
 
-/// Widen-only poll deferral for an `auth_broken` profile. Each quarantined
-/// poll spends a guaranteed-dead 401 → refresh → 400 pair against the token
-/// endpoint, so the cadence stretches to the same ceiling the 429 ladder
-/// converges to; the poll stays a (slow) recovery path rather than being
-/// excluded outright. Applied at partition time from the live flag — never
-/// baked into the `last_fetched` stamp — so a login/adopt/carry lifting the
-/// flag snaps the cadence back on the very next tick.
-const AUTH_BROKEN_BACKOFF_MS: u64 = MAX_RETRY_AFTER_MS;
-
 /// Base extra backoff applied after a 429 that carries no usable `retry-after`:
 /// the first such 429 lands the next slot one interval + this far out. Successive
 /// 429s multiply it by [`RATE_LIMIT_BACKOFF_FACTOR`]; a server-provided
@@ -61,9 +53,10 @@ const AUTH_BROKEN_BACKOFF_MS: u64 = MAX_RETRY_AFTER_MS;
 const RATE_LIMIT_MIN_BACKOFF_MS: u64 = 10_000;
 
 /// Per-consecutive-429 multiplier on [`RATE_LIMIT_MIN_BACKOFF_MS`] when the
-/// server gives no usable `retry-after`: streak 1 → 10s, 2 → 30s, 3 → 90s,
-/// each capped by [`MAX_RETRY_AFTER_MS`]. Stops a sustained rate limit from being
-/// re-hit every cadence; the streak resets on the next live fetch.
+/// server gives no usable `retry-after`: streak 1 → 10s, 2 → 30s, 3 → 90s.
+/// Callers cap the tail: the fetch deferrals clamp to the #74 floor and the
+/// kick block to [`MAX_RETRY_AFTER_MS`]. Stops a sustained rate limit from
+/// being re-hit every cadence; the streak resets on the next live fetch.
 const RATE_LIMIT_BACKOFF_FACTOR: u64 = 3;
 
 /// Last streak level at which the ACTIVE profile's 429 ladder stays capped at
@@ -202,7 +195,7 @@ pub(crate) struct TokenEntry {
     /// rotate-on-429 to clock-expired tokens only.
     pub(crate) access_expires_at: Option<i64>,
     /// Persisted `auth_broken` quarantine at snapshot time; widens the poll
-    /// cadence by [`AUTH_BROKEN_BACKOFF_MS`] while set.
+    /// cadence to the [`DEGRADED_GAP_CEILING_MS`] floor while set.
     pub(crate) auth_broken: bool,
     /// Elected by [`tick`] before the fan-out: this profile is the one queue
     /// member allowed to OPEN a 5h window this tick (`usage::auto_start_queue`). Decided
@@ -298,9 +291,10 @@ impl ThirdPartyEntry {
 trait NamedEntry {
     fn name(&self) -> &str;
     /// Widen-only extra deferral added to the fixed cadence at partition time.
-    /// Zero for everything but a quarantined or refresh-failing OAuth profile.
-    fn poll_backoff_ms(&self, streaks: StreakCounts) -> u64 {
-        let _ = streaks;
+    /// Zero for everything but a quarantined or refresh-failing OAuth profile;
+    /// clamped to the #74 degraded floor ([`degraded_extra`]).
+    fn poll_backoff_ms(&self, streaks: StreakCounts, interval_ms: u64) -> u64 {
+        let _ = (streaks, interval_ms);
         0
     }
 }
@@ -310,19 +304,27 @@ impl NamedEntry for TokenEntry {
         &self.name
     }
 
-    fn poll_backoff_ms(&self, streaks: StreakCounts) -> u64 {
+    fn poll_backoff_ms(&self, streaks: StreakCounts, interval_ms: u64) -> u64 {
         if self.auth_broken {
-            return AUTH_BROKEN_BACKOFF_MS;
+            // Each quarantined poll spends a guaranteed-dead 401 → refresh → 400
+            // pair against the token endpoint, so the cadence stretches to the
+            // full degraded floor (a ceiling-sized raw extra reduces to exactly
+            // `max(interval, CEILING) - interval`). The poll stays a (slow)
+            // recovery path rather than being excluded outright, and the
+            // deferral is computed live from the flag — never baked into the
+            // `last_fetched` stamp — so a login/adopt/carry lifting it snaps
+            // the cadence back on the very next tick.
+            return degraded_extra(interval_ms, DEGRADED_GAP_CEILING_MS);
         }
         // A run of transient refresh failures climbs the same curve a 429 run
-        // does, capped at the same ceiling. Without it the one failure mode that
+        // does, clamped to the same floor. Without it the one failure mode that
         // can hit EVERY profile at once — clauth's own request shape drifting,
         // which never quarantines because the endpoint never confirmed a dead
         // token — re-hits the token endpoint at full cadence indefinitely.
         if streaks.refresh_fail == 0 {
             return 0;
         }
-        rate_limit_backoff_ms(streaks.refresh_fail).min(MAX_RETRY_AFTER_MS)
+        degraded_extra(interval_ms, rate_limit_backoff_ms(streaks.refresh_fail))
     }
 }
 
@@ -1260,7 +1262,8 @@ fn kick_block(blocks: &KickBlocks, name: &ProfileName) -> Option<KickBlock> {
 /// limiter's advertised ceiling — once that passes, the next tick is always due.
 fn kick_block_after_429(prev: Option<KickBlock>, rl: &KickRateLimit, now_secs: i64) -> KickBlock {
     let streak = prev.map_or(1, |b| b.streak.saturating_add(1));
-    // The ladder fn itself is uncapped — every caller applies the shared cap.
+    // The ladder fn itself is uncapped — each call site applies its own cap
+    // (the fetch deferrals the #74 5min floor, this block `MAX_RETRY_AFTER_MS`).
     // Without it a header-less deep streak schedules hours out and wedges the
     // window closed long after the limiter relents.
     let ladder_secs = (rate_limit_backoff_ms(streak).min(MAX_RETRY_AFTER_MS) / 1000).max(1) as i64;
@@ -1718,9 +1721,22 @@ fn run_fetch(
     outcome
 }
 
+/// Clamp a NON-HINT extra deferral (ms) so the total gap `interval + extra`
+/// never exceeds the #74 degraded floor: `max(interval, DEGRADED_GAP_CEILING_MS)`.
+/// Only narrows — a fast rung under the floor is returned unchanged. A server
+/// `retry-after` never passes through here; it is honored up to
+/// [`MAX_RETRY_AFTER_MS`] at the deferral sites instead.
+fn degraded_extra(interval_ms: u64, extra_ms: u64) -> u64 {
+    let floor = interval_ms
+        .max(DEGRADED_GAP_CEILING_MS)
+        .saturating_sub(interval_ms);
+    extra_ms.min(floor)
+}
+
 /// Extra backoff (ms) for the `streak`-th consecutive 429 with no usable hint:
-/// `base * factor^(streak - 1)`, saturating. The ceiling is applied by
-/// [`next_slot_deferral`].
+/// `base * factor^(streak - 1)`, saturating. Unbounded on its own — the fetch
+/// deferral sites clamp the tail to the #74 floor ([`degraded_extra`]) and the
+/// kick block to [`MAX_RETRY_AFTER_MS`].
 fn rate_limit_backoff_ms(streak: u32) -> u64 {
     let exp = streak.saturating_sub(1);
     RATE_LIMIT_MIN_BACKOFF_MS.saturating_mul(RATE_LIMIT_BACKOFF_FACTOR.saturating_pow(exp))
@@ -1735,8 +1751,9 @@ fn rate_limit_backoff_ms(streak: u32) -> u64 {
 /// requests too; taking that "retry now" at face value re-polls at cadence,
 /// keeps the window pinned full, and the profile never leaves `RateLimited`
 /// (observed 2026-07-11: hours of uninterrupted per-account 429s that only a
-/// growing back-off can drain). Capped at [`MAX_RETRY_AFTER_MS`]. Non-429
-/// outcomes: no defer.
+/// growing back-off can drain). The non-hint ladder's total gap is clamped to
+/// the #74 floor `max(interval, [`DEGRADED_GAP_CEILING_MS`])`; a server hint
+/// still wins verbatim up to [`MAX_RETRY_AFTER_MS`]. Non-429 outcomes: no defer.
 ///
 /// The ACTIVE profile's ladder caps at one extra interval (2× cadence) while
 /// the streak is shallow (≤ [`ACTIVE_CAP_MAX_STREAK`]): a deep slot on the row
@@ -1757,7 +1774,8 @@ fn next_slot_deferral(
 ) -> IntervalMs {
     let hint = retry_after.map(|ra| ra.as_millis() as u64);
     let target_ms = if rate_limited {
-        let mut ladder = interval_ms.saturating_add(rate_limit_backoff_ms(streak));
+        let mut ladder =
+            interval_ms.saturating_add(degraded_extra(interval_ms, rate_limit_backoff_ms(streak)));
         if active && streak <= ACTIVE_CAP_MAX_STREAK {
             ladder = ladder.min(interval_ms.saturating_mul(2));
         }
@@ -3761,7 +3779,10 @@ fn partition_due<T: NamedEntry + Clone>(
             .get(entry.name())
             .copied()
             .unwrap_or(EpochMs::from_millis(0));
-        let backoff = entry.poll_backoff_ms(streaks.get(entry.name()).copied().unwrap_or_default());
+        let backoff = entry.poll_backoff_ms(
+            streaks.get(entry.name()).copied().unwrap_or_default(),
+            interval_ms,
+        );
         let next = last
             .saturating_add(interval)
             .saturating_add(IntervalMs::from_millis(backoff));

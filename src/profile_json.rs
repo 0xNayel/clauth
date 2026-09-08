@@ -108,13 +108,20 @@ fn cache_file_of(third_party: bool) -> &'static str {
     }
 }
 
-/// The longest gap between two cache writes a LIVE scheduler can legally leave:
-/// `partition_due` schedules the next poll at `last + interval + backoff`, where
-/// the interval is capped by [`crate::profile::MAX_REFRESH_INTERVAL_MS`]
-/// (3_600_000) and the widen-only backoff by
-/// [`crate::usage::MAX_RETRY_AFTER_MS`] (900_000), so 4_500_000 ms.
+/// The longest gap between two cache writes a LIVE scheduler can legally leave.
+/// The widen-only backoff is either the #74 degraded floor — a non-hint
+/// deferral clamps the total gap to `max(interval, 5min)`, so zero extra at
+/// the ceiling interval — or a server `retry-after` capped at
+/// [`crate::usage::MAX_RETRY_AFTER_MS`] (900_000). The wider of the two over
+/// every interval is the ceiling interval itself: 3_600_000 ms. (Plus the
+/// per-fetch `deadline_spread`, up to `interval/4`; the 2× margin below
+/// absorbs it.)
 const MAX_LIVE_REFRESH_GAP_MS: u64 =
-    crate::profile::MAX_REFRESH_INTERVAL_MS + crate::usage::MAX_RETRY_AFTER_MS;
+    if crate::profile::MAX_REFRESH_INTERVAL_MS > crate::usage::MAX_RETRY_AFTER_MS {
+        crate::profile::MAX_REFRESH_INTERVAL_MS
+    } else {
+        crate::usage::MAX_RETRY_AFTER_MS
+    };
 
 /// A cached figure older than this is not a reading anyone is maintaining — the
 /// case a daemonless surface (the MCP server runs no scheduler by design) hits
@@ -125,15 +132,15 @@ const MAX_LIVE_REFRESH_GAP_MS: u64 =
 const STALE_AFTER_MS: u64 = 2 * MAX_LIVE_REFRESH_GAP_MS;
 
 /// Cache age past which a reading is stale, derived from the cadence a reader
-/// polls at: `2 × max(interval_ms, 5min) + interval_ms`. ONE home for the
-/// arithmetic so [`ProfileWindows::stale`] and the `status.json` arm derive
-/// from the same threshold and can never drift. The 5-minute floor is the
-/// ceiling the degraded-fetch cadence work (#74) clamps every backoff ladder
-/// to; until that clamp lands the 15-min hints can legally leave a longer
-/// gap, so this threshold reads conservative (a stalled cache marks stale
-/// early, never late). `interval_ms` is the LIVE refresh interval the caller
-/// polls at, so a deliberately slow cadence widens the grace rather than
-/// redding it.
+/// polls at: `2 × max(interval_ms, 5min) + interval_ms`. The home for the
+/// `status.json` age arm and any reader that polls at a known interval. The
+/// 5-minute floor is the ceiling the degraded-fetch cadence work (#74) clamps
+/// every backoff ladder to. `interval_ms` is the LIVE refresh interval the
+/// caller polls at, so a deliberately slow cadence widens the grace rather than
+/// redding it. [`ProfileWindows::stale`] instead reads the fixed
+/// [`STALE_AFTER_MS`]: the MCP server runs no scheduler, holds no interval to
+/// derive from, and the widest-interval derivation is the honest ceiling for
+/// it.
 pub(crate) fn stale_after_ms(interval_ms: u64) -> u64 {
     let floored = interval_ms.max(crate::usage::DEGRADED_GAP_CEILING_MS);
     2 * floored + interval_ms
