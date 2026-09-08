@@ -7,7 +7,7 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, ClaudeRollingPacing, EpochMs, LastFetchedAt, ProfileActivity,
+    ActivityStore, ClaudeRollingPacing, EpochMs, FetchStamp, LastFetchedAt, ProfileActivity,
     RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, ThirdPartyFetcher, TokenEntry,
     anchor_post_reset_oauth, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
     collect_third_party_entries, collect_tokens, fetch_third_party_due, filter_suppressed,
@@ -246,7 +246,7 @@ fn partition_due_uses_fixed_interval() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), EpochMs::from_millis(base));
+        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
     let (due, next) = partition_due(
         &snapshot,
         base + 1,
@@ -322,8 +322,8 @@ fn should_anchor_fetch_fires_once_after_reset_plus_grace() {
 fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
     let now = ANCHOR_NOW;
     let reset = now - RESET_ANCHOR_GRACE_MS - 1_000; // reset + grace comfortably passed
-    let last_before = EpochMs::from_millis(reset - 60_000); // fetched before the reset
-    let last_after = EpochMs::from_millis(reset + 1_000); // already fetched post-reset
+    let last_before = FetchStamp::at(EpochMs::from_millis(reset - 60_000)); // fetched before the reset
+    let last_after = FetchStamp::at(EpochMs::from_millis(reset + 1_000)); // already fetched post-reset
 
     let snapshot = vec![
         token("due"),
@@ -522,7 +522,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), EpochMs::from_millis(base));
+        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
 
     let mut flagged = token("a");
     flagged.auth_broken = true;
@@ -595,7 +595,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), EpochMs::from_millis(base));
+        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
 
     let snapshot = vec![token("a")];
     let streaks = |refresh_fail: u32| {
@@ -657,6 +657,320 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
         next["a"],
         base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "a confirmed-dead token outranks the refresh-fail ladder"
+    );
+}
+
+/// The composed deferral must be clamped once, at the site where both extras
+/// meet. A deep 429 streak records its ladder extra in the `last_fetched` stamp
+/// (`apply_outcome`); a deep refresh-fail streak adds its own at partition time.
+/// Unclamped, the two stack to `interval + 2*floor`. The clamp bounds the sum of
+/// the recorded 429 extra and the partition extra to the degraded floor, so a
+/// deep-both profile polls one interval past its stamp, never the stacked gap.
+#[test]
+fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
+    // The stamp already carries the deep 429 extra (`apply_outcome` recorded it).
+    last_fetched.lock().unwrap().insert(
+        "a".to_string(),
+        FetchStamp {
+            due: EpochMs::from_millis(base + floor),
+            ladder_ms: floor,
+        },
+    );
+
+    let snapshot = vec![token("a")];
+    let streaks = HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    // The recorded 429 extra already sits in the stamp, so a correctly clamped
+    // partition adds nothing: the next poll lands one interval past the stamp.
+    assert_eq!(
+        next["a"],
+        base + floor + REFRESH_INTERVAL_MS,
+        "a deep-both profile polls one interval past its stamp, never the stacked 8.5 min"
+    );
+}
+
+/// The write side of the recorded ladder: `apply_outcome` must record the
+/// deferral it actually baked, and the clamp must compose on THAT value. A
+/// recording regression (stamping the ladder into the due but recording 0)
+/// would hand partition a bare stamp and re-introduce the stacked gap through
+/// the refresh-fail ladder — this pin drives both halves end to end.
+#[test]
+fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome, now_ms};
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Deep on both axes before the outcome lands; update_streaks only widens.
+    streaks.lock().unwrap().insert(
+        "storm".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    );
+
+    let outcome = FetchOutcome {
+        name: crate::profile::ProfileName::from("storm"),
+        info: None,
+        status: FetchStatus::RateLimited,
+        rotated: None,
+        from_fetch: false,
+        refresh_failed: false,
+        plan_override: None,
+        retry_after: None,
+    };
+    apply_outcome(
+        outcome,
+        &store,
+        &statuses,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
+    let (due, ladder_ms) = {
+        let stamp = last_fetched
+            .lock()
+            .unwrap()
+            .get("storm")
+            .copied()
+            .expect("the 429 outcome stamps");
+        (stamp.due, stamp.ladder_ms)
+    };
+    assert_eq!(
+        ladder_ms, floor,
+        "a deep no-hint 429 must record the floor-clamped ladder it baked"
+    );
+
+    // Partition composes on the recorded value: deep refresh-fail ladder meets
+    // the recorded floor bake and the clamp leaves nothing to add.
+    let snapshot = vec![token("storm")];
+    let live_streaks = HashMap::from([("storm".to_string(), streaks.lock().unwrap()["storm"])]);
+    let (_, next) = partition_due(
+        &snapshot,
+        now_ms(),
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &live_streaks,
+    );
+    assert_eq!(
+        next["storm"],
+        due.as_millis() + REFRESH_INTERVAL_MS,
+        "the recorded ladder must carry the compose; a zero recording stacks the refresh ladder on top"
+    );
+}
+
+/// The round-2 phantom: a non-429 outcome (`Cached` mid-storm, or the
+/// `auth_broken` bail) stamps a bare deadline while the 429 streak stays deep.
+/// The refresh-fail ladder must stay FULLY alive on that stamp. Re-deriving the
+/// bake from the streak would read a floor that the stamp never baked and eat
+/// the whole partition ladder; the recorded value keeps it exact.
+#[test]
+fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
+    // A non-429 stamp: the deadline is bare, the recorded ladder is 0.
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+
+    let snapshot = vec![token("a")];
+    let streaks = HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    assert_eq!(
+        next["a"],
+        base + REFRESH_INTERVAL_MS + floor,
+        "a bare stamp with a deep refresh-fail streak keeps its full partition ladder"
+    );
+}
+
+/// The active-profile cap bakes a SHORTER ladder than the raw streak would, so
+/// the recorded bake is the capped value. The clamp must use that recorded
+/// value, not the uncapped streak estimate, or it eats the refresh backoff.
+#[test]
+fn partition_due_clamps_the_active_capped_bake_exactly() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    // `next_slot_deferral`'s cap: active streak 5 ladders to 2*interval, so the
+    // recorded bake is one interval (2*interval - interval), not the raw floor.
+    last_fetched.lock().unwrap().insert(
+        "a".to_string(),
+        FetchStamp {
+            due: EpochMs::from_millis(base + REFRESH_INTERVAL_MS),
+            ladder_ms: REFRESH_INTERVAL_MS,
+        },
+    );
+
+    let snapshot = vec![token("a")];
+    let streaks = HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 5,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    // recorded bake (interval) + refresh ladder (floor) clamp to the floor, so
+    // the partition adds floor - interval and the total gap is the degraded floor.
+    assert_eq!(
+        next["a"],
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
+        "an active-capped bake clamps exactly against its recorded ladder"
+    );
+}
+
+/// The composed clamp must leave a single-axis profile's deadline untouched: a
+/// 429-only profile keeps its baked deferral, a refresh-fail-only profile keeps
+/// its partition ladder.
+#[test]
+fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let baked_extra = 30_000u64; // streak-2 ladder, same on both axes
+
+    // 429-only: the extra is baked into the stamp, the partition adds nothing.
+    last_fetched.lock().unwrap().insert(
+        "rl".to_string(),
+        FetchStamp {
+            due: EpochMs::from_millis(base + baked_extra),
+            ladder_ms: baked_extra,
+        },
+    );
+    let (_, next) = partition_due(
+        &[token("rl")],
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::from([(
+            "rl".to_string(),
+            super::StreakCounts {
+                rate_limit: 2,
+                refresh_fail: 0,
+            },
+        )]),
+    );
+    assert_eq!(
+        next["rl"],
+        base + baked_extra + REFRESH_INTERVAL_MS,
+        "a 429-only stamp keeps its baked deferral, never narrowed"
+    );
+
+    // refresh-fail-only: nothing baked, the partition adds the ladder.
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("rf".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+    let (_, next) = partition_due(
+        &[token("rf")],
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::from([(
+            "rf".to_string(),
+            super::StreakCounts {
+                rate_limit: 0,
+                refresh_fail: 2,
+            },
+        )]),
+    );
+    assert_eq!(
+        next["rf"],
+        base + baked_extra + REFRESH_INTERVAL_MS,
+        "a refresh-fail-only profile keeps its partition ladder, never narrowed"
+    );
+}
+
+/// A third-party entry's `poll_backoff_ms` is the default 0 and its names never
+/// enter the OAuth `poll_streaks` map, so the composed clamp must leave its
+/// deadline untouched even while a deep streak map is in hand.
+#[test]
+fn partition_due_clamp_leaves_third_party_untouched() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert("tp".to_string(), FetchStamp::at(EpochMs::from_millis(base)));
+
+    let snapshot = vec![tp_entry("tp")];
+    // A deep streak for another name is never read for "tp".
+    let streaks = HashMap::from([(
+        "other".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    assert_eq!(
+        next["tp"],
+        base + REFRESH_INTERVAL_MS,
+        "a third-party deadline is untouched by the composed clamp"
     );
 }
 
@@ -5202,11 +5516,10 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
     // would then fetch nothing (no live request on a regression) and leave the
     // marks/store below untouched, which is what makes each assert discriminate.
-    state
-        .last_fetched
-        .lock()
-        .unwrap()
-        .insert("kitty".to_string(), EpochMs::from_millis(super::now_ms()));
+    state.last_fetched.lock().unwrap().insert(
+        "kitty".to_string(),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
 
     // A bootstrap-only `Queued` mark: `standdown_tick` sweeps every Queued mark,
     // while an armed tick with nothing due leaves it in place.

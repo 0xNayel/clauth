@@ -108,14 +108,46 @@ impl IntervalMs {
     pub(crate) const fn from_millis(ms: u64) -> Self {
         Self(ms)
     }
+
+    pub(crate) const fn as_millis(self) -> u64 {
+        self.0
+    }
+}
+
+/// A profile's stamped next-fetch deadline: the due instant plus the ladder
+/// deferral baked into it at the stamp site. `ladder_ms` is what
+/// [`next_slot_deferral`] returned (the 429 ladder, or the hint when one won),
+/// so `partition_due` clamps the composed deferral against the TRUE baked value
+/// rather than re-deriving it from the live streak. A bootstrap stamp or a
+/// non-429 stamp records 0; a hint on the third-party leg records its defer but
+/// the third-party backoff is 0, so the clamp stays an identity there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct FetchStamp {
+    pub(crate) due: EpochMs,
+    pub(crate) ladder_ms: u64,
+}
+
+impl FetchStamp {
+    /// A stamp carrying no baked ladder (bootstrap at cache mtime, a non-429
+    /// fetch, or a plain now).
+    pub(crate) const fn at(due: EpochMs) -> Self {
+        Self { due, ladder_ms: 0 }
+    }
+
+    /// The due instant in epoch-ms. The stamp's only externally meaningful
+    /// value; `ladder_ms` exists for the partition clamp alone.
+    pub(crate) const fn as_millis(self) -> u64 {
+        self.due.as_millis()
+    }
 }
 
 pub(crate) type UsageStore = Arc<RankedMutex<HashMap<String, UsageInfo>, rank::UsageStore>>;
 pub(crate) type StatusStore = Arc<RankedMutex<HashMap<String, FetchStatus>, rank::UsageStatus>>;
 pub(crate) type TokenList = Arc<RankedMutex<Vec<TokenEntry>, rank::Tokens>>;
 
-/// Per-profile epoch-ms of the last fetch attempt (cadence gating).
-pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, EpochMs>, rank::LastFetched>>;
+/// Per-profile stamp of the last fetch attempt (cadence gating): the due instant
+/// plus the ladder deferral baked into it.
+pub(crate) type LastFetchedAt = Arc<RankedMutex<HashMap<String, FetchStamp>, rank::LastFetched>>;
 
 /// One profile's consecutive-failure counters. Both ladder off
 /// [`rate_limit_backoff_ms`] and both clear on the next live fetch, but they stay
@@ -2013,6 +2045,10 @@ fn apply_outcome(
     // Only the 429 axis feeds the deferral here; the refresh-fail axis widens at
     // partition time instead (`TokenEntry::poll_backoff_ms`) so a recovery snaps
     // the cadence back on the next tick rather than sitting out a baked-in stamp.
+    // The stamp records that computed deferral — whatever `next_slot_deferral`
+    // returned (the ladder, the active-capped ladder, or a hint-won defer) — so
+    // partition can clamp the composed deferral against the true baked value
+    // rather than re-deriving it from the live streak.
     let counts = update_streaks(
         streaks,
         &outcome.name,
@@ -2035,7 +2071,13 @@ fn apply_outcome(
 
     // Both in one critical section — ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350).
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(outcome.name.to_string(), stamped);
+        lf.insert(
+            outcome.name.to_string(),
+            FetchStamp {
+                due: stamped,
+                ladder_ms: defer.as_millis(),
+            },
+        );
         if let Ok(mut st) = status.lock() {
             st.insert(outcome.name.to_string(), outcome.status);
         }
@@ -2167,7 +2209,10 @@ fn try_seed_cache(
     }
     // Ascending rank order: LAST_FETCHED(200) < USAGE_STATUS(350) — matches `apply_outcome`.
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(name.to_string(), EpochMs::from_millis(mtime));
+        lf.insert(
+            name.to_string(),
+            FetchStamp::at(EpochMs::from_millis(mtime)),
+        );
         if let Ok(mut st) = status.lock() {
             st.insert(name.to_string(), fetch_status);
         }
@@ -2204,7 +2249,10 @@ pub(crate) fn bootstrap_third_party(
         }
         // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
         if let Ok(mut lf) = last_fetched.lock() {
-            lf.insert(entry.name.to_string(), EpochMs::from_millis(mtime));
+            lf.insert(
+                entry.name.to_string(),
+                FetchStamp::at(EpochMs::from_millis(mtime)),
+            );
             if let Ok(mut st) = status.lock() {
                 st.insert(entry.name.to_string(), fetch_status);
             }
@@ -2676,7 +2724,13 @@ fn stamp_last_fetched(
         .saturating_add(defer)
         .saturating_add(IntervalMs::from_millis(extra_deferral_ms));
     if let Ok(mut lf) = last_fetched.lock() {
-        lf.insert(name.to_string(), stamped);
+        lf.insert(
+            name.to_string(),
+            FetchStamp {
+                due: stamped,
+                ladder_ms: defer.as_millis(),
+            },
+        );
     }
     publish_one_countdown(next_refresh, name, stamped, interval_ms);
 }
@@ -3790,6 +3844,9 @@ fn scan_recovery(
 /// on the single-use refresh token. Poisoned activity mutex fails safe to excluded.
 /// A quarantined entry's deadline widens by its `poll_backoff_ms` — read from the
 /// snapshot each partition, so the widening vanishes the tick the flag lifts.
+/// The 429 extra baked into `last_fetched` composes with that backoff; the sum
+/// is clamped to the degraded floor here so a deep-both profile never stacks the
+/// two ladder extras past `max(interval, DEGRADED_GAP_CEILING_MS)`.
 fn partition_due<T: NamedEntry + Clone>(
     snapshot: &[T],
     now: u64,
@@ -3808,17 +3865,19 @@ fn partition_due<T: NamedEntry + Clone>(
     let mut due = Vec::new();
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
-        let last = lf
-            .get(entry.name())
-            .copied()
-            .unwrap_or(EpochMs::from_millis(0));
-        let backoff = entry.poll_backoff_ms(
-            streaks.get(entry.name()).copied().unwrap_or_default(),
-            interval_ms,
-        );
+        let last = lf.get(entry.name()).copied().unwrap_or_default();
+        let counts = streaks.get(entry.name()).copied().unwrap_or_default();
+        let backoff = entry.poll_backoff_ms(counts, interval_ms);
+        // `last.ladder_ms` is the true deferral the stamp site computed
+        // (`apply_outcome` records `next_slot_deferral`'s value); clamp it
+        // together with this partition backoff once, here where both extras
+        // meet. The partition adds only the remainder past the recorded bake.
+        let partition_extra = degraded_extra(interval_ms, last.ladder_ms.saturating_add(backoff))
+            .saturating_sub(last.ladder_ms);
         let next = last
+            .due
             .saturating_add(interval)
-            .saturating_add(IntervalMs::from_millis(backoff));
+            .saturating_add(IntervalMs::from_millis(partition_extra));
         per_profile.insert(entry.name().to_string(), next.as_millis());
         let excluded = match act.as_ref() {
             Ok(a) => matches!(
@@ -3971,7 +4030,7 @@ fn should_anchor_fetch(
 fn anchor_post_reset_oauth(
     snapshot: &[TokenEntry],
     resets: &HashMap<String, u64>,
-    last_fetched: &HashMap<String, EpochMs>,
+    last_fetched: &HashMap<String, FetchStamp>,
     excluded: &HashSet<String>,
     due: &mut Vec<TokenEntry>,
     next: &mut HashMap<String, u64>,
