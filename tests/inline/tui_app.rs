@@ -7506,11 +7506,11 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
 }
 
 /// #74 degraded cue, FEED half: `apply_usage` derives `usage_stale` off the
-/// DISK cache mtime vs `stale_after_ms`, with the spent-account exemption
-/// reading the disk cache too (never the live store — a spent account the
-/// scheduler dropped from its due set keeps its store entry, so the two
-/// sources disagree exactly on the exempted state). The render pins in
-/// `tui_render_usage.rs` hold only if this derivation is right.
+/// DISK body's `fetched_at` vs `stale_after_ms`, with the spent-account
+/// exemption reading the disk cache too (never the live store — a spent
+/// account the scheduler dropped from its due set keeps its store entry, so
+/// the two sources disagree exactly on the exempted state). The render pins
+/// in `tui_render_usage.rs` hold only if this derivation is right.
 #[test]
 fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
     let stale_at = |age_ms: u64, disk_util: f64| {
@@ -7557,17 +7557,9 @@ fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
                     utilization: disk_util,
                     resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
                 }),
+                fetched_at: Some(crate::usage::now_ms() - age_ms),
                 ..UsageInfo::default()
             },
-        );
-        let path = crate::profile_cache::profile_cache_path(
-            &crate::profile::ProfileName::from(GATE_PROFILE),
-            crate::profile_cache::USAGE_CACHE_FILE,
-        )
-        .expect("cache path resolves");
-        crate::testutil::set_mtime(
-            &path,
-            std::time::SystemTime::now() - std::time::Duration::from_millis(age_ms),
         );
         app.apply_usage();
         {

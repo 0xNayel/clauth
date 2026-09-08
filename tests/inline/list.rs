@@ -28,6 +28,10 @@ fn oauth(name: &str) -> Profile {
 /// Warm `name`'s OAuth usage cache: a `Max 5x` plan and fixed 5h/7d utilization
 /// so the rounding and the plan label are pinned, not incidental.
 fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
+    warm_usage_at(name, five_h, seven_d, None);
+}
+
+fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>) {
     // The cache write is gated on the on-disk record; the row this warms is the
     // test's pin, so the name has to exist in the record for the write to land.
     crate::testutil::register_names(&[name]);
@@ -47,6 +51,7 @@ fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
                 utilization: seven_d,
                 resets_at: None,
             }),
+            fetched_at,
             ..Default::default()
         },
     );
@@ -447,17 +452,8 @@ fn list_table_marks_a_stale_reading() {
         profiles: vec![oauth("work")],
     };
     config.state.active_profile = Some("work".into());
-    warm_usage("work", 42.4, 17.6);
-    let path = crate::profile_cache::profile_cache_path(
-        &crate::profile::ProfileName::from("work"),
-        USAGE_CACHE_FILE,
-    )
-    .unwrap();
     let age_ms = crate::profile_json::stale_after_ms(config.state.refresh_interval_ms) + 60_000;
-    crate::testutil::set_mtime(
-        &path,
-        std::time::SystemTime::now() - std::time::Duration::from_millis(age_ms),
-    );
+    warm_usage_at("work", 42.4, 17.6, Some(crate::usage::now_ms() - age_ms));
 
     let table = render_table(
         &config,

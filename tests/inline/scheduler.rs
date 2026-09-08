@@ -1164,6 +1164,166 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
     );
 }
 
+/// The `fetched_at` age clock: a plan ride re-writes `usage_cache.json` (so its
+/// mtime advances) but must NOT re-age the body — the written body keeps the
+/// stamp the live fetch left, and the status age arm keys on that stamp rather
+/// than the re-stamped mtime.
+#[test]
+fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+
+    // Seed the disk body with a stamp past the age threshold.
+    let stale_ago_ms = crate::profile_json::stale_after_ms(REFRESH_INTERVAL_MS) + 60_000;
+    let seeded_fetched_at = crate::usage::now_ms() - stale_ago_ms;
+    let prior = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+        fetched_at: Some(seeded_fetched_at),
+        ..Default::default()
+    };
+    crate::testutil::register_names(&["a"]);
+    super::write_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+        &prior,
+    );
+
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    apply_outcome(
+        FetchOutcome::cached(
+            &crate::profile::ProfileName::from("a"),
+            FetchStatus::RateLimited,
+            None,
+            None,
+        )
+        .with_plan(Some(canceled)),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &weekly_reset_kicks,
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    assert!(
+        disk.plan.unwrap().is_canceled(),
+        "the plan ride still persists the tier flip"
+    );
+    assert_eq!(
+        disk.fetched_at,
+        Some(seeded_fetched_at),
+        "the plan ride keeps the live fetch's age stamp — it advances no age"
+    );
+
+    // The re-write advanced the cache mtime, but the age arm keys on fetched_at:
+    // the reading must still be stale.
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("a", false)],
+    };
+    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entry = entries
+        .iter()
+        .find(|e| e.name.as_str() == "a")
+        .expect("profile a present");
+    assert!(
+        entry.stale,
+        "the status arm reads stale off the old fetched_at stamp despite the advanced mtime"
+    );
+}
+
+/// The fresh direction: a live fetch body stamps `fetched_at` to now, and the
+/// same status arm reads it not-stale.
+#[test]
+fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+
+    crate::testutil::register_names(&["a"]);
+    let body = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        ..Default::default()
+    };
+    apply_outcome(
+        FetchOutcome {
+            name: crate::profile::ProfileName::from("a"),
+            info: Some(body),
+            status: FetchStatus::Fresh,
+            rotated: None,
+            from_fetch: true,
+            refresh_failed: false,
+            plan_override: None,
+            retry_after: None,
+        },
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &weekly_reset_kicks,
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    let stamped = disk.fetched_at.expect("a live body is stamped");
+    assert!(
+        crate::usage::now_ms() - stamped < 60_000,
+        "the stamp is 'now', not a re-played older value"
+    );
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("a", false)],
+    };
+    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entry = entries
+        .iter()
+        .find(|e| e.name.as_str() == "a")
+        .expect("profile a present");
+    assert!(!entry.stale, "a freshly stamped body reads not stale");
+}
+
 /// `mark_window_open` synthesizes a live 5h window after a successful kick
 /// (the kick's 200 IS the window opening; /usage may 429 for minutes), but
 /// never touches a window that is already live.

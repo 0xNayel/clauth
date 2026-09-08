@@ -1917,7 +1917,11 @@ fn apply_outcome(
             }
             return info;
         }
-        preserve_live_window(info.clone(), prev.as_ref(), now_epoch_secs())
+        let mut info = preserve_live_window(info.clone(), prev.as_ref(), now_epoch_secs());
+        // The age clock: only a live fetch re-ages the body, so the plan ride
+        // above keeps whatever stamp the loaded snapshot already carried.
+        info.fetched_at = Some(now.as_millis());
+        info
     });
 
     // The weekly-reset re-test mark: a fresh body whose aggregate 7d window

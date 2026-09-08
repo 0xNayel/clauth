@@ -2410,20 +2410,31 @@ impl App {
                 }
                 // #74 degraded cue: cache age past the derived threshold reads
                 // stale, independent of fetch_status. Same threshold, same
-                // mtime source, and same maxed-window exemption as
+                // maxed-window exemption, and same age source as
                 // `status.json`'s `age_stale` arm — the exemption reads the
                 // DISK cache (`load_profile_cache`), never the live store,
                 // because the two can diverge on a spent account the
                 // scheduler dropped from its due set: reading the store there
                 // would publish the exact disagreement the exemption exists
-                // to prevent.
+                // to prevent. OAuth dates off the body's `fetched_at`;
+                // third-party figures keep the cache mtime.
+                let oauth_usage = if p.usage_cache_is_third_party() {
+                    None
+                } else {
+                    load_profile_cache::<UsageInfo>(&p.name, USAGE_CACHE_FILE)
+                };
                 let spent_skipped = !refresh_spent_accounts
-                    && !p.usage_cache_is_third_party()
-                    && load_profile_cache::<UsageInfo>(&p.name, USAGE_CACHE_FILE)
-                        .is_some_and(|u| windows_maxed(&u, (now / 1000) as i64));
+                    && oauth_usage
+                        .as_ref()
+                        .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
+                let age_source_ms: Option<u64> = if p.usage_cache_is_third_party() {
+                    profile_cache_mtime_ms(&p.name, usage_cache_file(p))
+                } else {
+                    oauth_usage.as_ref().and_then(|u| u.fetched_at)
+                };
                 p.usage_stale = !spent_skipped
-                    && profile_cache_mtime_ms(&p.name, usage_cache_file(p))
-                        .is_some_and(|mt| now.saturating_sub(mt) > stale_after_ms(interval_ms));
+                    && age_source_ms
+                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms));
             }
 
             bells = cfg

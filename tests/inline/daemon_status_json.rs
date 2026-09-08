@@ -762,22 +762,6 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     };
     config.state.refresh_interval_ms = 90_000;
     crate::testutil::register_names(&["work"]);
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from("work"),
-        crate::profile_cache::USAGE_CACHE_FILE,
-        &crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 42.0,
-                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
-            }),
-            ..Default::default()
-        },
-    );
-    let path = crate::profile_cache::profile_cache_path(
-        &crate::profile::ProfileName::from("work"),
-        crate::profile_cache::USAGE_CACHE_FILE,
-    )
-    .unwrap();
     let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
         v["profiles"]
             .as_array()
@@ -789,19 +773,30 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     };
     // Threshold at this interval: 2 × max(90s, the degraded ceiling) + 90s.
     let ceiling_secs = crate::usage::DEGRADED_GAP_CEILING_MS / 1000;
-    let clock =
-        |age_secs: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
-    let set_age = |age_secs: u64| crate::testutil::set_mtime(&path, clock(age_secs));
     let threshold_secs = 2 * ceiling_secs + 90;
+    let write = |utilization: f64, age_secs: u64| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+                ..Default::default()
+            },
+        );
+    };
     // Fresh and at-threshold → not stale; past it → stale on the single-shot.
-    set_age(threshold_secs - 60);
+    write(42.0, threshold_secs - 60);
     let v = build_status(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
         false,
         "a cache younger than the threshold is not stale"
     );
-    set_age(threshold_secs + 60);
+    write(42.0, threshold_secs + 60);
     let v = build_status(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
@@ -815,21 +810,8 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
 
     // A live-maxed window under the spent-accounts opt-out is exempt from the
     // age arm: its figure cannot change by polling, so age distrusts nothing.
-    // The cache is rewritten at the 100% cap (a live window pinned there), which
-    // also resets the mtime — the age below is re-established after the rewrite.
     config.state.refresh_spent_accounts = false;
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from("work"),
-        crate::profile_cache::USAGE_CACHE_FILE,
-        &crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 100.0,
-                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
-            }),
-            ..Default::default()
-        },
-    );
-    set_age(threshold_secs + 60);
+    write(100.0, threshold_secs + 60);
     let v = build_status(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
@@ -840,21 +822,10 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     // replace the flag. Pinned by its own test above.
 
     // The age arm holds on the DAEMON feed too: same cache, live signals
-    // attached, no stuck-429 (Fresh store entry, no streaks) — an old cache
+    // attached, no stuck-429 (Fresh store entry, no streaks) — an old body
     // must read stale on the more-used surface, not only the single-shot.
     config.state.refresh_spent_accounts = true;
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from("work"),
-        crate::profile_cache::USAGE_CACHE_FILE,
-        &crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 42.0,
-                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
-            }),
-            ..Default::default()
-        },
-    );
-    set_age(threshold_secs + 60);
+    write(42.0, threshold_secs + 60);
     let live = LiveSignals {
         status: &HashMap::from([("work".to_string(), FetchStatus::Fresh)]),
         third_party_status: &Default::default(),

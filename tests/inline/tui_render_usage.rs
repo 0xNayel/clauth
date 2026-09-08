@@ -1790,6 +1790,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             extra_usage: extra,
             spend,
             open_at: None,
+            fetched_at: None,
         });
         collect_stats(&profile, ResetFmt::default())
     };

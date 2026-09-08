@@ -181,13 +181,14 @@ pub(crate) struct ProfileEntry {
     /// when there is no cache at all.
     pub(crate) fetch_status: Option<String>,
     /// Additive: true when this reading is distrusted, by
-    /// either arm — a deep-slot stuck RateLimited, or cache age past
+    /// either arm — a deep-slot stuck RateLimited, or reading age past
     /// `stale_after_ms(interval)` (the stuck arm needs the live stores and is
     /// `false` single-shot). Readers dim it / show a "stuck" cue instead of
     /// treating it as current truth.
     pub(crate) stale: bool,
-    /// ISO-8601 UTC stamp of the cache behind the published figures; `None`
-    /// when there is no cache.
+    /// ISO-8601 UTC stamp of when the published figures were last fetched
+    /// (OAuth: the body's `fetched_at`; third-party: the cache write);
+    /// `None` when there is no cache or the body is undated.
     pub(crate) fetched_at: Option<String>,
     /// ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is
     /// pending (a spent skipped account, or no cache).
@@ -343,10 +344,19 @@ pub(crate) fn build_profile_entries(
                     (stamp > now).then_some(stamp)
                 })
             };
+            // The OAuth disk body, loaded once and shared by the spent-skip
+            // exemption and the age arm below — both read the DISK cache, never
+            // the live store (a spent account the scheduler dropped keeps its
+            // store entry, so the two can disagree exactly on the exempted state).
+            let oauth_usage = if p.usage_cache_is_third_party() {
+                None
+            } else {
+                load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+            };
             let spent_skipped = !config.state.refresh_spent_accounts
-                && !p.usage_cache_is_third_party()
-                && load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-                    .is_some_and(|u| windows_maxed(&u, (now / 1000) as i64));
+                && oauth_usage
+                    .as_ref()
+                    .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
             let next_refresh_ms: Option<u64> = if spent_skipped {
                 None
             } else {
@@ -379,8 +389,19 @@ pub(crate) fn build_profile_entries(
             //   live-maxed exemption below is inherited via `spent_skipped`:
             //   a window pinned at the API's 100% cap cannot change by
             //   polling, so age distrusts nothing about it.
+            // OAuth dates off the `fetched_at` the live fetch stamped; the
+            // third-party leg still dates off its cache mtime (its only writer
+            // is a fetch outcome). An undated OAuth body reads as not stale —
+            // the same honest-undated semantics `cache_age_secs` gives a future
+            // mtime stamp.
+            let age_source_ms: Option<u64> = if p.usage_cache_is_third_party() {
+                mtime_ms
+            } else {
+                oauth_usage.as_ref().and_then(|u| u.fetched_at)
+            };
             let age_stale = !spent_skipped
-                && mtime_ms.is_some_and(|mt| now.saturating_sub(mt) > stale_after_ms(interval_ms));
+                && age_source_ms
+                    .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms));
             let stale = match live {
                 Some(sig) => sig.status.get(name.as_str()).copied().is_some_and(|s| {
                     is_stuck_rate_limited(s, sig.streaks.get(name.as_str()).copied().unwrap_or(0))
@@ -418,7 +439,7 @@ pub(crate) fn build_profile_entries(
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
-                fetched_at: mtime_ms.map(iso_from_ms),
+                fetched_at: age_source_ms.map(iso_from_ms),
                 next_refresh_at: next_refresh_ms.map(iso_from_ms),
                 auto_start: p.auto_start,
                 auto_start_queue: queue_members

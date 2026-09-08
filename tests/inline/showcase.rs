@@ -316,6 +316,7 @@ fn oauth_profile(
             extra_usage: extra,
             spend,
             open_at: None,
+            fetched_at: None,
         }),
         fetch_status,
         provider: None,
