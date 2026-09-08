@@ -1334,3 +1334,51 @@ fn a_direct_feed_write_stamps_now() {
     );
     assert_eq!(body["active_profile"], serde_json::json!("beta"));
 }
+
+#[test]
+fn a_daemonless_publish_yields_to_a_feed_written_after_its_build_started() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("a")),
+            blank_profile(&crate::profile::ProfileName::from("b")),
+        ],
+        Some("b"),
+        30_000,
+    );
+
+    let feed = clauth_dir().expect("feed dir").join("status.json");
+    let incumbent: &[u8] = br#"{"sentinel": "incumbent"}"#;
+    std::fs::write(&feed, incumbent).expect("seed incumbent feed");
+    set_mtime(&feed, SystemTime::now() + Duration::from_secs(3600));
+
+    let candidate: &[u8] = br#"{"active_profile": "b", "body": "candidate"}"#;
+    super::publish_status_json_if_current(&config, candidate, SystemTime::now());
+    assert_eq!(
+        std::fs::read(&feed).expect("reread feed"),
+        incumbent,
+        "a feed written after the build started must survive the late commit"
+    );
+
+    set_mtime(&feed, SystemTime::now() - Duration::from_secs(3600));
+    super::publish_status_json_if_current(&config, candidate, SystemTime::now());
+    assert_eq!(
+        std::fs::read(&feed).expect("reread feed"),
+        candidate,
+        "an older feed yields to the fresh body"
+    );
+
+    // The licensing rule is "stamped strictly before this build started": an
+    // exactly-equal stamp must skip too (on a coarse-stamp filesystem an
+    // equal stamp cannot prove the write preceded the build).
+    let other: &[u8] = br#"{"sentinel": "second"}"#;
+    std::fs::write(&feed, other).expect("reseed feed for the equality direction");
+    let boundary = SystemTime::now();
+    set_mtime(&feed, boundary);
+    super::publish_status_json_if_current(&config, candidate, boundary);
+    assert_eq!(
+        std::fs::read(&feed).expect("reread feed"),
+        other,
+        "an exactly-equal stamp must skip, not publish"
+    );
+}

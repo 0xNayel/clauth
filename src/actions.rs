@@ -124,6 +124,18 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
 /// The no-op switch (already active) republishes nothing: the feed on disk
 /// already names this account.
 pub(crate) fn switch_profile(config: &ConfigHandle, name: &ProfileName) -> Result<()> {
+    switch_profile_synced(config, name, || {})
+}
+
+/// The injected closure runs after the switch has persisted and released both
+/// Config and State, between the status body's construction and its commit —
+/// the window a competing publisher can land in. Production passes a no-op;
+/// the regression tests use it to order two real wrappers.
+fn switch_profile_synced(
+    config: &ConfigHandle,
+    name: &ProfileName,
+    before_commit: impl FnOnce(),
+) -> Result<()> {
     #[allow(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
@@ -132,7 +144,7 @@ pub(crate) fn switch_profile(config: &ConfigHandle, name: &ProfileName) -> Resul
     let changed = switch_profile_locked(&mut guard, name)?;
     drop(guard);
     if changed {
-        crate::daemon::publish_status(config);
+        crate::daemon::publish_status_with(config, before_commit);
     }
     Ok(())
 }

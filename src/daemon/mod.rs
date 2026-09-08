@@ -423,16 +423,11 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// the republish carries the daemon's last stamp forward, or the epoch when no
 /// daemon has ever published — see [`prior_generated_at`].
 ///
-/// The probe-read-write is deliberately unserialized. The race it admits — a
-/// daemon's first tick landing between this probe and this write — costs one
-/// stamp at worst: the daemon's next tick (at most a second later) republishes
-/// with a fresh stamp over the same body, so the forged-fresh window is one
-/// tick, and the daemon's OWN writer never sees this write at all (it builds
-/// its body from its in-memory signals, not the file). Flocking the sequence
-/// would put `build_status`'s cache-stat and session-sweep disk work inside a
-/// cross-process lock, the exact shape the lock-placement rule below forbids.
-/// On a filesystem without working flock the probe errs and the publish
-/// proceeds by design: a possibly-thinner body is cheaper than a stale one.
+/// The daemon-presence probe stays unserialized. A daemon's first tick can land
+/// between the probe and this publish, costing one stale stamp at worst: the next
+/// tick replaces it. The switch-side body construction below remains outside the
+/// state flock; only its publication guards and atomic commit use the brief
+/// final hold.
 ///
 /// Call it OUTSIDE the switch's `with_state_lock`, the way every caller in
 /// `actions` does: [`build_status`] stats and reads each profile's caches and
@@ -444,6 +439,16 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// clone and released before any disk work, so the snapshot itself never holds
 /// the config mutex across the build either.
 pub(crate) fn publish_status(config: &crate::profile::ConfigHandle) {
+    publish_status_with(config, || {});
+}
+
+/// [`publish_status`] with a hook between the status body's construction and
+/// its commit — the window a competing publisher can land in. Production passes
+/// a no-op; the regression tests use it to order two real publishers.
+pub(crate) fn publish_status_with(
+    config: &crate::profile::ConfigHandle,
+    before_commit: impl FnOnce(),
+) {
     if singleton_held().unwrap_or(false) {
         return;
     }
@@ -456,7 +461,12 @@ pub(crate) fn publish_status(config: &crate::profile::ConfigHandle) {
         cfg.clone()
     };
     let stamp = prior_generated_at().unwrap_or_else(|| crate::usage::epoch_secs_to_iso(0));
-    write_status_feed_with_stamp(&snapshot, None, Some(&stamp));
+    let built_after = std::time::SystemTime::now();
+    let Some(json) = status_feed_json(&snapshot, None, Some(&stamp)) else {
+        return;
+    };
+    before_commit();
+    publish_status_json_if_current(&snapshot, &json, built_after);
 }
 
 /// The daemon's last `generated_at`, read off the feed this publish replaces.
@@ -489,31 +499,76 @@ fn prior_generated_at() -> Option<String> {
 /// whose `fetch_status`, `next_refresh_at`, `stale` and `pending_switch` fell
 /// back to the mtime derivation until the next tick overwrote them.
 ///
-/// Best-effort and lock-placement rules are [`publish_status`]'s.
+/// Best-effort and construction lock-placement rules are [`publish_status`]'s.
 ///
 /// Stamps `generated_at` now: the daemon's own spelling, and itself the
-/// freshness signal. The non-daemon republish must not mint one, so it goes
-/// through [`write_status_feed_with_stamp`] with the preserved daemon stamp.
+/// freshness signal. Only the daemon's writers come through here; the
+/// daemonless republish preserves the daemon's stamp instead
+/// ([`publish_status_with`]).
 pub(crate) fn write_status_feed(config: &AppConfig, live: Option<&LiveSignals>) {
-    write_status_feed_with_stamp(config, live, None);
+    let Some(json) = status_feed_json(config, live, None) else {
+        return;
+    };
+    write_status_json(&json);
 }
 
-/// [`write_status_feed`] with `generated_at` overridden: `None` stamps now;
-/// `Some` carries a stamp the caller owns — only [`publish_status`], which
-/// preserves the daemon's last write rather than forging a live one.
-fn write_status_feed_with_stamp(
+/// A separate process can publish again while this body is built. Two guards,
+/// taken with the write inside one brief State hold so daemonless publishers
+/// serialize against each other: the persisted active marker must still match
+/// the body's, and the on-disk feed must not be newer than `built_after`. The
+/// publish branch is what the second guard licenses: a feed stamped strictly
+/// before `built_after` finished its build before our build started, so its
+/// inputs predate ours and ours is at least as fresh. Anything stamped at or
+/// later skips — conservative even though a later stamp does not prove fresher
+/// inputs (a slow writer can publish old inputs late), because a skip only
+/// loses one best-effort refresh while a wrong overwrite is the
+/// stale-whole-feed defect this guard exists to prevent (B→C→B and same-active
+/// edits alike). The daemon's own writers take no state flock and bypass both
+/// guards by design: they are the feed's owner while the singleton is held,
+/// and this path defers to them at entry. Both guards only skip: publication
+/// is best-effort after a switch that already succeeded. The recency
+/// comparison leans on the filesystem stamp and `SystemTime` sharing one
+/// realtime clock; a backward clock step, or a coarse fs stamp collapsing a
+/// just-later write onto `built_after`'s tick, can cost one mis-ordered
+/// publish until the next one lands.
+fn publish_status_json_if_current(
+    snapshot: &AppConfig,
+    json: &[u8],
+    built_after: std::time::SystemTime,
+) {
+    debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::Config>());
+    let active = snapshot.state.active_profile.as_ref();
+    let feed = clauth_dir().ok().map(|dir| dir.join(STATUS_FILE));
+    if let Err(e) = crate::lock::with_state_lock(|_held| {
+        if crate::profile::load_app_state()?.active_profile.as_ref() != active {
+            logline!(
+                "clauth: skipped the daemonless status.json republish: the active profile moved while this body was built"
+            );
+            return Ok(());
+        }
+        if let Some(path) = feed.as_ref()
+            && let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified())
+            && mtime >= built_after
+        {
+            logline!(
+                "clauth: skipped the daemonless status.json republish: a newer publication landed while this body was built"
+            );
+            return Ok(());
+        }
+        write_status_json(json);
+        Ok(())
+    }) {
+        logline!("clauth: failed to publish status.json after a switch: {e:#}");
+    }
+}
+
+fn status_feed_json(
     config: &AppConfig,
     live: Option<&LiveSignals>,
     generated_at: Option<&str>,
-) {
-    let Ok(dir) = clauth_dir() else { return };
-    if let Err(e) = mkdir_700(&dir) {
-        logline!(
-            "clauth: failed to prepare {} for status.json: {e}",
-            dir.display()
-        );
-        return;
-    }
+) -> Option<Vec<u8>> {
+    debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::State>());
+    debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::Config>());
     let mut body = build_status(config, config.state.refresh_interval_ms, live, false);
     // The backdate this applies is the one deliberate exception to
     // `build_status`'s "the stamp never precedes a per-entry verdict instant"
@@ -524,12 +579,25 @@ fn write_status_feed_with_stamp(
         *field = serde_json::json!(stamp);
     }
     match serde_json::to_vec_pretty(&body) {
-        Ok(json) => {
-            if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), &json) {
-                logline!("clauth: failed to publish status.json after a switch: {e}");
-            }
+        Ok(json) => Some(json),
+        Err(e) => {
+            logline!("clauth: failed to serialize status.json after a switch: {e}");
+            None
         }
-        Err(e) => logline!("clauth: failed to serialize status.json after a switch: {e}"),
+    }
+}
+
+fn write_status_json(json: &[u8]) {
+    let Ok(dir) = clauth_dir() else { return };
+    if let Err(e) = mkdir_700(&dir) {
+        logline!(
+            "clauth: failed to prepare {} for status.json: {e}",
+            dir.display()
+        );
+        return;
+    }
+    if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), json) {
+        logline!("clauth: failed to publish status.json after a switch: {e}");
     }
 }
 

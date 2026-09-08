@@ -7,6 +7,58 @@ use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
 use crate::testutil::through_handle;
 
+const SWITCH_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn seed_keyless_switch_profiles() {
+    let profiles = ["a", "b", "c"]
+        .into_iter()
+        .map(|name| {
+            Profile::new(
+                name.to_string(),
+                Some("https://api.deepseek.com".to_string()),
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    for profile in &profiles {
+        crate::profile::save_profile(profile).expect("persist keyless profile");
+    }
+    let state = AppState {
+        profiles: profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect(),
+        active_profile: Some("a".into()),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist initial active profile");
+}
+
+fn switch_handle_from_disk() -> crate::profile::ConfigHandle {
+    std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+        crate::profile::load_config().expect("load independent config handle"),
+    ))
+}
+
+fn persisted_active() -> String {
+    crate::profile::load_app_state()
+        .expect("load persisted state")
+        .active_profile
+        .expect("fixture keeps an active profile")
+        .to_string()
+}
+
+fn feed_active(home: &HomeSandbox) -> String {
+    let body: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.home().join(".clauth/status.json")).expect("read status feed"),
+    )
+    .expect("status feed json");
+    body["active_profile"]
+        .as_str()
+        .expect("feed active profile")
+        .to_string()
+}
+
 /// The rotation guard every account mutation takes. Uncontended inside a
 /// sandbox, so this is the fixture spelling of "no rotation is in flight" — the
 /// contended direction is what the two refusal tests below drive.
@@ -33,6 +85,63 @@ fn acct_config() -> AppConfig {
         state: AppState::default(),
         profiles: vec![Profile::new("acct".to_string(), None, None)],
     }
+}
+
+#[test]
+fn a_delayed_daemonless_publish_keeps_the_current_active_profile() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+    assert!(!crate::daemon::singleton_held().expect("probe daemon singleton"));
+
+    let p1 = switch_handle_from_disk();
+    let p2 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body and released its locks before the commit");
+        assert_eq!(persisted_active(), "b");
+        crate::lock::with_state_lock(|_held| Ok(()))
+            .expect("P1 holds no state flock while publication is delayed");
+
+        switch_profile(&p2, &"c".into()).expect("P2 switches B to C");
+        assert_eq!(persisted_active(), "c");
+        assert_eq!(feed_active(&home), "c");
+
+        release_tx.send(()).expect("release P1 publication");
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "c");
+    assert_eq!(feed_active(&home), "c");
+}
+
+#[test]
+fn ordered_daemonless_switch_publishes_the_latest_state() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    let p1 = switch_handle_from_disk();
+    switch_profile(&p1, &"b".into()).expect("P1 switches A to B");
+    let p2 = switch_handle_from_disk();
+    switch_profile(&p2, &"c".into()).expect("P2 switches B to C");
+
+    assert_eq!(persisted_active(), "c");
+    assert_eq!(feed_active(&home), "c");
 }
 
 #[test]
@@ -4894,4 +5003,169 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
             .is_none(),
         "a reauth that moves the endpoint off Alibaba clears the session with it",
     );
+}
+
+#[test]
+fn a_late_commit_does_not_replace_a_newer_same_active_publication() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    let p1 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body before the competing publications");
+        assert_eq!(persisted_active(), "b");
+
+        switch_profile(&switch_handle_from_disk(), &"c".into()).expect("P2 switches B to C");
+        assert_eq!(feed_active(&home), "c");
+
+        // A same-active change P1's frozen body cannot know: b's endpoint moves
+        // after P1 built, before P3 publishes.
+        crate::profile::save_profile(&Profile::new(
+            "b".to_string(),
+            Some("https://api.other.example".to_string()),
+            None,
+        ))
+        .expect("edit b after P1 built");
+
+        switch_profile(&switch_handle_from_disk(), &"b".into()).expect("P3 switches C back to B");
+        assert_eq!(feed_active(&home), "b");
+
+        release_tx.send(()).expect("release P1 commit");
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "b");
+    let body: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.home().join(".clauth/status.json")).expect("read status feed"),
+    )
+    .expect("status feed json");
+    let b_entry = body["profiles"]
+        .as_array()
+        .expect("feed profiles")
+        .iter()
+        .find(|entry| entry["name"] == "b")
+        .expect("feed b entry");
+    assert_eq!(
+        b_entry["base_url"],
+        serde_json::json!("https://api.other.example"),
+        "the frozen body must not overwrite P3's same-active publication"
+    );
+    assert_eq!(feed_active(&home), "b");
+}
+
+#[test]
+fn a_daemonless_publish_skips_when_a_later_switch_never_published() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    // An older feed from before the switches: nothing newer lands while P1 is
+    // paused, so the publication-recency guard alone cannot explain a skip.
+    let feed = home.home().join(".clauth/status.json");
+    std::fs::write(&feed, br#"{"active_profile": "a", "sentinel": true}"#)
+        .expect("seed pre-switch feed");
+
+    let p1 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body before the competing switch");
+        {
+            // Hold the singleton so P2's own republish defers: P2 persists the
+            // switch, but no newer publication ever lands.
+            let _singleton = crate::daemon::hold_daemon_lock();
+            switch_profile(&switch_handle_from_disk(), &"c".into()).expect("P2 switches B to C");
+            assert_eq!(persisted_active(), "c");
+        }
+
+        release_tx.send(()).expect("release P1 commit");
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "c");
+    let body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&feed).expect("reread feed"))
+            .expect("status feed json");
+    assert_eq!(
+        body["active_profile"],
+        serde_json::json!("a"),
+        "the stale body must not overwrite the feed while C is persisted"
+    );
+}
+
+#[test]
+fn the_daemonless_commit_serializes_on_the_state_flock() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    let p1 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body before the state flock is taken");
+        // Hold the cross-process state flock: the commit must queue behind it,
+        // never write around it. Bound of this pin: it observes only a write
+        // that lands while another holder owns the flock, so a half-refactor
+        // that keeps the guards inside the hold but moves the write out stays
+        // green; no non-racy test can observe that shape from outside.
+        let state = crate::lock::StateLock::acquire().expect("test holds the state flock");
+        release_tx.send(()).expect("release P1 commit");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !home.home().join(".clauth/status.json").exists(),
+            "the commit must not write status.json while another holder owns the state flock"
+        );
+        drop(state);
+
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "b");
+    assert_eq!(feed_active(&home), "b");
 }
