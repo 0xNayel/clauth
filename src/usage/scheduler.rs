@@ -2521,6 +2521,12 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
             // Captured before the entry moves into the worker: suppression is
             // recorded against the credential that failed, never the bare name.
             let fingerprint = entry.credential_fingerprint();
+            // Captured for the same reason: only a Generic target's no-data
+            // rescan defers to the degraded floor, and `entry` moves next.
+            let is_generic = matches!(
+                &entry.target,
+                crate::providers::ThirdPartyTarget::Generic { .. }
+            );
             // Reuse the endpoint that last worked so steady state is one request.
             let hint = state.third_party_usage_store.lock().ok().and_then(|s| {
                 s.get(entry.name.as_str())
@@ -2536,11 +2542,11 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 mark_activity(&activity, &worker_name, ProfileActivity::Fetching);
                 fetcher(&entry.target, &entry.api_key, hint.as_deref())
             });
-            (name, fingerprint, h)
+            (name, fingerprint, is_generic, h)
         })
         .collect();
 
-    for (name, fingerprint, h) in handles {
+    for (name, fingerprint, is_generic, h) in handles {
         match h.join() {
             Ok(Ok(stats)) => {
                 clear_activity(&state.activity, &name);
@@ -2561,6 +2567,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     None,
                     false,
                     interval_ms,
+                    0,
                 );
             }
             Ok(Err(err)) => {
@@ -2570,7 +2577,8 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 let cached = load_profile_cache::<ThirdPartyStats>(&name, THIRD_PARTY_CACHE_FILE);
                 // A 429 carries the server's `retry-after` and defers the next
                 // slot (same server-directed deferral as the OAuth 429 path);
-                // any other error falls back to cache without deferring.
+                // any other error falls back to cache, and a GENERIC no-data
+                // rescan additionally defers to the degraded floor below.
                 let (status, retry_after) = match &err {
                     crate::providers::ThirdPartyError::RateLimited { retry_after } => {
                         (FetchStatus::RateLimited, *retry_after)
@@ -2597,7 +2605,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 // retry, only a manual refresh re-admits one for a single try: a
                 // profile whose usage credential is dead. The cadence can't fix
                 // that. 429 keeps the server-directed deferral; a generic
-                // no-data result (cached or not) keeps the normal cadence.
+                // no-data result (cached or not) defers to the degraded floor.
                 if matches!(status, FetchStatus::AuthExpired)
                     && let Ok(mut sup) = state.suppressed_generic.lock()
                 {
@@ -2616,6 +2624,17 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 } else {
                     crate::profile_cache::clear_auth_expired(&name);
                 }
+                // A generic scan that found nothing re-probes every candidate
+                // path; the floor keeps that rescan off the bare cadence. Only
+                // the generic arm gets it: a typed provider's error cadence is
+                // its own, and a 429/AuthExpired keeps its existing deferral.
+                let extra_deferral_ms = if is_generic
+                    && !matches!(status, FetchStatus::RateLimited | FetchStatus::AuthExpired)
+                {
+                    degraded_extra(interval_ms, DEGRADED_GAP_CEILING_MS)
+                } else {
+                    0
+                };
                 stamp_last_fetched(
                     &state.last_fetched,
                     &state.next_refresh_per_profile,
@@ -2623,6 +2642,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     retry_after,
                     matches!(status, FetchStatus::RateLimited),
                     interval_ms,
+                    extra_deferral_ms,
                 );
             }
             Err(_) => {
@@ -2637,7 +2657,9 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
 /// fetch duration, mirroring OAuth `apply_outcome`); a 429's `retry-after`
 /// stamps `retry_after - interval` ahead so `partition_due`'s fixed
 /// `stamp + interval_ms` math lands the next slot on `now + retry_after`
-/// (capped by [`MAX_RETRY_AFTER_MS`]).
+/// (capped by [`MAX_RETRY_AFTER_MS`]). `extra_deferral_ms` is a non-hint,
+/// non-429 deferral added verbatim: the generic no-data rescan passes
+/// [`degraded_extra(interval_ms, DEGRADED_GAP_CEILING_MS)`] there.
 fn stamp_last_fetched(
     last_fetched: &LastFetchedAt,
     next_refresh: &NextRefreshPerProfile,
@@ -2645,11 +2667,14 @@ fn stamp_last_fetched(
     retry_after: Option<Duration>,
     rate_limited: bool,
     interval_ms: u64,
+    extra_deferral_ms: u64,
 ) {
     // Third-party providers are independent hosts with their own limits; keep the
     // flat base backoff (streak 1) rather than the per-account exponential ramp.
     let defer = next_slot_deferral(rate_limited, retry_after, 1, interval_ms, false);
-    let stamped = EpochMs::from_millis(now_ms()).saturating_add(defer);
+    let stamped = EpochMs::from_millis(now_ms())
+        .saturating_add(defer)
+        .saturating_add(IntervalMs::from_millis(extra_deferral_ms));
     if let Ok(mut lf) = last_fetched.lock() {
         lf.insert(name.to_string(), stamped);
     }

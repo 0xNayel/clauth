@@ -3941,6 +3941,13 @@ fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
 }
 
 fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
+    third_party_state_at_interval(fetcher, REFRESH_INTERVAL_MS)
+}
+
+fn third_party_state_at_interval(
+    fetcher: ThirdPartyFetcher,
+    interval_ms: u64,
+) -> super::SchedulerState {
     use crate::profile::{AppConfig, AppState};
     use std::sync::atomic::{AtomicBool, AtomicU64};
     super::SchedulerState {
@@ -3951,7 +3958,7 @@ fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
         tokens: Arc::new(RankedMutex::new(vec![])),
         store: Arc::new(RankedMutex::new(HashMap::new())),
         status: Arc::new(RankedMutex::new(HashMap::new())),
-        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        refresh_interval: Arc::new(AtomicU64::new(interval_ms)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
@@ -3999,6 +4006,63 @@ fn stub_network_error(
     Err(crate::providers::ThirdPartyError::Network)
 }
 
+fn stub_status_no_data(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::Status)
+}
+
+fn stub_rate_limited_hint(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::RateLimited {
+        // Above the streak-1 ladder (~100s at the 90s interval) so the hint,
+        // never the ladder, decides the gap a test asserts on.
+        retry_after: Some(std::time::Duration::from_secs(240)),
+    })
+}
+
+fn stub_ok_stats(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Ok(crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    })
+}
+
+fn stamped_gap_ms(state: &super::SchedulerState, name: &str, before: u64) -> u64 {
+    stamped_gap_ms_at(state, name, before, REFRESH_INTERVAL_MS)
+}
+
+fn stamped_gap_ms_at(
+    state: &super::SchedulerState,
+    name: &str,
+    before: u64,
+    interval_ms: u64,
+) -> u64 {
+    state
+        .last_fetched
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .unwrap()
+        .as_millis()
+        .saturating_add(interval_ms)
+        .saturating_sub(before)
+}
+
 #[test]
 fn fetch_third_party_due_inserts_generic_auth_expired() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -4008,12 +4072,19 @@ fn fetch_third_party_due_inserts_generic_auth_expired() {
     let fp = entry.credential_fingerprint();
     let state = third_party_state(stub_auth_expired);
     crate::usage::reset_request_slots();
+    let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
     assert_eq!(
         state.suppressed_generic.lock().unwrap().get("generic-dead"),
         Some(&fp)
     );
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
+    // Suppression, not the no-data floor: the stamp keeps the bare cadence.
+    let gap = stamped_gap_ms(&state, "generic-dead", before);
+    assert!(
+        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
+        "AuthExpired must not take the generic no-data floor, got gap {gap}ms"
+    );
 }
 
 #[test]
@@ -4112,6 +4183,108 @@ fn fetch_third_party_due_does_not_insert_known_failed() {
     assert_eq!(
         state.third_party_status.lock().unwrap().get("qwen-failed"),
         Some(&super::FetchStatus::Failed)
+    );
+}
+
+/// A generic target whose scan found nothing defers its next poll to the
+/// degraded floor (`max(interval, 5min)`), so the multi-candidate rescan
+/// cannot re-probe at the bare cadence.
+#[test]
+fn fetch_third_party_due_generic_no_data_defers_to_floor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-floor"]);
+    let entry = tp_entry("generic-floor");
+    let state = third_party_state(stub_status_no_data);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "generic-floor", before);
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
+    assert!(
+        gap >= floor,
+        "generic no-data must defer to the 5-minute floor, gap {gap}ms"
+    );
+    assert!(
+        gap < floor + 2_000,
+        "the floor is the exact gap, got {gap}ms"
+    );
+}
+
+/// A typed provider's no-data keeps the normal cadence: only the generic
+/// rescan gets the floor.
+#[test]
+fn fetch_third_party_due_typed_no_data_keeps_cadence() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-nodata"]);
+    let entry = alibaba_entry("qwen-nodata", "console-token");
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "qwen-nodata", before);
+    assert!(
+        gap >= REFRESH_INTERVAL_MS,
+        "typed no-data must keep the normal cadence, gap {gap}ms"
+    );
+    assert!(
+        gap < REFRESH_INTERVAL_MS + 2_000,
+        "typed no-data must not floor, got gap {gap}ms"
+    );
+}
+
+/// A generic 429 with a server hint keeps the hint: the floor never widens a
+/// server-directed deferral, and the hint (240s, above the ~100s streak-1
+/// ladder) is what the assertion reads, so dropping the hint reds here.
+#[test]
+fn fetch_third_party_due_generic_429_hint_stays_unfloored() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-hint"]);
+    let entry = tp_entry("generic-hint");
+    let state = third_party_state(stub_rate_limited_hint);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "generic-hint", before);
+    assert!(
+        (240_000..242_000).contains(&gap),
+        "a server hint must stay unfloored, got gap {gap}ms"
+    );
+}
+
+/// A successful fetch keeps the bare cadence: the floor is a no-data
+/// mechanism, never a tax on data.
+#[test]
+fn fetch_third_party_due_a_live_body_keeps_the_bare_cadence() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-live"]);
+    let entry = tp_entry("generic-live");
+    let state = third_party_state(stub_ok_stats);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "generic-live", before);
+    assert!(
+        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
+        "a live body must keep the bare cadence, got gap {gap}ms"
+    );
+}
+
+/// An interval OVER the floor keeps its own cadence: `max(interval, 5min)` is
+/// the interval itself there, so the no-data floor adds nothing.
+#[test]
+fn fetch_third_party_due_no_data_at_a_wide_interval_adds_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-wide"]);
+    let entry = tp_entry("generic-wide");
+    let interval = 10 * 60_000;
+    let state = third_party_state_at_interval(stub_status_no_data, interval);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms_at(&state, "generic-wide", before, interval);
+    assert!(
+        (interval..interval + 2_000).contains(&gap),
+        "a wide interval must not be extended, got gap {gap}ms"
     );
 }
 
