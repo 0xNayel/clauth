@@ -306,14 +306,14 @@ impl NamedEntry for TokenEntry {
 
     fn poll_backoff_ms(&self, streaks: StreakCounts, interval_ms: u64) -> u64 {
         if self.auth_broken {
-            // Each quarantined poll spends a guaranteed-dead 401 → refresh → 400
-            // pair against the token endpoint, so the cadence stretches to the
-            // full degraded floor (a ceiling-sized raw extra reduces to exactly
+            // The flagged poll can't refresh (`fetch_with_rotation` bails before
+            // spending the dead pair), so its cadence stretches to the full
+            // degraded floor (a ceiling-sized raw extra reduces to exactly
             // `max(interval, CEILING) - interval`). The poll stays a (slow)
-            // recovery path rather than being excluded outright, and the
-            // deferral is computed live from the flag — never baked into the
-            // `last_fetched` stamp — so a login/adopt/carry lifting it snaps
-            // the cadence back on the very next tick.
+            // recovery path — adopt/carry/login still run and lift the flag —
+            // rather than being excluded outright, and the deferral is computed
+            // live from the flag, never baked into the `last_fetched` stamp, so
+            // a lift snaps the cadence back on the very next tick.
             return degraded_extra(interval_ms, DEGRADED_GAP_CEILING_MS);
         }
         // A run of transient refresh failures climbs the same curve a 429 run
@@ -344,10 +344,9 @@ pub(crate) type ThirdPartyStatusStore =
 /// ([`ThirdPartyEntry::credential_fingerprint`]). Never persisted — clears when
 /// the process exits.
 ///
-/// Two admissions, and the type name records only the first: a GENERIC profile
-/// whose last fetch yielded no data, and ANY profile whose usage credential is
-/// dead ([`FetchStatus::AuthExpired`]: a dead api key or a dead console
-/// session, either of which any third-party profile can hit).
+/// One admission: a profile whose usage credential is dead
+/// ([`FetchStatus::AuthExpired`]: a dead api key or a dead console session,
+/// either of which any third-party profile can hit).
 /// 429s are never added; they keep the server-directed deferral instead.
 ///
 /// Cleared by a manual refresh (the TUI's `refetch_queue`) OR by the credential
@@ -905,6 +904,17 @@ fn fetch_with_rotation(
     // macOS only: clauth can't write the Keychain item this session's CC reads,
     // so rotating would sign it out (`runtime::rotation_blocked_by_live_session`).
     if crate::runtime::rotation_blocked_for(name) {
+        return bail_unrotated();
+    }
+    // A standing `auth_broken` quarantine means the refresh token is already
+    // known dead; spending it here is a guaranteed 400. `bail_unrotated` skips
+    // the spend, keeps the pre-rotation context (a 401 stays Cached, an
+    // unmask-429 keeps its retry-after), and still runs the live usage poll on
+    // the PROACTIVE arm (the access token is still valid, so a refused
+    // rotation must never cost the live reading). The adopt legs above already
+    // ran, and login, carry and adopt each lift the flag themselves, so no
+    // recovery path is blocked.
+    if entry.auth_broken {
         return bail_unrotated();
     }
     mark_activity(activity, name, ProfileActivity::Refreshing);
@@ -2499,14 +2509,6 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
         .into_iter()
         .map(|entry| {
             let name = entry.name.clone();
-            // Generic-ness is only HALF the suppression gate (see the outcome
-            // handler below): a generic profile suppresses on a no-data result,
-            // while a dead usage credential suppresses whatever the provider.
-            // On everything else a known provider keeps its normal cadence.
-            let is_generic = matches!(
-                entry.target,
-                crate::providers::ThirdPartyTarget::Generic { .. }
-            );
             // Captured before the entry moves into the worker: suppression is
             // recorded against the credential that failed, never the bare name.
             let fingerprint = entry.credential_fingerprint();
@@ -2525,11 +2527,11 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 mark_activity(&activity, &worker_name, ProfileActivity::Fetching);
                 fetcher(&entry.target, &entry.api_key, hint.as_deref())
             });
-            (name, is_generic, fingerprint, h)
+            (name, fingerprint, h)
         })
         .collect();
 
-    for (name, is_generic, fingerprint, h) in handles {
+    for (name, fingerprint, h) in handles {
         match h.join() {
             Ok(Ok(stats)) => {
                 clear_activity(&state.activity, &name);
@@ -2582,15 +2584,12 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), status);
                 }
-                // Two outcomes suppress for the rest of the session — no timer
-                // retry, only a manual refresh re-admits one for a single try. A
-                // generic profile that tried and found nothing (no cache, not a
-                // 429), and ANY profile whose usage credential is dead: the
-                // cadence can't fix either, and only the second can happen to a
-                // known provider. 429 keeps the server-directed deferral;
-                // cached legs are unaffected.
-                if (matches!(status, FetchStatus::AuthExpired)
-                    || (is_generic && matches!(status, FetchStatus::Failed)))
+                // One outcome suppresses for the rest of the session — no timer
+                // retry, only a manual refresh re-admits one for a single try: a
+                // profile whose usage credential is dead. The cadence can't fix
+                // that. 429 keeps the server-directed deferral; a generic
+                // no-data result (cached or not) keeps the normal cadence.
+                if matches!(status, FetchStatus::AuthExpired)
                     && let Ok(mut sup) = state.suppressed_generic.lock()
                 {
                     sup.insert(name.to_string(), fingerprint);
@@ -2884,8 +2883,8 @@ fn tick(state: &SchedulerState) {
         .unwrap_or_default();
 
     // A manual refresh (forced) clears session suppression so the profile
-    // retries once this tick. If it still yields no data it re-suppresses when
-    // the outcome lands. Done before the snapshot so the name survives the
+    // retries once this tick. If its credential is still dead it re-suppresses
+    // when the outcome lands. Done before the snapshot so the name survives the
     // suppressed-name filter below.
     if !forced.is_empty()
         && let Ok(mut sup) = state.suppressed_generic.lock()
@@ -2905,8 +2904,8 @@ fn tick(state: &SchedulerState) {
         .lock()
         .map(|t| t.clone())
         .unwrap_or_default();
-    // Drop generic profiles suppressed this session (no-data on the timer) from
-    // the third-party leg so they aren't re-fetched every cadence. Only a manual
+    // Drop profiles with a dead usage credential (session-suppressed) from the
+    // third-party leg so they aren't re-fetched every cadence. Only a manual
     // refresh (forced, cleared above) re-admits one for a single retry.
     let tp_snapshot = filter_suppressed(&state.suppressed_generic, tp_snapshot);
 

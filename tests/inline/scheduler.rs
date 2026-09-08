@@ -508,10 +508,10 @@ fn partition_due_excludes_switching() {
     );
 }
 
-/// A quarantined (`auth_broken`) profile's poll spends a guaranteed-dead
-/// 401 → refresh → 400 pair against the token endpoint, so partition widens
-/// its cadence to the degraded floor `max(interval, DEGRADED_GAP_CEILING_MS)`
-/// — computed from the live flag, never baked into the `last_fetched` stamp,
+/// A quarantined (`auth_broken`) profile's poll can no longer refresh (the
+/// rotation leg bails before spending the dead pair), so partition widens its
+/// cadence to the degraded floor `max(interval, DEGRADED_GAP_CEILING_MS)` —
+/// computed from the live flag, never baked into the `last_fetched` stamp,
 /// so any flag lift (login, adopt, carry) snaps the cadence back on the very
 /// next tick.
 #[test]
@@ -3740,7 +3740,7 @@ fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
     );
 }
 
-/// The api key is part of the fingerprint too, so the generic no-data
+/// The api key is part of the fingerprint too, so a dead-credential
 /// suppression clears on a rotated key by the same mechanism.
 #[test]
 fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
@@ -3873,8 +3873,11 @@ fn fetch_third_party_due_inserts_known_auth_expired() {
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
+/// A generic profile whose fetch found nothing is NOT session-suppressed: its
+/// transient no-data is already clamped by the fetch deferral, and suppressing
+/// stopped it from rescanning for the whole session. The AuthExpired arm stays.
 #[test]
-fn fetch_third_party_due_inserts_generic_failed_without_cache() {
+fn fetch_third_party_due_does_not_insert_generic_failed_without_cache() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["generic-no-data"]);
     let entry = tp_entry("generic-no-data");
@@ -3884,13 +3887,9 @@ fn fetch_third_party_due_inserts_generic_failed_without_cache() {
     let state = third_party_state(stub_network_error);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert_eq!(
-        state
-            .suppressed_generic
-            .lock()
-            .unwrap()
-            .get("generic-no-data"),
-        Some(&fp)
+    assert!(
+        state.suppressed_generic.lock().unwrap().is_empty(),
+        "a generic no-data result must not suppress — it rescans on the cadence"
     );
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
 }
@@ -7179,6 +7178,131 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
         !result.opened,
         "the window stays shut; the kick could not recover"
     );
+}
+
+/// A standing `auth_broken` quarantine means the refresh token is already dead,
+/// so the rotation leg must NOT spend it. The plain fetch still runs (the 401
+/// probe — that's what set the flag) and the adopt legs above still run; the
+/// leg bails to cache. Only a login, adopt, or carry lifts the flag.
+#[test]
+fn a_flagged_profile_skips_the_dead_refresh_but_keeps_the_401_probe() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-auth-broken";
+    // usage 401 → (skip) → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits — the pin must see it, not mask it.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a quarantined profile must not spend the dead refresh: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+}
+
+/// The flagged-profile skip must take the `bail_unrotated` shape, never an
+/// inline cached bail: on the PROACTIVE arm (access token still clock-valid,
+/// inside the lead window) `bail_unrotated` serves the LIVE usage reading, so
+/// refusing the dead refresh must never cost the live poll. An inline
+/// `rotation_bail_context` bail — the shape a first cut of the skip took —
+/// drops that fetch and the flagged profile's usage freezes until login.
+#[test]
+fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-auth-broken-proactive";
+    // usage 200 → skip → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"object":"list","data":[],"plan":{"tier":"max5"}}"#.to_string(),
+            )
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .expect("oauth credentials");
+        if let Some(token) = oauth.claude_ai_oauth.as_mut() {
+            // Inside the lead window (floor 15 min): with `preemptive_rotation`
+            // on (the fixture default), the poll takes the PROACTIVE arm, so
+            // the plain fetch runs first and its 200 must be served through
+            // the skip.
+            token.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+        }
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 300_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the live usage poll must survive the skip on the proactive arm: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a quarantined profile must not spend the dead refresh: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Fresh);
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
 }
 
 // ── the rest of `fetch_with_rotation`, driven offline ────────────────────────
