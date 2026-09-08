@@ -2291,13 +2291,13 @@ impl App {
         if !self.fetch_lease.acquire() {
             return;
         }
+        // Run the startup one-shot on Fresh data only. A Cached seed's numbers
+        // are unverified — stale in either direction — so switching on them
+        // risks acting on a window the account no longer has. Stale profiles
+        // are due on the scheduler's first tick, which fetches then
+        // auto-switches off the corrected numbers.
         let switched = {
-            let mut cfg = self.config();
-            // Run the startup one-shot on Fresh data only. A Cached seed's numbers
-            // are unverified — stale in either direction — so switching on them
-            // risks acting on a window the account no longer has. Stale profiles
-            // are due on the scheduler's first tick, which fetches then
-            // auto-switches off the corrected numbers.
+            let cfg = self.config();
             let active_profile = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n));
             let active_fresh =
                 active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
@@ -2308,7 +2308,8 @@ impl App {
                     let usage = p.usage.as_ref()?;
                     self.active_burn_rate(&p.name, usage)
                 });
-                auto_switch_if_needed(&mut cfg, rate).ok().flatten()
+                drop(cfg);
+                auto_switch_if_needed(&self.config, rate).ok().flatten()
             } else {
                 None
             }
@@ -4353,10 +4354,7 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
         prompt_divergence(app, active.to_string(), "switching");
         return;
     }
-    let result = {
-        let mut cfg = app.config();
-        switch_profile(&mut cfg, name)
-    };
+    let result = switch_profile(&app.config, name);
     clear_activity(&app.activity, name);
     match result {
         Ok(()) => {
@@ -4380,10 +4378,7 @@ fn perform_switch_off(app: &mut App) {
         prompt_divergence(app, active.to_string(), "switching off");
         return;
     }
-    let result = {
-        let mut cfg = app.config();
-        switch_off(&mut cfg)
-    };
+    let result = switch_off(&app.config);
     match result {
         Ok(()) => {
             app.refresh_tokens();

@@ -9,7 +9,7 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::actions::{switch_off, switch_profile};
+use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::logline::logline;
 use crate::profile::{load_config, reload_fingerprint};
 use crate::usage::{collect_third_party_entries, collect_tokens, is_idle, now_ms};
@@ -214,9 +214,10 @@ impl super::Daemon {
 
         // Hold the state flock across the switch AND the post-write fingerprint
         // read, so an external write can't slip into the save→read window and be
-        // adopted as our own (the :354 self-adoption gap). `with_state_lock` is
-        // re-entrant, so `switch_profile`'s inner acquisition nests without
-        // deadlock; `reload_fingerprint()` is read while we still hold the flock.
+        // adopted as our own (the :354 self-adoption gap). The config guard is
+        // taken FIRST (Config ranks outer of the state flock — the order
+        // `lockorder` asserts), held across the switch, and dropped before the
+        // republish below so its disk sweep runs under no config guard.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -233,12 +234,13 @@ impl super::Daemon {
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|_held| {
-                switch_profile(&mut cfg, &target)?;
-                Ok((reload_fingerprint(), returning))
+                let changed = switch_profile_locked(&mut cfg, &target)?;
+                // Read while we still hold the flock, per the comment above.
+                Ok((reload_fingerprint(), returning, changed))
             })
         };
         match result {
-            Ok((fp, returning)) => {
+            Ok((fp, returning, changed)) => {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
                 self.switch_backoff = None;
@@ -246,6 +248,12 @@ impl super::Daemon {
                     logline!("clauth daemon: returned to preferred account '{target}'");
                 } else {
                     logline!("clauth daemon: switched to '{target}'");
+                }
+                // The `cfg` guard is dropped at the block's end above, so this
+                // republish holds no config lock. A no-op switch (target already
+                // active) skips it: the feed on disk already names this account.
+                if changed {
+                    crate::daemon::publish_status(&self.config);
                 }
             }
             Err(e) => {
@@ -324,7 +332,9 @@ impl super::Daemon {
             );
             return;
         }
-        // Same flock-held fingerprint capture as `drain_pending_switch`.
+        // Same guard-then-flock shape as `drain_pending_switch`: the guard is
+        // taken first, held across the locked switch-off, and dropped before
+        // the gated republish below.
         let result = {
             #[allow(
                 clippy::expect_used,
@@ -332,15 +342,18 @@ impl super::Daemon {
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
             crate::lock::with_state_lock(|_held| {
-                switch_off(&mut cfg)?;
-                Ok(reload_fingerprint())
+                let changed = switch_off_locked(&mut cfg)?;
+                Ok((reload_fingerprint(), changed))
             })
         };
         match result {
-            Ok(fp) => {
+            Ok((fp, changed)) => {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
                 logline!("clauth daemon: switched off: all accounts spent");
+                if changed {
+                    crate::daemon::publish_status(&self.config);
+                }
             }
             Err(e) => logline!("clauth daemon: switch-off failed: {e}"),
         }

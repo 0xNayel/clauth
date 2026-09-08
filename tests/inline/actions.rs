@@ -5,6 +5,7 @@
 use super::*;
 use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
+use crate::testutil::through_handle;
 
 /// The rotation guard every account mutation takes. Uncontended inside a
 /// sandbox, so this is the fixture spelling of "no rotation is in flight" — the
@@ -138,8 +139,10 @@ fn switch_replaces_active_account_mirror_without_refusing() {
     crate::profile::save_app_state(&config.state).expect("persist state");
 
     // Must NOT bail — the live file is the active account's captured mirror.
-    switch_profile(&mut config, &crate::profile::ProfileName::from("xfx"))
-        .expect("switch replaces the active-account mirror");
+    let (config, ()) = through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("xfx"))
+            .expect("switch replaces the active-account mirror");
+    });
 
     assert!(config.is_active(&crate::profile::ProfileName::from("xfx")));
     assert_eq!(
@@ -205,12 +208,14 @@ fn two_profiles_active_on_one() -> AppConfig {
 #[test]
 fn switch_publishes_the_status_feed_when_no_daemon_owns_it() {
     let home = HomeSandbox::new();
-    let mut config = two_profiles_active_on_one();
+    let config = two_profiles_active_on_one();
 
     let feed = home.home().join(".clauth").join("status.json");
     assert!(!feed.exists(), "nothing has published a feed yet");
 
-    switch_profile(&mut config, &"two".into()).expect("switch");
+    through_handle(config, |h| {
+        switch_profile(h, &"two".into()).expect("switch");
+    });
 
     let published = std::fs::read(&feed).expect("the switch itself published the feed");
     let body: serde_json::Value = serde_json::from_slice(&published).unwrap();
@@ -233,6 +238,26 @@ fn switch_publishes_the_status_feed_when_no_daemon_owns_it() {
     );
 }
 
+/// The no-op arm: a switch to the account ALREADY active changes nothing, so
+/// republishing would rewrite a feed whose bytes are already correct — and
+/// `publish_status`'s probe-to-stamp flow (stat every profile cache, read the
+/// old feed) would run that rewrite under no switch at all. `changed` gating
+/// the republish is what keeps a no-op switch off the disk entirely.
+#[test]
+fn a_no_op_switch_does_not_republish_the_feed() {
+    let home = HomeSandbox::new();
+    let config = two_profiles_active_on_one();
+
+    through_handle(config, |h| {
+        switch_profile(h, &"one".into()).expect("already-active is a no-op success");
+    });
+
+    assert!(
+        !home.home().join(".clauth").join("status.json").exists(),
+        "a switch that changed nothing must not write the feed"
+    );
+}
+
 /// A live daemon OWNS the feed: it republishes every tick with the scheduler's
 /// in-memory `fetch_status` / `next_refresh_at` / `pending_switch`, which a
 /// single-shot build cannot see. A switch must leave the file to that daemon —
@@ -241,13 +266,19 @@ fn switch_publishes_the_status_feed_when_no_daemon_owns_it() {
 #[test]
 fn switch_leaves_the_feed_to_a_running_daemon() {
     let home = HomeSandbox::new();
-    let mut config = two_profiles_active_on_one();
+    let config = two_profiles_active_on_one();
     let _daemon = crate::daemon::hold_daemon_lock();
 
-    switch_profile(&mut config, &"two".into()).expect("switch");
-
+    through_handle(config, |h| {
+        switch_profile(h, &"two".into()).expect("switch");
+    });
+    // Off disk, not the handle clone: the closure's return is `()`, so the
+    // switch's landed marker is observable here only through the store it
+    // persisted, which is also what any later clauth process would read.
     assert!(
-        config.is_active(&"two".into()),
+        crate::profile::load_config()
+            .expect("load")
+            .is_active(&"two".into()),
         "the switch itself still lands"
     );
     assert!(
@@ -295,8 +326,9 @@ fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
     };
     config.state.active_profile = Some("keeper".into());
 
-    let err = switch_profile(&mut config, &crate::profile::ProfileName::from("ghost"))
-        .expect_err("ghost must bail");
+    let (config, err) = through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("ghost")).expect_err("ghost must bail")
+    });
     assert!(
         err.to_string().contains("not found"),
         "bail names the cause, got: {err}"
@@ -359,7 +391,7 @@ fn switch_profile_refuses_a_target_deleted_on_disk() {
     save_app_state(&config.state).expect("persist state");
 
     // The leg's snapshot predates the delete.
-    let mut stale = config.clone();
+    let stale = config.clone();
 
     // CLI account mutation: delete victim out from under the stale snapshot.
     // `victim` is not active on the delete config, so the live file survives and
@@ -376,8 +408,10 @@ fn switch_profile_refuses_a_target_deleted_on_disk() {
     .expect("delete");
     drop(guard);
 
-    let err = switch_profile(&mut stale, &crate::profile::ProfileName::from("victim"))
-        .expect_err("a deleted target must be refused");
+    let (stale, err) = through_handle(stale, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("victim"))
+            .expect_err("a deleted target must be refused")
+    });
     assert_eq!(err.to_string(), "profile 'victim' not found");
     assert!(
         stale.is_active(&crate::profile::ProfileName::from("keeper")),
@@ -408,7 +442,7 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
     let mut target = Profile::new("target".to_string(), None, None);
     target.disabled = true;
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("active".into()),
             profiles: vec!["active".into(), "target".into()],
@@ -418,8 +452,10 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let err = switch_profile(&mut config, &crate::profile::ProfileName::from("target"))
-        .expect_err("a disabled target must be refused");
+    let (config, err) = through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("target"))
+            .expect_err("a disabled target must be refused")
+    });
     assert_eq!(
         err.to_string(),
         "'target': account is disabled, run `clauth enable target`"
@@ -479,7 +515,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -491,7 +527,9 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -557,7 +595,7 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -568,7 +606,9 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -647,7 +687,7 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -657,7 +697,9 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
         profiles: vec![a, b],
     };
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(
         action, None,
         "a scoped-blocked active must not hop onto a canceled member reading idle headroom"
@@ -718,7 +760,7 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -728,7 +770,9 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
         profiles: vec![a, b],
     };
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(action, None, "a pinned sink stays parked");
     assert!(config.is_active(&crate::profile::ProfileName::from("a")));
 }
@@ -1286,7 +1330,7 @@ fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
     save_profile(&departing).expect("save departing");
     save_profile(&incoming).expect("save incoming");
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["departing".into(), "incoming".into()],
             active_profile: Some("departing".into()),
@@ -1302,14 +1346,16 @@ fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    switch_off(&mut config).expect("switch off");
+    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the switch then reads"
     );
 
-    switch_profile(&mut config, &crate::profile::ProfileName::from("incoming"))
-        .expect("switch to the incoming account");
+    through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("incoming"))
+            .expect("switch to the incoming account");
+    });
 
     let settings = crate::profile::claude_dir()
         .ok()
@@ -1640,7 +1686,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
         }),
     });
     save_profile(&departing).expect("save departing");
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["departing".into()],
             active_profile: Some("departing".into()),
@@ -1655,7 +1701,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    switch_off(&mut config).expect("switch off");
+    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the capture then reads"
@@ -1708,7 +1754,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
         }),
     });
     save_profile(&departing).expect("save departing");
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["departing".into()],
             active_profile: Some("departing".into()),
@@ -1723,7 +1769,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    switch_off(&mut config).expect("switch off");
+    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the commit then reads"
@@ -4268,7 +4314,7 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
     crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("acct"))
         .expect("link acct live");
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["acct".into()],
             active_profile: Some("acct".into()),
@@ -4277,7 +4323,7 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
         profiles: vec![profile],
     };
 
-    switch_off(&mut config).expect("switch_off");
+    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     let after: serde_json::Value =
@@ -4310,7 +4356,7 @@ fn switch_off_on_diverged_file_keeps_profile_snapshot_and_drops_login() {
     )
     .expect("write diverged live file");
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["acct".into()],
             active_profile: Some("acct".into()),
@@ -4319,7 +4365,7 @@ fn switch_off_on_diverged_file_keeps_profile_snapshot_and_drops_login() {
         profiles: vec![profile],
     };
 
-    switch_off(&mut config).expect("switch_off");
+    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     assert!(

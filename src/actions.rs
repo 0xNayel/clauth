@@ -19,8 +19,8 @@ use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
-    AccountId, AppConfig, ClaudeCredentials, ConsoleCredential, DivergenceChoice, ModelSettings,
-    Profile, ProfileName, load_app_state, profile_dir, save_app_state, save_profile,
+    AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
+    ModelSettings, Profile, ProfileName, load_app_state, profile_dir, save_app_state, save_profile,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -112,11 +112,42 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
+/// Switch to `name`: relink the live credentials, then republish the feed.
+///
+/// Takes the shared [`crate::profile::ConfigHandle`]: the config guard is
+/// acquired FIRST and held across the state flock (the order
+/// [`crate::lockorder`] ranks them), and released before the republish below —
+/// the reverse order (a republish under the config mutex) is what the round-2
+/// review flagged: [`crate::daemon::publish_status`] stats and reads every
+/// profile's cache under it.
+///
+/// The no-op switch (already active) republishes nothing: the feed on disk
+/// already names this account.
+pub(crate) fn switch_profile(config: &ConfigHandle, name: &ProfileName) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = switch_profile_locked(&mut guard, name)?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
+    Ok(())
+}
+
+/// [`switch_profile`]'s locked body: the caller holds the config guard and
+/// receives the did-the-active-move answer so it can gate its own republish.
+/// Guard acquired before the flock — see the wrapper. The daemon's tick drain
+/// is the cross-module caller: it takes the guard first and holds it across
+/// this fn's flock, so its post-switch fingerprint read stays inside the flock
+/// while the config guard stays outer, the ranked order.
+pub(crate) fn switch_profile_locked(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
     with_state_lock(|held| {
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
-            return Ok(());
+            return Ok(false);
         }
         // Is the outgoing live file an UNCAPTURED CC re-login? `snapshot_active_
         // credentials` deliberately skips capturing that case (Diverged & not a
@@ -146,47 +177,66 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
         } else {
             force_link_profile_credentials(name)?;
         }
-        finish_switch(config, name, held)
-    })?;
-    // The active account moved: republish the feed for its external readers.
-    // Outside the lock — see `daemon::publish_status`.
-    crate::daemon::publish_status(config);
-    Ok(())
+        finish_switch(config, name, held)?;
+        Ok(true)
+    })
 }
 
 /// Discard the live login: force-relink to `target`'s stored creds WITHOUT
 /// capturing the foreign live file into any profile. Bypasses the non-force
 /// `link_profile_credentials` refuse-guard (which exists to protect an
 /// un-captured re-login) precisely because the caller chose to drop it.
-pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &ProfileName) -> Result<()> {
-    with_state_lock(|held| {
+///
+/// Same lock shape as [`switch_profile`]: guard first, dropped before the
+/// gated republish.
+pub(crate) fn switch_profile_discard(config: &ConfigHandle, target: &ProfileName) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = with_state_lock(|held| {
+        let config = &mut *guard;
         ensure_switch_target_ok(config, target)?;
         if config.is_active(target) {
-            return Ok(());
+            return Ok(false);
         }
         force_link_profile_credentials(target)?;
-        finish_switch(config, target, held)
+        finish_switch(config, target, held)?;
+        Ok(true)
     })?;
-    // The active account moved: republish the feed for its external readers.
-    // Outside the lock — see `daemon::publish_status`.
-    crate::daemon::publish_status(config);
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
     Ok(())
 }
 
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
-pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|held| {
+///
+/// Same lock shape as [`switch_profile`]: guard first, dropped before the
+/// gated republish.
+pub(crate) fn switch_profile_reconciled(config: &ConfigHandle, name: &ProfileName) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = with_state_lock(|held| {
+        let config = &mut *guard;
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
-            return Ok(());
+            return Ok(false);
         }
         force_snapshot_active_credentials(config)?;
         force_link_profile_credentials(name)?;
-        finish_switch(config, name, held)
+        finish_switch(config, name, held)?;
+        Ok(true)
     })?;
-    // The active account moved: republish the feed for its external readers.
-    // Outside the lock — see `daemon::publish_status`.
-    crate::daemon::publish_status(config);
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
     Ok(())
 }
 
@@ -248,17 +298,13 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> 
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim().to_ascii_lowercase();
         if answer.is_empty() || answer == "y" || answer == "yes" {
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            let mut cfg = config.lock().expect("config mutex poisoned");
-            switch_profile_reconciled(&mut cfg, canonical)?;
+            switch_profile_reconciled(&config, canonical)?;
         } else {
             outln!("clauth: aborted, no changes made");
             return Ok(());
         }
     } else {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let mut cfg = config.lock().expect("config mutex poisoned");
-        switch_profile(&mut cfg, canonical)?;
+        switch_profile(&config, canonical)?;
     }
 
     // Prime the 5h window if opted in. Kicks with the current access token and
@@ -431,8 +477,8 @@ pub(crate) fn switch_profile_noninteractive(
         None => false,
     };
 
-    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-    let config = &mut *config.lock().expect("config mutex poisoned");
+    // The variant fns take the handle and lock internally, so this dispatch
+    // holds no guard across the switch.
     if diverged {
         match on_divergence {
             Some(DivergenceChoice::Overwrite) => switch_profile_reconciled(config, target)?,
@@ -458,10 +504,27 @@ pub(crate) fn switch_profile_noninteractive(
 /// (`snapshot_active_credentials` skips it, keeping the stored identity), so a
 /// fresh `/login` is dropped: the TUI gates that on the divergence prompt, while
 /// the automatic wrap-off leg accepts the drop, unattended by design.
-pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
+pub(crate) fn switch_off(config: &ConfigHandle) -> Result<()> {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let changed = switch_off_locked(&mut guard)?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
+    Ok(())
+}
+
+/// [`switch_off`]'s locked body: the caller holds the config guard (ranked
+/// outer of the state flock) and receives the did-anything-change answer so
+/// it can gate its own republish.
+pub(crate) fn switch_off_locked(config: &mut AppConfig) -> Result<bool> {
     with_state_lock(|held| {
         if config.state.active_profile.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         snapshot_active_credentials(config)?;
         clear_claude_credentials()?;
@@ -474,12 +537,9 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
         // than a possibly-stale in-memory list.
         let mut state = load_app_state()?;
         state.set_active(None, held);
-        save_app_state(&state)
-    })?;
-    // The active account moved: republish the feed for its external readers.
-    // Outside the lock — see `daemon::publish_status`.
-    crate::daemon::publish_status(config);
-    Ok(())
+        save_app_state(&state)?;
+        Ok(true)
+    })
 }
 
 /// The env keys an activation has to strip out of `settings.json` before it

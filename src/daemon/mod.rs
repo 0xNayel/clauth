@@ -438,12 +438,25 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// `actions` does: [`build_status`] stats and reads each profile's caches and
 /// sweeps the session flocks, and that disk work has no business extending the
 /// critical section every other clauth process is queued behind.
-pub(crate) fn publish_status(config: &AppConfig) {
+///
+/// Takes the shared [`ConfigHandle`] and snapshots the config the same way the
+/// daemon's own writer and the API's switch do — the guard acquired for the
+/// clone and released before any disk work, so the snapshot itself never holds
+/// the config mutex across the build either.
+pub(crate) fn publish_status(config: &crate::profile::ConfigHandle) {
     if singleton_held().unwrap_or(false) {
         return;
     }
+    let snapshot = {
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let cfg = config.lock().expect("config mutex poisoned");
+        cfg.clone()
+    };
     let stamp = prior_generated_at().unwrap_or_else(|| crate::usage::epoch_secs_to_iso(0));
-    write_status_feed_with_stamp(config, None, Some(&stamp));
+    write_status_feed_with_stamp(&snapshot, None, Some(&stamp));
 }
 
 /// The daemon's last `generated_at`, read off the feed this publish replaces.

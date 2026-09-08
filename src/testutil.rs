@@ -90,6 +90,22 @@ impl Drop for HomeSandbox {
     }
 }
 
+/// Run a switch fn (`switch_profile`/`switch_off`/`auto_switch_if_needed`, all
+/// [`crate::profile::ConfigHandle`]-taking) over an owned `AppConfig` and hand
+/// the mutated value back. The fns lock internally and run their post-switch
+/// feed republish on the handle, so the test moves the value in and clones it
+/// out after — every later assert reads the post-switch state.
+pub(crate) fn through_handle<T>(
+    config: crate::profile::AppConfig,
+    run: impl FnOnce(&crate::profile::ConfigHandle) -> T,
+) -> (crate::profile::AppConfig, T) {
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let out = run(&handle);
+    let config = handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (config, out)
+}
+
 /// Completion signals for detached background tasks that have no joinable
 /// handle of their own — e.g. the MCP background delegate, which detaches via
 /// `tokio::task::spawn_blocking` and drops the returned task handle

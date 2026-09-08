@@ -1622,11 +1622,25 @@ pub(crate) fn find_recovered_member(
 /// `active_burn_pct_per_hour` is the caller's in-memory burn rate for the
 /// active profile (ignored unless burn-aware mode is on) — same contract as
 /// [`next_target`], which this forwards it to.
+///
+/// Takes the shared [`crate::profile::ConfigHandle`]: the config guard is
+/// acquired first (Config ranks outer of the state flock in
+/// [`crate::lockorder`]) and dropped before the switch dispatch below — the
+/// switch fns take the handle and take their own locks, so the post-switch
+/// feed republish's disk sweep runs under no config guard. A caller holding
+/// a guard across this call would hold it through that sweep.
 pub(crate) fn auto_switch_if_needed(
-    config: &mut AppConfig,
+    config: &crate::profile::ConfigHandle,
     active_burn_pct_per_hour: Option<f64>,
 ) -> Result<Option<SwitchAction>> {
-    with_state_lock(|_held| {
+    let handle = config;
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = handle.lock().expect("config mutex poisoned");
+    let decision = with_state_lock(|_held| {
+        let config = &mut *guard;
         let Some(active_name) = config.state.active_profile.as_ref() else {
             return Ok(None);
         };
@@ -1663,22 +1677,29 @@ pub(crate) fn auto_switch_if_needed(
                 && scoped_weekly_blocked(active, weekly_pct)
                 && let Some(target) = fully_clear_target(config, weekly_pct)
             {
-                switch_profile(config, &ProfileName::from(target.clone()))?;
                 return Ok(Some(SwitchAction::To(target)));
             }
             return Ok(None);
         }
 
-        let Some(action) = next_target(config, active_burn_pct_per_hour) else {
-            return Ok(None);
-        };
-
-        match &action {
-            SwitchAction::To(target) => switch_profile(config, &ProfileName::from(target.clone()))?,
-            SwitchAction::Off => switch_off(config)?,
+        Ok(next_target(config, active_burn_pct_per_hour))
+    });
+    // The guard is dropped before the dispatch: the switch fns take the handle
+    // and take their own locks (guard, then flock — the ranked order), so a
+    // re-entrant double take of the same config mutex can never happen and the
+    // post-switch republish runs under no config guard.
+    drop(guard);
+    match decision? {
+        Some(SwitchAction::To(target)) => {
+            switch_profile(handle, &ProfileName::from(target.clone()))?;
+            Ok(Some(SwitchAction::To(target)))
         }
-        Ok(Some(action))
-    })
+        Some(SwitchAction::Off) => {
+            switch_off(handle)?;
+            Ok(Some(SwitchAction::Off))
+        }
+        None => Ok(None),
+    }
 }
 
 #[cfg(test)]

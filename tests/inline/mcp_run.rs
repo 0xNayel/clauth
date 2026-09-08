@@ -1216,7 +1216,7 @@ fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_
     );
     crate::profile::save_profile(&departing).expect("save departing");
     crate::profile::save_profile(&target).expect("save target");
-    let mut config = crate::profile::AppConfig {
+    let config = crate::profile::AppConfig {
         state: crate::profile::AppState {
             profiles: vec!["departing".into(), "ds-target".into()],
             active_profile: Some("departing".into()),
@@ -1231,7 +1231,10 @@ fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    crate::actions::switch_off(&mut config).expect("switch off");
+    let config = crate::testutil::through_handle(config, |h| {
+        crate::actions::switch_off(h).expect("switch off")
+    })
+    .0;
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the delegate then reads"

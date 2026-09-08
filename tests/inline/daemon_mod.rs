@@ -16,7 +16,7 @@ use crate::profile::{
     AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, clauth_dir,
     reload_fingerprint, save_app_state, save_profile,
 };
-use crate::testutil::{HomeSandbox, blank_profile, set_mtime};
+use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
 use crate::usage::{ProfileActivity, clear_activity, mark_activity, now_ms};
 
 use super::Daemon;
@@ -1274,7 +1274,7 @@ fn a_non_daemon_publish_preserves_the_daemons_last_stamp() {
         120_000,
     );
 
-    super::publish_status(&config);
+    through_handle(config, super::publish_status);
 
     let body = feed_on_disk();
     assert_eq!(
@@ -1297,7 +1297,7 @@ fn a_non_daemon_publish_with_no_prior_feed_stamps_the_epoch() {
         120_000,
     );
 
-    super::publish_status(&config);
+    through_handle(config, super::publish_status);
 
     let body = feed_on_disk();
     assert_eq!(
