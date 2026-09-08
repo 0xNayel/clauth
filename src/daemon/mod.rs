@@ -170,8 +170,8 @@ fn api_enabled() -> bool {
 
 /// `serve`'s listener decision, extracted because it is the REST kill switch's
 /// call site: `Some(addr)` under `CLAUTH_NO_API=1` must yield `no_api`, never a
-/// prepared listener. The prepare arm reads the certificate and mints the token;
-/// the bind itself runs later, below the claim, in `api::serve_prepared`.
+/// prepared listener. The prepare arm reads the certificate; the token mint and
+/// the bind itself run later, below the claim, in `api::serve_prepared`.
 fn listener_setup(
     listen: Option<SocketAddr>,
     certs: &api::tls::CertSource,
@@ -209,10 +209,12 @@ pub(crate) fn serve(
     // The listener's unreadable certificate is settled BEFORE the claim below,
     // because the claim is what terminates the incumbent under `--replace`.
     // Failing after it would leave the host with no daemon at all: no refresh,
-    // no auto-switch, not merely no listener. The bind deliberately does NOT
-    // happen here: it runs below the claim (and below a standby's promotion) in
-    // `api::serve_prepared`, where the incumbent's port is free and a redundant
-    // instance never reaches a bind at all.
+    // no auto-switch, not merely no listener. Nothing else settles here: the
+    // token mint and the bind deliberately do NOT run above the claim — both
+    // live in `api::serve_prepared`, below it (and below a standby's
+    // promotion), where the incumbent's port is free, a redundant instance
+    // never reaches them, and a start that dies cannot have written
+    // `auth_token.json`.
     let (prepared, no_api) = listener_setup(listen, certs)?;
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
@@ -251,9 +253,9 @@ pub(crate) fn serve(
     // After `boot` (the stores are seeded and the scheduler is up, so a request
     // arriving immediately gets real numbers) and before `run` (which never
     // returns). The certificate was settled by `api::prepare` above the claim;
-    // the bind happens here for the first time, on a port that is winnable
-    // exactly now: the incumbent under `--replace` is dead, and a promoted
-    // standby holds the claim it parked for.
+    // the token mint and the bind happen here for the first time, on a port
+    // that is winnable exactly now: the incumbent under `--replace` is dead,
+    // and a promoted standby holds the claim it parked for.
     if let Some(addr) = no_api {
         // Said here rather than above the claim so a redundant instance cannot
         // print it and then "already running": two lines from a process that

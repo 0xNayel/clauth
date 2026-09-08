@@ -1121,10 +1121,11 @@ fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
     );
 }
 
-/// `prepare` reads the certificate and mints the token, and binds nothing: the
-/// bind belongs below the singleton claim, where the port is winnable, so a
+/// `prepare` reads the certificate and binds nothing: the bind belongs below
+/// the singleton claim, where the port is winnable, so a
 /// prepared-but-not-yet-serving listener leaves its port answering
-/// `ConnectionRefused`.
+/// `ConnectionRefused`. The token mint lives below the claim too — see the
+/// tests at the end of this file.
 #[test]
 fn prepare_leaves_the_port_unbound() {
     let _home = HomeSandbox::new();
@@ -1241,4 +1242,228 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
         "the failing prepare must leave the singleton held by the incumbent: {second:?}"
     );
     drop(incumbent);
+}
+
+// The token mint sits below the singleton claim: a `--listen` start that dies
+// on TLS preparation, or yields as redundant, must never write
+// `auth_token.json` — replacing a damaged file there revokes every client of
+// the running daemon from a start that served nothing. The byte comparisons
+// assert through `assert!` on purpose: a red must not print token bytes.
+
+/// `~/.clauth/auth_token.json` inside the sandbox.
+fn token_file() -> std::path::PathBuf {
+    crate::profile::clauth_dir()
+        .expect("dir")
+        .join("auth_token.json")
+}
+
+/// Seed a well-formed fixture token — the identity a running incumbent was
+/// spawned with and its clients hold. Synthetic fixture bytes only; a bearer is
+/// a password, so nothing here renders one.
+fn seed_token(path: &Path, token: &str) {
+    crate::profile::mkdir_700(path.parent().expect("token parent")).expect("mkdir token parent");
+    std::fs::write(
+        path,
+        serde_json::json!({
+            "schema": 1,
+            "token": token,
+            "created_at": "synthetic-fixture",
+            "tier": "control",
+        })
+        .to_string(),
+    )
+    .expect("write the token fixture");
+}
+
+/// A health request answered by the INCUMBENT's context. Routes read the token
+/// file per request (`token::current_or`), so a replacement on disk is what
+/// flips which bearer verifies — the revocation these tests pin.
+fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
+    routes::handle(
+        ctx,
+        &http::Request {
+            method: "GET".to_string(),
+            path: "/api/v1/health".to_string(),
+            query: String::new(),
+            bearer: Some(bearer.to_string()),
+            if_none_match: None,
+            body: Vec::new(),
+            keep_alive: false,
+        },
+    )
+    .status
+}
+
+/// Hold the singleton lock the way a running daemon does: a real flock claimed
+/// in this process, released when the test ends. `serve` would create the dir
+/// itself; the claim has to run first, so this stands it up.
+fn incumbent_claim() -> crate::daemon::probe::DaemonLock {
+    let dir = crate::profile::clauth_dir().expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.clauth");
+    match crate::daemon::probe::claim_singleton(&dir, false).expect("claim") {
+        crate::daemon::probe::Claim::Active(lock) => lock,
+        other => panic!("an uncontended sandbox must yield an active claim: {other:?}"),
+    }
+}
+
+/// Certificates that cannot be read, so `serve` fails in TLS preparation — the
+/// arm whose failure must not cost the incumbent its clients.
+fn unreadable_certs(root: &Path) -> crate::daemon::api::tls::CertSource {
+    crate::daemon::api::tls::CertSource::Explicit(crate::daemon::api::tls::CertPaths {
+        cert: root.join("missing.crt"),
+        issuer: None,
+        key: root.join("missing.key"),
+    })
+}
+
+/// A damaged `auth_token.json` must survive a contender whose certificate
+/// cannot be read. The mint used to run beside that certificate read, above the
+/// singleton claim, so the contender replaced the file on its way out and every
+/// client of the running daemon went 401 — the pin is the file's bytes and the
+/// incumbent's auth flip, not just the error.
+#[test]
+fn a_tls_failed_start_leaves_a_damaged_token_file_untouched() {
+    let _home = HomeSandbox::new();
+    let path = token_file();
+    seed_token(&path, TOKEN);
+    let incumbent = ctx();
+    let _lock = incumbent_claim();
+    // Held by the test, so a bind misplaced above the claim would fail on the
+    // port before reaching the arm under test.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
+    let addr = held.local_addr().expect("addr");
+    assert_eq!(health_status(&incumbent, TOKEN), 200);
+    std::fs::write(&path, b"not json").expect("damage the token file");
+    assert_eq!(
+        health_status(&incumbent, TOKEN),
+        200,
+        "damaged disk state alone must fall back to the incumbent's spawn token"
+    );
+
+    let err = crate::daemon::serve(
+        crate::daemon::StartMode::ExitIfRunning,
+        Some(addr),
+        &unreadable_certs(_home.home()),
+    )
+    .expect_err("the unreadable certificate must fail the contender");
+    assert!(
+        format!("{err:#}").contains("failed to read the TLS certificate"),
+        "the failure must be TLS preparation, not something later: {err:#}"
+    );
+    assert!(
+        std::fs::read(&path).expect("read the damaged file") == b"not json",
+        "a failed contender must leave the damaged token file byte-identical"
+    );
+    assert_eq!(
+        health_status(&incumbent, TOKEN),
+        200,
+        "the incumbent's clients must still verify after the failed start"
+    );
+}
+
+/// No token file at all must stay that way: a file minted by a start that never
+/// serves is a credential nobody asked for.
+#[test]
+fn a_tls_failed_start_mints_no_token_when_none_exists() {
+    let _home = HomeSandbox::new();
+    let path = token_file();
+    seed_token(&path, TOKEN);
+    let incumbent = ctx();
+    let _lock = incumbent_claim();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
+    let addr = held.local_addr().expect("addr");
+    std::fs::remove_file(&path).expect("remove the token file");
+
+    let err = crate::daemon::serve(
+        crate::daemon::StartMode::ExitIfRunning,
+        Some(addr),
+        &unreadable_certs(_home.home()),
+    )
+    .expect_err("the unreadable certificate must fail the contender");
+    assert!(
+        format!("{err:#}").contains("failed to read the TLS certificate"),
+        "{err:#}"
+    );
+    assert!(
+        !path.exists(),
+        "a contender that never served must not mint a token file"
+    );
+    assert_eq!(health_status(&incumbent, TOKEN), 200);
+}
+
+/// The redundant exit is a one-line yield to the holder — and under the old
+/// order the contender's only durable action was still a token replacement:
+/// the mint ran above the claim, before the contender knew it was redundant.
+#[test]
+fn a_redundant_start_leaves_a_damaged_token_file_untouched() {
+    let _home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(_home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_redundant_start_leaves_a_damaged_token_file_untouched: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let path = token_file();
+    seed_token(&path, TOKEN);
+    let incumbent = ctx();
+    let _lock = incumbent_claim();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
+    let addr = held.local_addr().expect("addr");
+    assert_eq!(health_status(&incumbent, TOKEN), 200);
+    std::fs::write(&path, b"not json").expect("damage the token file");
+
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    crate::daemon::serve(
+        crate::daemon::StartMode::ExitIfRunning,
+        Some(addr),
+        &crate::daemon::api::tls::CertSource::Explicit(paths),
+    )
+    .expect("a redundant contender exits 0");
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("already running")),
+        "the contender must have reached the redundant-claim branch"
+    );
+    assert!(
+        std::fs::read(&path).expect("read the damaged file") == b"not json",
+        "a redundant start must leave the damaged token file byte-identical"
+    );
+    assert_eq!(health_status(&incumbent, TOKEN), 200);
+}
+
+/// The control, green both before and after the mint moves: a HEALTHY token is
+/// never rewritten by any start, because reading a valid token never writes.
+/// If this reddens, the mint stopped reading before writing.
+#[test]
+fn a_tls_failed_start_leaves_a_healthy_token_untouched() {
+    let _home = HomeSandbox::new();
+    let path = token_file();
+    seed_token(&path, TOKEN);
+    let incumbent = ctx();
+    let _lock = incumbent_claim();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
+    let addr = held.local_addr().expect("addr");
+    let before = std::fs::read(&path).expect("read the healthy file");
+    assert_eq!(health_status(&incumbent, TOKEN), 200);
+
+    let err = crate::daemon::serve(
+        crate::daemon::StartMode::ExitIfRunning,
+        Some(addr),
+        &unreadable_certs(_home.home()),
+    )
+    .expect_err("the unreadable certificate must fail the contender");
+    assert!(
+        format!("{err:#}").contains("failed to read the TLS certificate"),
+        "{err:#}"
+    );
+    assert!(
+        std::fs::read(&path).expect("read the token file") == before,
+        "a healthy token must stay byte-identical across a failed start"
+    );
+    assert_eq!(health_status(&incumbent, TOKEN), 200);
 }

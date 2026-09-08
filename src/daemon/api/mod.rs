@@ -148,8 +148,7 @@ fn claim_slot() -> Option<ConnectionSlot> {
     None
 }
 
-/// Everything the listener needs except the socket, done before anything is at
-/// stake: the certificate is read and the token minted.
+/// The listener's TLS identity, read before anything is at stake.
 ///
 /// Split from [`serve_prepared`] so `daemon::serve` can settle the certificate
 /// BEFORE claiming the singleton. Under `--replace` the claim terminates the
@@ -162,47 +161,50 @@ fn claim_slot() -> Option<ConnectionSlot> {
 /// The cost of reading this early is a `--standby` instance's park: it carries
 /// the config built here through an unbounded wait, so a renewal that lands
 /// while it parks reaches the promoted daemon only at its next restart.
+///
+/// The token is NOT minted here: minting above the singleton claim let a
+/// contender replace a damaged `auth_token.json` before it knew whether it may
+/// serve — a start that then died on this certificate, or yielded as redundant,
+/// had already revoked every client of the running daemon. [`serve_prepared`]
+/// mints, below the claim and below a standby's promotion.
 pub(crate) struct Prepared {
     listen: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
-    auth: AuthToken,
 }
 
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
-    // The plaintext token lives only for this scope; `AuthToken` keeps its
-    // digest.
-    let auth = AuthToken::from_plaintext(&token::load_or_create()?);
     let tls_config = tls::server_config(certs)?;
-    Ok(Prepared {
-        listen,
-        tls_config,
-        auth,
-    })
+    Ok(Prepared { listen, tls_config })
 }
 
-/// Bind the listener [`prepare`] set up, and start serving on it.
+/// Mint the bearer token, bind the listener [`prepare`] set up, and start
+/// serving on it.
 ///
-/// The bind deliberately happens here, below the singleton claim and below a
-/// standby's promotion: above the claim, `--replace --listen` died on the port
-/// its dying incumbent still held, a plain second instance exited non-zero on
-/// a boot race its contract says it wins by yielding, and a parked standby held
-/// a listening socket nothing accepted on for the whole park. Every failure
-/// here is fatal to the daemon by design (the caller propagates it): the
-/// operator asked for a listener, and a daemon that silently ran without one
-/// would look healthy while the remote client stayed dark.
+/// The mint and the bind deliberately happen here, below the singleton claim
+/// and below a standby's promotion. Minting above the claim (in `prepare`)
+/// replaced a damaged `auth_token.json` before the contender knew whether it
+/// may serve: a start that then died on the certificate, or exited redundant,
+/// had already revoked every client of the running daemon. Binding above the
+/// claim died `--replace --listen` on the port its dying incumbent still held,
+/// exited a plain second instance non-zero on a boot race its contract says it
+/// wins by yielding, and had a parked standby holding a listening socket
+/// nothing accepted on for the whole park. Every failure here is fatal to the
+/// daemon by design (the caller propagates it): the operator asked for a
+/// listener, and a daemon that silently ran without one would look healthy
+/// while the remote client stayed dark.
 pub(crate) fn serve_prepared(
     prepared: Prepared,
     config: ConfigHandle,
     status_path: PathBuf,
     live: super::LiveStores,
 ) -> Result<()> {
-    let Prepared {
-        listen,
-        tls_config,
-        auth,
-    } = prepared;
+    let Prepared { listen, tls_config } = prepared;
     let listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
+    // Minted after the bind too: a start that will not serve — redundant,
+    // TLS-dead, or without its port — never writes `auth_token.json`. The
+    // plaintext token lives only for this scope; `AuthToken` keeps its digest.
+    let auth = AuthToken::from_plaintext(&token::load_or_create()?);
     let ctx = ApiContext::new(config, status_path, auth, Some(live));
 
     let spawned = std::thread::Builder::new()
