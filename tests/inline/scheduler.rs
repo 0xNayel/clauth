@@ -7465,6 +7465,155 @@ fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
     assert_eq!(outcome.rotated, None, "nothing may be rotated");
 }
 
+/// A NON-active flagged profile whose on-disk pair moved past the entry's token
+/// must self-heal: the carry leg above the `auth_broken` bail proves the chain
+/// is alive, lifts the stale quarantine, and never spends the dead refresh. The
+/// carry must run even though the profile is not active — external re-login is
+/// exactly the recovery the adopt legs (active-only) cannot reach.
+#[test]
+fn a_flagged_non_active_profile_carries_a_moved_disk_pair_without_a_refresh() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-non-active";
+    // usage 401 → (carry) → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits — the pin must see it, not mask it.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the entry's token: someone else rotated.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a carried non-active pair must not spend the dead refresh: {seen:?}"
+    );
+    assert!(
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "the moved pair must lift the stale quarantine"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the carried pair must sync the caller's TokenList"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// The sibling control: same NON-active flag, same 401 probe, but the disk pair
+/// is UNCHANGED. The carry finds nothing, so the bail still refuses the dead
+/// refresh — no spend, no refetch, the quarantine stays set.
+#[test]
+fn a_flagged_non_active_profile_with_an_unchanged_pair_still_bails_without_a_refresh() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-unchanged";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Leave the disk pair as the fixture's "rt-old" — the SAME pair the entry
+    // carries, so the carry must find nothing.
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "an unchanged pair must not spend the dead refresh: {seen:?}"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "an unchanged pair keeps the quarantine"
+    );
+    assert!(refetch.lock().unwrap().is_empty(), "no refetch is queued");
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
 // ── the rest of `fetch_with_rotation`, driven offline ────────────────────────
 //
 // Everything below the 401 arm above: the clock-expired-429 unmask, both retry

@@ -906,14 +906,19 @@ fn fetch_with_rotation(
     if crate::runtime::rotation_blocked_for(name) {
         return bail_unrotated();
     }
+    if let Some(outcome) = carry_external_rotation(config, name, rt, refetch) {
+        return outcome;
+    }
     // A standing `auth_broken` quarantine means the refresh token is already
-    // known dead; spending it here is a guaranteed 400. `bail_unrotated` skips
-    // the spend, keeps the pre-rotation context (a 401 stays Cached, an
-    // unmask-429 keeps its retry-after), and still runs the live usage poll on
-    // the PROACTIVE arm (the access token is still valid, so a refused
-    // rotation must never cost the live reading). The adopt legs above already
-    // ran, and login, carry and adopt each lift the flag themselves, so no
-    // recovery path is blocked.
+    // known dead; spending it here is a guaranteed 400. The carry leg above
+    // already ran, so a stale quarantine whose on-disk pair moved lifts before
+    // this spend. `bail_unrotated` skips the spend, keeps the pre-rotation
+    // context (a 401 stays Cached, an unmask-429 keeps its retry-after), and
+    // still runs the live usage poll on the PROACTIVE arm (the access token is
+    // still valid, so a refused rotation must never cost the live reading).
+    // The first adopt leg above already ran (the Err-arm one sits behind the
+    // refresh this bail skips), and login, carry and adopt each lift
+    // the flag themselves, so no recovery path is blocked.
     if entry.auth_broken {
         return bail_unrotated();
     }
