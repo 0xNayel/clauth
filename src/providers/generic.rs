@@ -3,13 +3,15 @@
 //! Derives the API origin from the profile's `base_url`, probes a small curated
 //! set of usage-endpoint paths against that origin (same host only — the api_key
 //! already authorises it for completions), and scans the first response that
-//! isn't an error envelope for percentage-windows (→ bars), scalar balances
-//! (→ text rows), and a plan/tier. The working endpoint is recorded on the
-//! returned stats so the next tick reuses it (one request steady-state).
+//! isn't an error envelope for percentage-windows and remaining-fraction
+//! windows (→ bars), scalar balances (→ text rows), and a plan/tier. The
+//! working endpoint is recorded on the returned stats so the next tick reuses
+//! it (one request steady-state).
 //!
 //! The scanner is a pure recursive walk over [`serde_json::Value`] — no
-//! per-provider code. Bars win: a percentage-bearing object becomes a bar; only
-//! when no bars are found do we harvest scalar balances into rows.
+//! per-provider code. Bars win: a percentage-bearing object or a
+//! remaining-fraction window becomes a bar; only when no bars are found do we
+//! harvest scalar balances into rows.
 
 use serde_json::Value;
 
@@ -124,7 +126,7 @@ fn is_error_envelope(value: &Value) -> bool {
 fn scan(value: &Value) -> (Option<String>, Vec<UsageBar>, Vec<StatRow>) {
     let mut plan = None;
     let mut bars: Vec<UsageBar> = Vec::new();
-    scan_inner(value, &mut plan, &mut bars);
+    scan_inner(value, None, &mut plan, &mut bars);
 
     let rows = if bars.is_empty() {
         let mut rows = Vec::new();
@@ -137,7 +139,12 @@ fn scan(value: &Value) -> (Option<String>, Vec<UsageBar>, Vec<StatRow>) {
     (plan, bars, rows)
 }
 
-fn scan_inner(value: &Value, plan: &mut Option<String>, bars: &mut Vec<UsageBar>) {
+fn scan_inner(
+    value: &Value,
+    parent_key: Option<&str>,
+    plan: &mut Option<String>,
+    bars: &mut Vec<UsageBar>,
+) {
     match value {
         Value::Object(obj) => {
             if plan.is_none()
@@ -145,16 +152,16 @@ fn scan_inner(value: &Value, plan: &mut Option<String>, bars: &mut Vec<UsageBar>
             {
                 *plan = Some(p);
             }
-            if let Some(bar) = extract_bar(obj) {
+            if let Some(bar) = extract_bar(obj, parent_key) {
                 bars.push(bar);
             }
-            for v in obj.values() {
-                scan_inner(v, plan, bars);
+            for (k, v) in obj.iter() {
+                scan_inner(v, Some(k), plan, bars);
             }
         }
         Value::Array(arr) => {
             for v in arr {
-                scan_inner(v, plan, bars);
+                scan_inner(v, parent_key, plan, bars);
             }
         }
         _ => {}
@@ -174,18 +181,43 @@ fn find_plan(obj: &serde_json::Map<String, Value>) -> Option<String> {
     })
 }
 
-/// A bar is an object carrying a percentage-like field in 0..=100, optionally a
-/// sibling reset timestamp, a label field, and absolute used/total amounts.
-fn extract_bar(obj: &serde_json::Map<String, Value>) -> Option<UsageBar> {
+/// A bar is an object carrying a percentage-like field in 0..=100 (with an
+/// optional sibling reset timestamp, label field, and absolute used/total
+/// amounts), or a remaining-fraction window: `remaining`/`left` in 0..=1 plus
+/// a parseable reset sibling (Anthropic-mirror proxies report the fraction
+/// LEFT, so pct = `(1 - remaining) * 100`), labelled with the parent map's
+/// key. The reset sibling is what separates a window from a balance-looking
+/// object; a `remaining` above 1 is an absolute count (z.ai), never a fraction.
+fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -> Option<UsageBar> {
     let pct = obj.iter().find_map(|(k, v)| {
         is_pct_key(k)
             .then(|| v.as_f64())
             .flatten()
             .filter(|&p| (0.0..=100.0).contains(&p))
-    })?;
+    });
     let resets_at = obj
         .iter()
         .find_map(|(k, v)| is_reset_key(k).then(|| parse_reset(v)).flatten());
+    let Some(pct) = pct else {
+        let remaining = obj
+            .iter()
+            .find_map(|(k, v)| is_remaining_key(k).then(|| v.as_f64()).flatten())?;
+        if !(0.0..=1.0).contains(&remaining) {
+            return None;
+        }
+        let resets_at = resets_at?;
+        // The parent map's key, verbatim: overview_windows, roster_rank and
+        // window_duration_secs match the literal `5h`/`7d` labels, so a
+        // humanized label silently loses every window-derived feature.
+        let label = parent_key.unwrap_or("usage").to_string();
+        return Some(UsageBar {
+            label,
+            pct: (1.0 - remaining) * 100.0,
+            resets_at: Some(resets_at),
+            used: None,
+            total: None,
+        });
+    };
     let label = obj
         .iter()
         .find_map(|(k, v)| {
