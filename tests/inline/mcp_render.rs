@@ -62,6 +62,18 @@ fn bar(label: &str, pct: f64) -> UsageBar {
     }
 }
 
+fn lapsed_bar(label: &str, pct: f64) -> UsageBar {
+    UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() - 3_600,
+        )),
+        used: None,
+        total: None,
+    }
+}
+
 fn row(label: &str, value: &str) -> StatRow {
     StatRow {
         label: label.to_string(),
@@ -105,17 +117,10 @@ fn third_party_headline_skips_value_less_heading_row() {
 /// while an unstamped bar stays — no stamp is missing data, not a lapsed window.
 #[test]
 fn third_party_headline_drops_bars_whose_reset_has_passed() {
-    let lapsed = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 3_600);
     let live = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3_600);
     let s = third_party_stats(
         vec![
-            UsageBar {
-                label: "5h".to_string(),
-                pct: 100.0,
-                resets_at: Some(lapsed),
-                used: None,
-                total: None,
-            },
+            lapsed_bar("5h", 100.0),
             UsageBar {
                 label: "7d".to_string(),
                 pct: 30.0,
@@ -128,6 +133,75 @@ fn third_party_headline_drops_bars_whose_reset_has_passed() {
         None,
     );
     assert_eq!(third_party_headline(&s), "7d 30%");
+}
+
+/// All bars lapsed falls through to the wallet arm: no live bar spoke, so the
+/// honest figure is the funded wallet, not a stale utilization and not an empty
+/// headline.
+#[test]
+fn third_party_headline_all_lapsed_bars_fall_through_to_wallet() {
+    let s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![row("api balance", "498.18 CNY")],
+        None,
+    );
+    assert_eq!(third_party_headline(&s), "api balance: 498.18 CNY");
+}
+
+/// Same fall-through one arm deeper: no funded wallet, so the first value row
+/// carries the headline.
+#[test]
+fn third_party_headline_all_lapsed_bars_fall_through_to_row() {
+    let s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![row("balance", "$4.20")],
+        None,
+    );
+    assert_eq!(third_party_headline(&s), "balance: $4.20");
+}
+
+/// Control: all lapsed with nothing behind it stays the empty headline, the
+/// same answer as no bars at all.
+#[test]
+fn third_party_headline_all_lapsed_bars_with_nothing_stays_empty() {
+    let s = third_party_stats(vec![lapsed_bar("5h", 100.0)], vec![], None);
+    assert_eq!(third_party_headline(&s), "");
+}
+
+/// The fall-through composite for an exhausted account: all bars lapsed AND a
+/// refusal verdict renders figure beside verdict — never the refusal alone,
+/// which would hide how short the account is behind a lapsed window.
+#[test]
+fn third_party_headline_all_lapsed_bars_render_the_refusal_beside_its_figure() {
+    let mut s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![
+            row("api balance", "498.18 CNY"),
+            StatRow {
+                label: String::new(),
+                value: crate::providers::LOW_BALANCE.to_string(),
+                kind: StatRowKind::Danger,
+            },
+        ],
+        None,
+    );
+    s.is_available = false;
+    assert_eq!(
+        third_party_headline(&s),
+        "api balance: 498.18 CNY (balance too low)"
+    );
+}
+
+/// The plan-prefix tail over the fall-through: a plan label still prefixes the
+/// wallet figure when no live bar speaks for the account.
+#[test]
+fn third_party_headline_all_lapsed_bars_keep_the_plan_prefix() {
+    let s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![row("api balance", "498.18 CNY")],
+        Some("pro"),
+    );
+    assert_eq!(third_party_headline(&s), "pro: api balance: 498.18 CNY");
 }
 
 /// The reader here is picking a delegate target, so a provider's refusal has to

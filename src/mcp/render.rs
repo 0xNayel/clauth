@@ -326,12 +326,14 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 }
 
 /// One-line cached headline for a third-party profile from
-/// `third_party_cache.json`: non-empty bars join as `label pct%`, else the first
-/// funded wallet row (an empty wallet a two-wallet provider lists first must not
-/// win the headline over the funded one), else the first stat row that carries a
-/// value; the plan label prefixes the line when present. Value-less rows (e.g.
-/// DeepSeek's `USD balance` heading) are skipped so the headline never renders a
-/// dangling `label:` with nothing after it.
+/// `third_party_cache.json`: LIVE bars join as `label pct%` (a lapsed bar is
+/// the previous window's last reading and drops), and when no live bar remains
+/// the chain falls through to the first funded wallet row (an empty wallet a
+/// two-wallet provider lists first must not win the headline over the funded
+/// one), then the first stat row that carries a value; the plan label prefixes
+/// the line when present. Value-less rows (e.g. DeepSeek's `USD balance`
+/// heading) are skipped so the headline never renders a dangling `label:` with
+/// nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     // The verdict row `ThirdPartyStats::unfunded` appends, identified by its
     // value rather than its `Danger` kind: OpenRouter marks its own overdrawn
@@ -343,26 +345,21 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
         .find(|r| r.value == crate::providers::LOW_BALANCE)
         .map(|r| r.value.as_str());
 
-    let mut body = if !s.bars.is_empty() {
-        // A bar whose reset has passed is the previous window's last reading
-        // (#74): it drops the same way the OAuth row drops, so the headline
-        // renders the account's live headroom rather than a stale figure. All
-        // bars lapsed leaves the wallet/row arms, which is the honest answer
-        // for an account no live bar speaks for.
-        let live_bars: Vec<&crate::providers::UsageBar> = s
-            .bars
-            .iter()
-            .filter(|b| crate::profile_json::usage_bar_is_live(b))
-            .collect();
-        if live_bars.is_empty() {
-            String::new()
-        } else {
-            live_bars
-                .iter()
-                .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
+    // A bar whose reset has passed is the previous window's last reading
+    // (#74): it drops the same way the OAuth row drops, so the headline
+    // renders the account's live headroom rather than a stale figure. All
+    // bars lapsed leaves the wallet/row arms, which is the honest answer
+    // for an account no live bar speaks for.
+    let live_bars = s
+        .bars
+        .iter()
+        .filter(|b| crate::profile_json::usage_bar_is_live(b))
+        .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut body = if !live_bars.is_empty() {
+        live_bars
     } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
         format!("{}: {}", wallet.label, wallet.value)
     } else if let Some(row) = s
