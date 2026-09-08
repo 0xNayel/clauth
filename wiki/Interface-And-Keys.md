@@ -15,7 +15,7 @@
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
 | **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
-The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable.
+The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those cached figures age past the refresh cadence's stale threshold, the status block adds a `[ stale ]` pill; it reads the cache age, not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
 
 ## Keys
 
