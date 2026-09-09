@@ -100,11 +100,11 @@ fn no_tls_fixture() {
 /// writes them. `Err` when `openssl` is missing AND the run demands a fixture;
 /// `Ok(None)` only for a missing `openssl` on a box that accepted the skip.
 ///
-/// A present-but-failing `openssl` is an `Err` too, not a skip: LibreSSL
-/// rejecting `-addext` is exactly that case, and a leg that CI marks as
-/// required was silently carrying zero listener coverage while reporting
-/// green — a skipped test is indistinguishable from a passing one in a
-/// summary line.
+/// A present-but-failing `openssl` is an `Err` too, not a skip: a build that
+/// rejects one of the generation flags is exactly that case, and a leg that
+/// CI marks as required was silently carrying zero listener coverage while
+/// reporting green — a skipped test is indistinguishable from a passing one
+/// in a summary line.
 fn generate_chain(
     dir: &Path,
 ) -> Result<Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)>, String> {
@@ -198,8 +198,8 @@ fn generate_chain(
 
 /// A present-but-failing `openssl` must fail the run, not skip it. The missing
 /// case is covered by `no_tls_fixture` + `CLAUTH_REQUIRE_TLS_FIXTURE`; the
-/// FAILING case is the one CI's required legs were silently passing on — macOS
-/// LibreSSL rejecting `-addext` reports green over zero listener coverage.
+/// FAILING case is the one CI's required legs were silently passing on — a
+/// generation failure reports green over zero listener coverage.
 ///
 /// A fake `openssl` that answers `version` (so the presence probe passes) and
 /// fails everything else stands in for exactly that box.
