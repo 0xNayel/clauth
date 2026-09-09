@@ -161,8 +161,10 @@ fn scan_inner(
             }
         }
         Value::Array(arr) => {
+            // The container key names the collection ("windows"), never an
+            // element; inheriting it labels every bar identically.
             for v in arr {
-                scan_inner(v, parent_key, plan, bars);
+                scan_inner(v, None, plan, bars);
             }
         }
         _ => {}
@@ -186,9 +188,10 @@ fn find_plan(obj: &serde_json::Map<String, Value>) -> Option<String> {
 /// optional sibling reset timestamp, label field, and absolute used/total
 /// amounts), or a remaining-fraction window: `remaining`/`left` in 0..=1 plus
 /// a parseable reset sibling (Anthropic-mirror proxies report the fraction
-/// LEFT, so pct = `(1 - remaining) * 100`), labelled with the parent map's
-/// key. The reset sibling is what separates a window from a balance-looking
-/// object; a `remaining` above 1 is an absolute count (z.ai), never a fraction.
+/// LEFT, so pct = `(1 - remaining) * 100`), labelled by the parent map's key
+/// (an array element or root object: its own label field). The reset sibling
+/// is what separates a window from a balance-looking object; a `remaining`
+/// above 1 is an absolute count (z.ai), never a fraction.
 fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -> Option<UsageBar> {
     let pct = obj.iter().find_map(|(k, v)| {
         is_pct_key(k)
@@ -207,10 +210,23 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
             return None;
         }
         let resets_at = resets_at?;
-        // The parent map's key, verbatim: overview_windows, roster_rank and
-        // window_duration_secs match the literal `5h`/`7d` labels, so a
-        // humanized label silently loses every window-derived feature.
-        let label = parent_key.unwrap_or("usage").to_string();
+        // Label chain: the parent map's key verbatim (a map entry's key IS its
+        // window name — overview_windows, roster_rank and window_duration_secs
+        // match the literal `5h`/`7d`, so a humanized label silently loses
+        // every window-derived feature); an array element or root object has
+        // no key, so its own label field; else "usage".
+        let label = match parent_key {
+            Some(k) => k.to_string(),
+            None => obj
+                .iter()
+                .find_map(|(k, v)| {
+                    is_label_key(k)
+                        .then(|| v.as_str())
+                        .flatten()
+                        .map(humanize_label)
+                })
+                .unwrap_or_else(|| "usage".to_string()),
+        };
         return Some(UsageBar {
             label,
             pct: (1.0 - remaining) * 100.0,
