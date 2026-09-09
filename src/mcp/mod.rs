@@ -125,12 +125,19 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
 /// whose reset has passed reads `None` (#74) — the same liveness the published
 /// `windows` array filters on — so a lapsed 5h at the cap ranks on the next
 /// live figure instead of sorting the account to the bottom of the roster.
+/// The shared cache selector gates the read itself: a retyped profile's
+/// leftover `usage_cache.json` is a fossil from its OAuth life, not headroom,
+/// so it is dropped here exactly as `published_windows` drops it from the feed
+/// and the rank falls to the provider's own bars or wallet (#74).
 fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
     let live = |w: &Option<UsageWindow>| {
         w.as_ref()
             .filter(|w| crate::profile_json::window_row_is_live(w))
             .cloned()
     };
+    if crate::profile::stored_usage_cache_is_third_party(name) {
+        return (None, None);
+    }
     match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
         Some(u) => (live(&u.five_hour), live(&u.seven_day)),
         None => (None, None),

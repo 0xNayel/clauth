@@ -5040,6 +5040,86 @@ fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
     );
 }
 
+/// A retyped profile — an endpoint account that used to be OAuth — keeps its
+/// old `usage_cache.json` from that earlier life. The leftover is not headroom:
+/// the shared cache selector says the account's figures live in the
+/// third-party cache, so the rank falls through to that arm exactly as
+/// `published_windows` drops the leftover, never sorting the account on a
+/// stale Anthropic window its own published `windows[]` carries none of (#74).
+#[test]
+fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["retyped", "oauth"]);
+    let retyped = crate::profile::Profile::new(
+        "retyped".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("k".to_string()),
+    );
+    crate::profile::save_profile(&retyped).expect("save the retyped profile");
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let leftover = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(stamp(3600)),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("retyped"),
+        USAGE_CACHE_FILE,
+        &leftover,
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        RosterRank::Unknown,
+        "a retyped profile's leftover OAuth cache is not headroom it ranks on",
+    );
+
+    // The fall-through lands on the provider's own figures when they exist.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("retyped"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![UsageBar {
+                label: "5h".to_string(),
+                pct: 20.0,
+                resets_at: Some(stamp(3600)),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        RosterRank::Window(80.0),
+        "the retyped profile ranks on its own live provider bar",
+    );
+
+    // Control: the same cache on an OAuth profile still ranks.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("oauth"),
+        USAGE_CACHE_FILE,
+        &leftover,
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("oauth")),
+        RosterRank::Window(60.0),
+        "an OAuth profile's own cache still ranks",
+    );
+}
+
 /// A 19h-lapsed 5h at the 100% cap still published `5h_used_pct: 100.0` beside
 /// the already-filtered `windows[]` (#74): one reply saying two things about one
 /// window. A lapsed share reads `null` — the same unknown the dropped row
