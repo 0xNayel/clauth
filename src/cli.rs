@@ -247,6 +247,9 @@ pub(crate) enum Command {
     ///
     /// Refreshes usage, auto-switches on exhaustion, and writes
     /// ~/.clauth/status.json. Exits at once when a daemon is already running.
+    /// `--listen` also serves the REST API (see the Daemon wiki page);
+    /// `--status`, `--print-token` and `--rotate-token` print and exit without
+    /// running a scheduler.
     Daemon {
         /// Wait instead, and take over when the running daemon exits. For a
         /// launchd/systemd unit paired with a manual run.
