@@ -982,6 +982,28 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         false,
         "a live-maxed window the opt-out skips is never age-stale"
     );
+    // The two quadrants the maxed arm does not cover: a NON-maxed window under
+    // the opt-out still takes the age verdict (the exemption is keyed on the
+    // opt-out AND the live-maxed shape together, so the flag alone exempts
+    // nothing), and a live-maxed window with the opt-out ON takes the verdict
+    // too — the source derives the exemption only under
+    // `!refresh_spent_accounts && windows_maxed`.
+    write(42.0, threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "a non-maxed window is age-stale even with spent accounts skipped"
+    );
+    config.state.refresh_spent_accounts = true;
+    write(100.0, threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "the live-maxed exemption is inherited from the opt-out alone: with the \
+         opt-out on, a maxed window is still age-stale"
+    );
     // The stuck-429 arm is untouched: the exemption shares the OR, it does not
     // replace the flag. Pinned by its own test above.
 

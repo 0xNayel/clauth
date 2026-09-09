@@ -159,6 +159,18 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
         "an account still on the slowest legal cadence is not one nobody refreshes",
     );
 
+    // The fresh direction at a DATED body: a live fetch younger than the
+    // threshold reads not-stale on the same surface that publishes the marker,
+    // so the flag cannot flip to "always stale once dated" and pass.
+    seed_usage_cache("kerry", &five_hour_at(12.0), Duration::from_secs(60));
+    let fresh = profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry")));
+    assert!(!fresh.stale(), "a body fetched a minute ago is current");
+    let age = fresh.age_secs().expect("a dated body publishes its age");
+    assert!(
+        (55..=65).contains(&age),
+        "the fresh direction is exercised at a real dated age: {age}s"
+    );
+
     seed_usage_cache(
         "kerry",
         &five_hour_at(12.0),
@@ -186,11 +198,15 @@ fn stale_after_ms_floors_at_the_degraded_ceiling_and_scales_with_interval() {
     // grace a degraded fetch can leave.
     assert_eq!(stale_after_ms(90_000), 2 * ceiling + 90_000);
     // At the ceiling the interval dominates; at the max interval the threshold
-    // is 3h. Monotone: a slower cadence always means a wider grace.
+    // is 3h. Monotone: a slower cadence always means a wider grace. The max
+    // interval is the config's own ceiling constant, not a restated number.
     assert_eq!(stale_after_ms(ceiling), 3 * ceiling);
-    assert_eq!(stale_after_ms(3_600_000), 2 * 3_600_000 + 3_600_000);
+    assert_eq!(
+        stale_after_ms(crate::profile::MAX_REFRESH_INTERVAL_MS),
+        2 * crate::profile::MAX_REFRESH_INTERVAL_MS + crate::profile::MAX_REFRESH_INTERVAL_MS
+    );
     assert!(stale_after_ms(90_000) < stale_after_ms(ceiling));
-    assert!(stale_after_ms(ceiling) < stale_after_ms(3_600_000));
+    assert!(stale_after_ms(ceiling) < stale_after_ms(crate::profile::MAX_REFRESH_INTERVAL_MS));
 }
 
 /// An OAuth body clauth cannot date reads STALE with no age published. Both
@@ -367,6 +383,40 @@ fn the_stale_flip_is_exact_not_second_granular() {
     assert!(
         is_stale_at(690_000 + 999),
         "threshold + 999ms flips: the pre-R10 shape read it fresh"
+    );
+}
+
+/// The bound the surfaces actually compare against: `STALE_AFTER_MS` is the
+/// fixed threshold the MCP payloads read, and the strict `>` means the instant
+/// a healthy ceiling-cadence fetch lands exactly on it still reads fresh. The
+/// comparison is pinned against the constant itself so a threshold edit that
+/// drops the strictness reds here, not only in the flip test's hand-picked
+/// number (the threshold's margin is pinned by the value-arm test above).
+#[test]
+fn the_stale_threshold_boundary_is_strict_at_the_constant() {
+    let threshold_ms = STALE_AFTER_MS;
+    // One captured instant for both the stamp and the verdict — the flip
+    // test's shape — so preemption between two `now_ms()` calls cannot drift
+    // the boundary assertion.
+    let now = crate::usage::now_ms();
+    let at = |offset_ms: i64| {
+        let usage = crate::usage::UsageInfo {
+            fetched_at: Some((now as i64 - offset_ms).max(0) as u64),
+            ..five_hour_at(12.0)
+        };
+        oauth_age(Some(&usage), now).is_stale(threshold_ms, true)
+    };
+    assert!(
+        !at(threshold_ms as i64),
+        "exactly at the threshold the verdict is strict: fresh"
+    );
+    assert!(
+        at(threshold_ms as i64 + 1),
+        "one millisecond past the constant flips"
+    );
+    assert!(
+        !at(threshold_ms as i64 - 1),
+        "one millisecond under the constant reads fresh"
     );
 }
 
@@ -579,7 +629,7 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
                 label: "7d Opus".to_string(),
                 window: UsageWindow {
                     utilization: 100.0,
-                    resets_at: Some(live),
+                    resets_at: Some(live.clone()),
                 },
             }],
             ..Default::default()
@@ -595,10 +645,38 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
     );
     assert_eq!(windows[0].label, "7d");
     assert_eq!(windows[0].utilization_pct, 17.0);
+    assert_eq!(windows[0].resets_at, Some(live.clone()));
     assert_eq!(windows[1].label, "7d Opus");
     assert_eq!(
         windows[1].utilization_pct, 100.0,
         "a window pinned at the cap with a future reset is live, not lapsed"
+    );
+    assert_eq!(windows[1].resets_at, Some(live));
+
+    // A row whose `resets_at` is present but UNPARSEABLE stays — absence of a
+    // usable stamp is missing data, not a lapsed window — and its stamp rides
+    // through verbatim, the same missing-data shape an unstamped row carries.
+    seed_usage_cache(
+        "kerry",
+        &UsageInfo {
+            seven_day: Some(UsageWindow {
+                utilization: 33.0,
+                resets_at: Some("not a timestamp".to_string()),
+            }),
+            ..Default::default()
+        },
+        Duration::from_secs(100),
+    );
+    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    assert_eq!(
+        windows.len(),
+        1,
+        "an unparseable stamp keeps its row: {windows:?}"
+    );
+    assert_eq!(
+        windows[0].resets_at,
+        Some("not a timestamp".to_string()),
+        "the unparsed stamp rides through, never normalized"
     );
 
     // A lapsed stamp on the weekly row too proves the per-model window drops
@@ -608,6 +686,10 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
         &UsageInfo {
             five_hour: Some(UsageWindow {
                 utilization: 50.0,
+                resets_at: Some(lapsed.clone()),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 100.0,
                 resets_at: Some(lapsed.clone()),
             }),
             weekly_scoped: vec![crate::usage::ScopedWindow {
@@ -624,6 +706,9 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
     let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
     assert!(
         windows.is_empty(),
-        "every lapsed row drops, weekly and 5h alike: {windows:?}"
+        "every lapsed row drops, 7d and weekly and 5h alike: {windows:?}"
     );
+    // And the 7d leg drops ON ITS OWN, not only in the all-lapsed set: the
+    // first fixture's live 7d proved the row exists on this body, so the drop
+    // here is the 7d filter's own verdict.
 }
