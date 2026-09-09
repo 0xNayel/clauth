@@ -638,11 +638,18 @@ pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
             pct_clause(five),
             pct_clause(seven)
         ));
-        // An age dates a FIGURE. With neither window cached there is no figure
-        // to date, and stamping the cache's age onto two `unknown`s would read
-        // as a measurement clauth does not have.
+        // An age rides this clause whichever shape the pair takes. With a
+        // figure it dates the figure; with both shares reading `unknown` —
+        // never cached, or cached and lapsed past their own resets — it dates
+        // the unknown itself (owner ruling 2026-09-08: the cache's age is the
+        // one signal separating an all-lapsed pair from a never-fetched
+        // account). The `stale` word rides the figure-bearing clause only: a
+        // verdict qualifies a figure, and beside two unknowns it would claim
+        // one the prose does not show.
         if five.is_some() || seven.is_some() {
             out.push_str(&freshness_clause(lu));
+        } else {
+            out.push_str(&age_clause(lu));
         }
     }
     if let Some(w) = lu.get("throughput_warning").and_then(Value::as_str) {
@@ -847,8 +854,12 @@ fn age_clause(v: &Value) -> String {
 /// plus the response's bars at the source — matching the rendered figure for a
 /// `5h` substring would make the copy decide its own meaning.
 ///
-/// A freshness clause rides the FIGURE it dates and nothing else: stamping a
-/// cache's age onto `unknown` asserts a measurement clauth does not have.
+/// A freshness clause rides the FIGURE it dates, and the `stale` word never
+/// rides an unknown: a verdict qualifies a figure, and beside one the prose
+/// does not print it would claim a number the reader cannot see. The AGE may
+/// date an unknown (owner ruling 2026-09-08: date the unknowns, so a reader
+/// can tell how stale the unknown is) — the same split
+/// [`live_usage_prose`]'s all-lapsed arm implements.
 fn windows_prose(windows: &Value) -> String {
     match windows.get("kind").and_then(Value::as_str) {
         Some("third_party") => {
@@ -857,7 +868,7 @@ fn windows_prose(windows: &Value) -> String {
                 .and_then(Value::as_str)
                 .filter(|b| !b.is_empty())
             else {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             };
             let mut out = if windows
                 .get("provider_windows")
@@ -878,7 +889,7 @@ fn windows_prose(windows: &Value) -> String {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             if ws.is_empty() {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             }
             let mut out = ws
                 .iter()
