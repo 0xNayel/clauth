@@ -338,6 +338,38 @@ fn a_plan_only_rewrite_does_not_refresh_the_oauth_age() {
     assert!(windows.stale(), "9000s is past the MCP staleness threshold");
 }
 
+/// The stale verdict flips on the EXACT threshold instant, not up to a second
+/// late: `Dated` carries millis (R10) because the pre-R10 shape divided to
+/// seconds in the age and multiplied back in the verdict, so a body at
+/// `threshold + 999ms` still read fresh.
+#[test]
+fn the_stale_flip_is_exact_not_second_granular() {
+    let threshold = crate::usage::now_ms();
+    let is_stale_at = |offset_ms: u64| {
+        let usage = crate::usage::UsageInfo {
+            fetched_at: Some(threshold.saturating_sub(offset_ms)),
+            ..five_hour_at(12.0)
+        };
+        oauth_age(Some(&usage), threshold).is_stale(690_000, true)
+    };
+    assert!(
+        !is_stale_at(690_000 - 1),
+        "1ms under the threshold reads fresh"
+    );
+    assert!(
+        !is_stale_at(690_000),
+        "the threshold instant itself still reads fresh: the verdict is strict"
+    );
+    assert!(
+        is_stale_at(690_000 + 1),
+        "1ms past the threshold flips (pre-R10: only +1000ms did)"
+    );
+    assert!(
+        is_stale_at(690_000 + 999),
+        "threshold + 999ms flips: the pre-R10 shape read it fresh"
+    );
+}
+
 /// `tier_label` feeds the MCP `profiles` rows (roster and session scope), and
 /// reads straight off `usage_cache.json` — never a live fetch. A canceled
 /// subscription reports its TIER here like every other account: the org drops to
