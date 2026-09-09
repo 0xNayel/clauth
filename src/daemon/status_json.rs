@@ -387,12 +387,16 @@ pub(crate) fn build_profile_entries(
             //   live-maxed exemption below is inherited via `spent_skipped`:
             //   a window pinned at the API's 100% cap cannot change by
             //   polling, so age distrusts nothing about it.
-            // OAuth goes through the one age contract (`oauth_age`), so this
-            // feed, the TUI cue and the MCP payloads cannot answer differently
-            // about the same file; the third-party leg still dates off its cache
-            // mtime, its only writer being a fetch outcome. An OAuth body with
-            // no stamp or a future one is stale with no age published: its
-            // figures stay visible, and nothing claims to date them.
+            // OAuth AGE goes through the one contract (`oauth_age`), so this
+            // feed's `stale`, the TUI cue and the MCP payloads cannot answer
+            // differently about the same file. `fetch_status` and
+            // `next_refresh_at` below are a separate question (the last fetch
+            // OUTCOME, not the reading's age) and still derive from the file's
+            // mtime, which a plan-only rewrite moves. The third-party leg dates
+            // off that mtime too, its only writer being a fetch outcome. An
+            // OAuth body with no stamp or a future one is stale with no age
+            // published: its figures stay visible, and nothing claims to date
+            // them.
             let (age_source_ms, past_threshold) = if p.usage_cache_is_third_party() {
                 (
                     mtime_ms,

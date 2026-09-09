@@ -846,6 +846,35 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         );
     }
 
+    // The verdict qualifies a figure this feed publishes. An all-lapsed body
+    // publishes an empty `windows[]`, so no age can make it stale — this is the
+    // arm that separates the live-window predicate from a field count, which
+    // answers `true` for the same body.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some("2000-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - (threshold_secs + 60) * 1000),
+            ..Default::default()
+        },
+    );
+    let v = build_status(&config, 90_000, None, false);
+    let row = v["profiles"].as_array().unwrap()[0].clone();
+    assert_eq!(
+        row["windows"].as_array().map(Vec::len),
+        Some(0),
+        "fixture control: the lapsed row really is dropped from the feed",
+    );
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "no published figure, so nothing for the marker to qualify"
+    );
+
     // A live-maxed window under the spent-accounts opt-out is exempt from the
     // age arm: its figure cannot change by polling, so age distrusts nothing.
     config.state.refresh_spent_accounts = false;

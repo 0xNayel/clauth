@@ -7569,7 +7569,7 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
 /// in `tui_render_usage.rs` hold only if this derivation is right.
 #[test]
 fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
-    let stale_at = |age_ms: u64, disk_util: f64| {
+    let stale_for = |disk: UsageInfo| {
         let _home = crate::testutil::HomeSandbox::new();
         let mut app = {
             let mut profile =
@@ -7608,14 +7608,7 @@ fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
         crate::profile_cache::write_profile_cache(
             &crate::profile::ProfileName::from(GATE_PROFILE),
             crate::profile_cache::USAGE_CACHE_FILE,
-            &UsageInfo {
-                five_hour: Some(UsageWindow {
-                    utilization: disk_util,
-                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
-                }),
-                fetched_at: Some(crate::usage::now_ms() - age_ms),
-                ..UsageInfo::default()
-            },
+            &disk,
         );
         app.apply_usage();
         {
@@ -7628,20 +7621,51 @@ fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
         }
     };
     let interval = crate::profile::AppState::default().refresh_interval_ms;
-    let fresh = stale_at(crate::profile_json::stale_after_ms(interval) / 2, 42.0);
-    let stale = stale_at(crate::profile_json::stale_after_ms(interval) + 60_000, 42.0);
+    let body = |util: f64, resets_at: &str, fetched_at: Option<u64>| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: Some(resets_at.to_string()),
+        }),
+        fetched_at,
+        ..UsageInfo::default()
+    };
+    let dated = |age_ms: u64, util: f64| {
+        body(
+            util,
+            "2999-01-01T00:00:00+00:00",
+            Some(crate::usage::now_ms() - age_ms),
+        )
+    };
+    let threshold = crate::profile_json::stale_after_ms(interval);
+
+    assert!(
+        !stale_for(dated(threshold / 2, 42.0)),
+        "a cache under the threshold must not read stale"
+    );
+    assert!(
+        stale_for(dated(threshold + 60_000, 42.0)),
+        "a cache past the threshold must read stale"
+    );
     // `windows_maxed` keys on the DISK body (100%, a far-future reset): the
     // exempt arm holds even at an age far past the threshold, and holds
     // against the live store's non-maxed body.
-    let spent = stale_at(
-        crate::profile_json::stale_after_ms(interval) + 60_000,
-        100.0,
-    );
-    assert!(!fresh, "a cache under the threshold must not read stale");
-    assert!(stale, "a cache past the threshold must read stale");
     assert!(
-        !spent,
+        !stale_for(dated(threshold + 60_000, 100.0)),
         "a live-maxed window is exempt: its figure cannot change by polling"
+    );
+    // The age rides the BODY. An undated one is stale on its own, and only
+    // this arm separates the contract from the cache-mtime derivation it
+    // replaced: the fixture writes the file NOW, so an mtime reading calls it
+    // fresh.
+    assert!(
+        stale_for(body(42.0, "2999-01-01T00:00:00+00:00", None)),
+        "a body nothing can date reads stale"
+    );
+    // ...and the verdict qualifies a figure, so a body whose only window has
+    // lapsed carries no marker however undatable it is.
+    assert!(
+        !stale_for(body(42.0, "2000-01-01T00:00:00+00:00", None)),
+        "an all-lapsed body publishes no row for a marker to qualify"
     );
 }
 
