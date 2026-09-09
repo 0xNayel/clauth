@@ -4526,6 +4526,132 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
     );
 }
 
+/// The OAuth seed's freshness and `last_fetched` stamp date off the BODY's
+/// `fetched_at`, not the file's mtime: a plan-only rewrite from a prior run
+/// (the hourly `/profile` ride on a 429'd `/usage`) moves the mtime to now
+/// without producing a new reading, and seeding off it imported the re-age
+/// into the LIVE store (`fetch_status: "Fresh"` on a body hours stale), which
+/// the status feed then publishes verbatim (R8, #74).
+#[test]
+fn try_seed_cache_dates_the_seed_off_the_bodies_own_stamp() {
+    use std::time::{Duration, SystemTime};
+
+    use super::{FetchStatus, StatusStore, now_ms, try_seed_cache};
+    use crate::profile::profile_subpath;
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::testutil::{HomeSandbox, set_mtime};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let interval = REFRESH_INTERVAL_MS;
+
+    crate::testutil::register_names(&["ridden"]);
+    // The plan-only shape: a body 3 intervals old under a file rewritten now.
+    let now = now_ms();
+    let mut body = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    body.fetched_at = Some(now - 3 * interval);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("ridden"),
+        USAGE_CACHE_FILE,
+        &body,
+    );
+    let path = profile_subpath(
+        &crate::profile::ProfileName::from("ridden"),
+        "usage_cache.json",
+    )
+    .expect("cache path");
+    set_mtime(&path, SystemTime::now());
+
+    assert!(try_seed_cache(
+        &store,
+        &status,
+        &last_fetched,
+        &crate::profile::ProfileName::from("ridden"),
+        now,
+        interval
+    ));
+    assert_eq!(
+        status.lock().unwrap().get("ridden").copied(),
+        Some(FetchStatus::Cached),
+        "a rewrite is not a fetch: the seed status follows the body's stamp"
+    );
+    let stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&oauth_key("ridden"))
+        .copied()
+        .unwrap()
+        .as_millis();
+    assert!(
+        stamp <= now.saturating_sub(3 * interval - 1_000),
+        "the cadence resumes from the last real fetch ({stamp}), not the rewrite"
+    );
+
+    // Control: the same body with its stamp moved to now — a real fetch —
+    // seeds Fresh, stamped ~now, so the resume behavior itself is unchanged.
+    let mut fresh = body.clone();
+    fresh.fetched_at = Some(now - 1_000);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("ridden"),
+        USAGE_CACHE_FILE,
+        &fresh,
+    );
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(2 * 3600));
+    assert!(try_seed_cache(
+        &store,
+        &status,
+        &last_fetched,
+        &crate::profile::ProfileName::from("ridden"),
+        now,
+        interval
+    ));
+    assert_eq!(
+        status.lock().unwrap().get("ridden").copied(),
+        Some(FetchStatus::Fresh),
+        "control: a body fetched just now seeds Fresh, mtime 2h old notwithstanding"
+    );
+
+    // An undatable body (plan-only cold fill, pre-`fetched_at` cache) has no
+    // stamp to trust, so the file's own write stays its clock.
+    let undated = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("ridden"),
+        USAGE_CACHE_FILE,
+        &undated,
+    );
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(30));
+    assert!(try_seed_cache(
+        &store,
+        &status,
+        &last_fetched,
+        &crate::profile::ProfileName::from("ridden"),
+        now,
+        interval
+    ));
+    assert_eq!(
+        status.lock().unwrap().get("ridden").copied(),
+        Some(FetchStatus::Fresh),
+        "no stamp to trust, so the file's own write dates it"
+    );
+}
+
 /// `deadline_spread` separates profiles' fetch deadlines so they don't fall due
 /// on the same tick: bounded to `[0, interval/4)`, deterministic for a fixed
 /// `(name, now)`, varied across profiles and across cycles, and zero on a

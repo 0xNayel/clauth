@@ -276,11 +276,43 @@ pub(crate) fn build_profile_entries(
             // selector every reader shares (`usage_cache_file` carries why).
             let mtime_ms = profile_cache_mtime_ms(name, usage_cache_file(p));
 
+            // The OAuth disk body, loaded once and shared by the spent-skip
+            // exemption, the freshness derivations and the age arm below —
+            // all read the DISK cache, never the live store (a spent account
+            // the scheduler dropped keeps its store entry, so the two can
+            // disagree exactly on the exempted state).
+            let oauth_usage = if p.usage_cache_is_third_party() {
+                None
+            } else {
+                load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+            };
+
+            // The clock both mtime derivations below read. A DATED OAuth body
+            // dates off its own `fetched_at` stamp — the same age contract
+            // (`oauth_age`) every other surface reads — because a plan-only
+            // cache rewrite (`apply_outcome`'s `plan_refresh` write, the
+            // hourly `/profile` ride on a 429'd `/usage`) moves the mtime
+            // without producing a new reading, and dating off it let that
+            // rewrite re-age the account (R8, #74). An UNDATABLE body (a
+            // plan-only cold fill, a pre-`fetched_at` cache) has no stamp to
+            // trust, so the mtime is the only clock left (known-movable; the
+            // account it describes carries no fetch to date), as does a
+            // third-party cache: that file's only writer is a fetch outcome.
+            let derived_clock_ms = if p.usage_cache_is_third_party() {
+                mtime_ms
+            } else {
+                match oauth_age(oauth_usage.as_ref(), now) {
+                    OauthAge::Dated(_) => oauth_usage.as_ref().and_then(|u| u.fetched_at),
+                    OauthAge::Absent | OauthAge::Undated => mtime_ms,
+                }
+            };
+
             // fetch_status: the live stores when a daemon is running, else
-            // derive from cache freshness (Fresh within one interval, else
-            // Cached). A name in NEITHER live store (a just-started daemon, the
-            // single-shot `status --json`) falls back to that derivation rather
-            // than reading as never-fetched; null = no cache at all.
+            // derive from the last real fetch's recency (Fresh within one
+            // interval, else Cached) off `derived_clock_ms`. A name in NEITHER
+            // live store (a just-started daemon, the single-shot
+            // `status --json`) falls back to that derivation rather than
+            // reading as never-fetched; null = no cache at all.
             //
             // Both stores are consulted, OAuth first — the same precedence the
             // TUI's own merge applies, so the two surfaces can't disagree about
@@ -292,8 +324,8 @@ pub(crate) fn build_profile_entries(
             // stale cache published `Fresh` — a dead session reading as live,
             // which is the outcome this status exists to prevent.
             let derived_status = || {
-                mtime_ms.map(|mt| {
-                    if now.saturating_sub(mt) < interval_ms {
+                derived_clock_ms.map(|at| {
+                    if now.saturating_sub(at) < interval_ms {
                         "Fresh"
                     } else {
                         "Cached"
@@ -324,12 +356,13 @@ pub(crate) fn build_profile_entries(
                 None => recorded_expired().or_else(derived_status),
             };
 
-            // next_refresh_at: the live countdown store, else mtime + interval
-            // (also the fallback for names the live store doesn't carry). A
-            // derived stamp already past (`now >= mtime + interval`) publishes
-            // None — the single-shot has no live countdown to vouch for it, so
-            // an overdue stamp would read as perpetually overdue (#74).
-            // Live-store stamps stay verbatim: a daemon's own countdown is real.
+            // next_refresh_at: the live countdown store, else the derived
+            // clock + interval (also the fallback for names the live store
+            // doesn't carry). A derived stamp already past (`now >= clock +
+            // interval`) publishes None — the single-shot has no live
+            // countdown to vouch for it, so an overdue stamp would read as
+            // perpetually overdue (#74). Live-store stamps stay verbatim: a
+            // daemon's own countdown is real.
             // A spent OAuth account under `refresh_spent_accounts` OFF has no
             // pending refresh — the scheduler blanks its live entry, so
             // `spent_skipped` guards the derivation too.
@@ -341,19 +374,10 @@ pub(crate) fn build_profile_entries(
             // other. That predicate also pins the constant below: the `&&`
             // reaches it only where `usage_cache_file` resolves to that file.
             let derived_next = || {
-                mtime_ms.and_then(|mt| {
-                    let stamp = mt.saturating_add(interval_ms);
+                derived_clock_ms.and_then(|at| {
+                    let stamp = at.saturating_add(interval_ms);
                     (stamp > now).then_some(stamp)
                 })
-            };
-            // The OAuth disk body, loaded once and shared by the spent-skip
-            // exemption and the age arm below — both read the DISK cache, never
-            // the live store (a spent account the scheduler dropped keeps its
-            // store entry, so the two can disagree exactly on the exempted state).
-            let oauth_usage = if p.usage_cache_is_third_party() {
-                None
-            } else {
-                load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
             };
             let spent_skipped = !config.state.refresh_spent_accounts
                 && oauth_usage
@@ -390,13 +414,12 @@ pub(crate) fn build_profile_entries(
             // OAuth AGE goes through the one contract (`oauth_age`), so this
             // feed's `stale`, the TUI cue and the MCP payloads cannot answer
             // differently about the same file. `fetch_status` and
-            // `next_refresh_at` below are a separate question (the last fetch
-            // OUTCOME, not the reading's age) and still derive from the file's
-            // mtime, which a plan-only rewrite moves. The third-party leg dates
-            // off that mtime too, its only writer being a fetch outcome. An
-            // OAuth body with no stamp or a future one is stale with no age
-            // published: its figures stay visible, and nothing claims to date
-            // them.
+            // `next_refresh_at` above are a separate question (the last fetch
+            // OUTCOME, not the reading's age) and read `derived_clock_ms`. The
+            // third-party leg dates off that mtime too, its only writer being
+            // a fetch outcome. An OAuth body with no stamp or a future one is
+            // stale with no age published: its figures stay visible, and
+            // nothing claims to date them.
             let (age_source_ms, past_threshold) = if p.usage_cache_is_third_party() {
                 (
                     mtime_ms,

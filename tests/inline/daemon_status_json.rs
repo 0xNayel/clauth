@@ -564,6 +564,103 @@ fn build_status_nulls_a_past_derived_next_refresh() {
     );
 }
 
+/// A plan-only cache rewrite (`apply_outcome`'s `plan_refresh` write, the
+/// hourly `/profile` ride on a 429'd `/usage`) moves the file's mtime to NOW
+/// while the body's `fetched_at` still names the fetch that last read the
+/// account. `fetch_status` and `next_refresh_at` derived off the mtime, so
+/// that rewrite re-aged the account — Fresh again, countdown re-armed — the
+/// #74 "stale reading served as live" shape reached through the plan leg
+/// instead of a dead poller. Both fields derive off the body's own stamp
+/// (R8): the one clock a plan-only write provably does not move.
+#[test]
+fn build_status_does_not_re_age_a_plan_only_rewrite() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let interval_ms = 300_000u64;
+    crate::testutil::register_names(&["work"]);
+    let body = |fetched_at: Option<u64>| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: 42.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                fetched_at,
+                ..Default::default()
+            },
+        );
+    };
+    // The plan-only shape: a body 4 intervals old under a file rewritten now.
+    // 20 min also clears this interval's staleness threshold
+    // (2 × max(300s, 5min) + 300s = 15min), so the age arm pins on the same
+    // body — it was already off the body (#74 R2); the re-age was these two
+    // fields alone.
+    let age_ms = 4 * interval_ms;
+    body(Some(crate::usage::now_ms() - age_ms));
+
+    let v = build_status(&config, interval_ms, None, false);
+    let row = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        row["fetch_status"], "Cached",
+        "a rewrite is not a fetch: the status follows the body's stamp"
+    );
+    assert_eq!(
+        row["stale"], true,
+        "20 min past fetch is past the threshold"
+    );
+    assert_eq!(
+        row["next_refresh_at"],
+        serde_json::Value::Null,
+        "the last fetch's slot is 3 intervals past; a rewrite cannot re-arm it"
+    );
+    // The published stamp keeps naming the fetch, never the rewrite.
+    let published = row["fetched_at"].as_str().expect("a dated body publishes");
+    let published_ms = crate::usage::iso_to_epoch_secs(published).expect("ISO-8601") * 1000;
+    assert!(
+        crate::usage::now_ms().saturating_sub(u64::try_from(published_ms).expect("positive"))
+            > age_ms / 2,
+        "the published stamp must date the fetch, not the file: {published}"
+    );
+
+    // Control: same file, stamp moved to now — a real fetch. Fresh, countdown
+    // armed: the derivation still reads a live fetch correctly.
+    body(Some(crate::usage::now_ms()));
+    let v = build_status(&config, interval_ms, None, false);
+    let row = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        row["fetch_status"], "Fresh",
+        "control: a live fetch is Fresh"
+    );
+    assert!(
+        !row["next_refresh_at"].is_null(),
+        "control: a live fetch has a pending refresh"
+    );
+
+    // An undatable body (a plan-only cold fill, a pre-`fetched_at` cache) has
+    // no stamp; the file's own write is its only clock and stays the fallback.
+    body(None);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(2 * interval_ms),
+    );
+    let v = build_status(&config, interval_ms, None, false);
+    assert_eq!(
+        v["profiles"].as_array().unwrap()[0]["fetch_status"],
+        "Cached",
+        "no stamp to trust, so the file's own write dates it"
+    );
+}
+
 /// The half a spent-skip gate keyed on `is_third_party` gets wrong: a GENERIC
 /// api-key endpoint (`provider` is `None`, so that predicate says false) is
 /// fetched on the cadence by the third-party leg, and `drop_spent_oauth` blanks
