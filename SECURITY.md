@@ -78,21 +78,7 @@ clauth binds a socket in exactly two places, both narrow:
 | `127.0.0.1:<random port>` | for the seconds `clauth login` waits for the browser redirect | loopback only; it checks the OAuth `state` and closes |
 | the address you pass to `clauth daemon --listen` | for as long as that daemon runs | wherever you bind it |
 
-`--listen` is off unless you ask for it, and it is the only way anything outside this
-machine can reach clauth. It is TLS-only (from this host's lego certificate, or the
-`--cert`/`--key` pair named on the command line, read at
-startup) and every route requires a bearer token, compared in constant time, stored at
-`~/.clauth/auth_token.json` and printed by `clauth daemon --print-token`. It exposes two
-operations, reading the status feed and switching the active account, and the feed it
-serves carries what `status.json` carries: names, tiers, percentages, timestamps, never a
-token or key. Connections persist and may be pipelined; `Content-Length` is the only
-framing accepted, chunked is refused, and any framing error closes the connection rather
-than resynchronizing, so the ambiguity request smuggling depends on does not arise. An
-unauthenticated request closes the connection too, so no unauthenticated client can hold a
-connection slot — though reaching the port does occupy one while connected, since the slot
-is claimed at `accept()`, before the handshake and before any token is seen. What bounds
-that is the clock: a peer that connects and says nothing gets the 10s first-request
-timeout, not the full connection lifetime.
+`--listen` is off unless you ask for it, and it is the only way anything outside this machine can reach clauth. It is TLS-only (from this host's lego certificate, or the `--cert`/`--key` pair named on the command line, read at startup) and every route requires a bearer token, compared in constant time, stored at `~/.clauth/auth_token.json` and printed by `clauth daemon --print-token`. It exposes two operations, reading the status feed and switching the active account, and the feed it serves carries what `status.json` carries: names, tiers, percentages, timestamps, never a token or key. Connections persist and may be pipelined; `Content-Length` is the only framing accepted, chunked is refused, and any framing error closes the connection rather than resynchronizing, so the ambiguity request smuggling depends on does not arise. An unauthenticated request closes the connection too, so no unauthenticated client can hold a connection slot — though reaching the port does occupy one while connected, since the slot is claimed at `accept()`, before the handshake and before any token is seen. What bounds that is the clock: a peer that connects and says nothing gets the 10s first-request timeout, not the full connection lifetime.
 Limits: 8 KiB of headers, 64 KiB of body, 32 concurrent connections, 100 requests and
 120 seconds per connection, a 10s deadline per read or write.
 `CLAUTH_NO_API=1` disables it. See `wiki/Daemon.md`.
@@ -132,10 +118,7 @@ Agent-invoked, only when the Claude Code plugin is installed:
 
 Network-invoked, only while `clauth daemon --listen` is running:
 
-- **`POST /api/v1/switch`.** The same relink as the `switch` MCP tool, performed for a
-  caller that presented the bearer token. It sends no inference itself, and it refuses
-  the cases that need a human (a login clauth has not saved, credentials a refresh has
-  rejected, a disabled account) rather than resolving them unattended.
+- **`POST /api/v1/switch`.** The same relink as the `switch` MCP tool, performed for a caller that presented the bearer token. It sends no inference itself, and it refuses the cases that need a human (a login clauth has not saved, credentials a refresh has rejected, a disabled account) rather than resolving them unattended.
 
 Nothing else sends inference or writes to your account.
 
