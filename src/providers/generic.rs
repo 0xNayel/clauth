@@ -121,8 +121,9 @@ fn is_error_envelope(value: &Value) -> bool {
 }
 
 /// Walk an arbitrary JSON value and extract `(plan, bars, rows)`. Bars take
-/// priority: a percentage-bearing object becomes a bar; scalar balances are
-/// harvested into rows only when no bars were found. Plan is independent.
+/// priority: a percentage-bearing or remaining-fraction object becomes a bar;
+/// scalar balances are harvested into rows only when no bars were found. Plan
+/// is independent.
 fn scan(value: &Value) -> (Option<String>, Vec<UsageBar>, Vec<StatRow>) {
     let mut plan = None;
     let mut bars: Vec<UsageBar> = Vec::new();
