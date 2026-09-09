@@ -8567,6 +8567,320 @@ fn a_flagged_non_active_profile_with_an_unchanged_pair_still_bails_without_a_ref
     assert_eq!(outcome.status, super::FetchStatus::Cached);
 }
 
+// ── the macOS refusal vs the carry ───────────────────────────────────────────
+//
+// The refusal is forced through the test seam (`crate::runtime::
+// set_rotation_blocked_override`): the predicate's first term is compile-time
+// false off macOS, so no Linux run reaches a `true` arm any other way.
+
+/// The refusal must not gate the carry. A live `clauth start` session blocks
+/// the ROTATION — clauth cannot write the Keychain item that session's CC
+/// reads — but the carry spends no refresh token; it only reads the store. So
+/// a flagged profile whose on-disk pair an external re-login through the
+/// session's own chain already moved still self-heals: quarantine lifted,
+/// refetch queued, fresh pair carried. Bailing at the guard BEFORE the carry
+/// (the pre-fix order) is the defect this pin reds.
+#[test]
+fn a_live_session_blocking_rotation_still_carries_a_moved_disk_pair() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-blocked";
+    // usage 401 → (carry) → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits — the pin must see it, not mask it.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the entry's token: an external re-login
+    // through the live session's own chain.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a blocked rotation must not spend the refresh — the carry reads disk only: {seen:?}"
+    );
+    assert!(
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "the moved pair must lift the stale quarantine even under a live session"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the carried pair must sync the caller's TokenList"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// The sibling control under a forced refusal: the disk pair UNCHANGED and the
+/// entry unflagged. The carry finds nothing, so the guard still bails — no
+/// spend, no refetch. An unflagged entry keeps the pin sharp against the guard
+/// vanishing from the swapped order: without the bail the leg walks straight
+/// into the refresh, and the token call this server records would be the spend.
+#[test]
+fn a_live_session_blocking_rotation_with_an_unchanged_pair_still_bails() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-blocked-unchanged";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+    }
+    // Leave the disk pair as the fixture's "rt-old" — the SAME pair the entry
+    // carries, so the carry must find nothing.
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "an unchanged pair under a blocked rotation must not spend the refresh: {seen:?}"
+    );
+    assert!(refetch.lock().unwrap().is_empty(), "no refetch is queued");
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// The unblocked control for the same seam: refusal forced OFF, moved pair —
+/// the carry outcome must be exactly the one the unforced path already serves,
+/// so the swap changed nothing the predicate cannot see. Also the seam's
+/// false-arm control: same call shape as the blocked pins, opposite value,
+/// opposite verdict.
+#[test]
+fn a_disarmed_refusal_keeps_the_carry_outcome_on_the_unblocked_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-disarmed";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the entry's token.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    crate::runtime::set_rotation_blocked_override(Some(false));
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a carried pair must not spend the dead refresh: {seen:?}"
+    );
+    assert!(
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "the moved pair must lift the stale quarantine"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the carried pair must sync the caller's TokenList"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// A tokenless entry bails BEFORE anything else: the `let Some(rt)` guard
+/// stays first, ahead of both the carry and the macOS refusal, so nothing is
+/// queued and nothing rotates. The disk pair is MOVED so a carry that ran
+/// anyway would be visible — the inequality would fire it.
+#[test]
+fn a_tokenless_profile_bails_before_the_carry_runs() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-tokenless";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the token the entry does not carry.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: None,
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a tokenless profile has nothing to spend: {seen:?}"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "nothing may lift the quarantine on a tokenless bail"
+    );
+    assert!(refetch.lock().unwrap().is_empty(), "no refetch is queued");
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
 // ── the rest of `fetch_with_rotation`, driven offline ────────────────────────
 //
 // Everything below the 401 arm above: the clock-expired-429 unmask, both retry

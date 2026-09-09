@@ -682,10 +682,34 @@ fn live_session_holds_rotatable(name: &ProfileName) -> bool {
 /// strictly the more expensive probe (a registry read plus a credential parse
 /// per live session), and it only ever narrows an answer that is already
 /// `true`, so it is never paid by a profile that was not about to be refused.
+///
+/// The `cfg!` term is compile-time false off macOS, so a Linux test can reach
+/// neither arm through the host; the test-only override below is the one way
+/// the scheduler's ordering pins can hold both.
 pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ROTATION_BLOCKED_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     cfg!(target_os = "macos")
         && rotation_blocked_by_live_session(has_live_session(name), true)
         && live_session_holds_rotatable(name)
+}
+
+// Test seam posing the refusal's answer from a Linux host. Thread-local, same
+// shape as `ROTATION_LOCK_TIMEOUT_OVERRIDE`: a test that forces it affects only
+// the thread it drives the fetch on, and `None` (the default) is the host
+// answer — production never sets it.
+#[cfg(test)]
+thread_local! {
+    static ROTATION_BLOCKED_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set or clear the test-only refusal override. `None` restores the host answer.
+#[cfg(test)]
+pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
+    ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
 /// Count of live `clauth start` sessions for the profile, deduped by marker NAME

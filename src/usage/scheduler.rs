@@ -1118,13 +1118,18 @@ fn fetch_with_rotation(
     let Some(rt) = refresh_token else {
         return bail_unrotated();
     };
+    // The carry reads disk only and spends no refresh token, so it runs even
+    // under a live session the rotation below must refuse — and it must run
+    // FIRST: bailing at the macOS guard before it would strand a flagged
+    // profile whose on-disk pair an external re-login through the session's
+    // own chain already moved, leaving the stale quarantine to lift never.
+    if let Some(outcome) = carry_external_rotation(config, name, rt, refetch) {
+        return outcome;
+    }
     // macOS only: clauth can't write the Keychain item this session's CC reads,
     // so rotating would sign it out (`runtime::rotation_blocked_by_live_session`).
     if crate::runtime::rotation_blocked_for(name) {
         return bail_unrotated();
-    }
-    if let Some(outcome) = carry_external_rotation(config, name, rt, refetch) {
-        return outcome;
     }
     // A standing `auth_broken` quarantine means the refresh token is already
     // known dead; spending it here is a guaranteed 400. The carry leg above
