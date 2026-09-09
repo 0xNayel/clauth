@@ -82,6 +82,23 @@ struct Row {
 impl Row {
     fn from_entry(config: &AppConfig, entry: &ProfileEntry) -> Row {
         let typed_name = &entry.name;
+        // A third-party account has no 5h/7d pool, so those columns render the
+        // provider's OWN headroom — its cached bars, or the wallet a scalar
+        // provider publishes — instead of the dashes a windowless OAuth account
+        // renders (owner ruling 2026-09-09 row 3).
+        let (five_h, seven_d) = match config.find(typed_name) {
+            Some(p) if p.usage_cache_is_third_party() => {
+                let (five, seven) = crate::profile_json::third_party_columns(p);
+                (
+                    five.unwrap_or_else(|| "-".to_string()),
+                    seven.unwrap_or_else(|| "-".to_string()),
+                )
+            }
+            _ => (
+                window_pct(&entry.windows, crate::usage::LABEL_5H),
+                window_pct(&entry.windows, crate::usage::LABEL_7D),
+            ),
+        };
         Row {
             marker: if entry.active { '*' } else { ' ' },
             name: entry.name.as_str().to_string(),
@@ -90,8 +107,8 @@ impl Row {
                 .as_deref()
                 .unwrap_or(entry.provider.as_str())
                 .to_string(),
-            five_h: window_pct(&entry.windows, crate::usage::LABEL_5H),
-            seven_d: window_pct(&entry.windows, crate::usage::LABEL_7D),
+            five_h,
+            seven_d,
             endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
             disabled: config.find(typed_name).is_some_and(|p| p.is_disabled()),
             keyless: config

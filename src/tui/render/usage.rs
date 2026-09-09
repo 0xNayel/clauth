@@ -1457,16 +1457,12 @@ fn bar_reset_trailing(rem: Option<i64>, reset_fmt: ResetFmt) -> String {
 /// Eyebrow amount for a bar: `used / total` when both are present, else empty.
 fn bar_amount(bar: &crate::providers::UsageBar) -> String {
     match (bar.used, bar.total) {
-        (Some(used), Some(total)) => format!("{} / {}", fmt_amount(used), fmt_amount(total)),
+        (Some(used), Some(total)) => format!(
+            "{} / {}",
+            crate::format::format_amount(used),
+            crate::format::format_amount(total)
+        ),
         _ => String::new(),
-    }
-}
-
-fn fmt_amount(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
     }
 }
 

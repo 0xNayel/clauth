@@ -61,6 +61,11 @@ fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>)
 }
 
 const HEADER: &str = "  PROFILE  PLAN    5H USED  7D USED  ENDPOINT";
+
+/// ISO-8601 UTC `now_secs + ahead_secs`, the shape `resets_at` carries.
+fn future_iso(ahead_secs: i64) -> String {
+    crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + ahead_secs)
+}
 // 42.4 → 42.4%, 17.6 → 17.6%: format_pct drops only trailing `.0`.
 const WORK_ROW: &str = "* work     Max 5x    42.4%    17.6%  -";
 
@@ -324,6 +329,255 @@ fn list_table_leaves_an_env_keyed_third_party_profile_unmarked() {
     );
 }
 
+/// A third-party account's 5h/7d columns render the PROVIDER's own headroom —
+/// its cached usage bars — rather than dashes (owner ruling 2026-09-09 row 3:
+/// the defect was the empty columns, not the marker). The bar arms mirror the
+/// roster rank's fall-through: a live bar's `pct`, falling back to the first
+/// funded wallet when no label-matched live bar exists. Lapsed bars and spent
+/// wallets keep reading as dashes, the same missing-data call every other
+/// surface makes. The `(stale)` marker itself is pinned by its own test below.
+#[test]
+fn list_table_renders_a_third_party_rows_own_headroom() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    crate::testutil::register_names(&["z.ai"]);
+    // The bar shape off a real capture, re-anchored to stay live, written
+    // through the production cache writer.
+    crate::testutil::write_captured_third_party_cache(
+        "z.ai",
+        crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+    );
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai    12.5%      48%  https://api.z.ai/api/anthropic",
+        ],
+        "a third-party row shows its own bars in the 5h/7d columns"
+    );
+}
+
+/// A live bar under a label the columns do not spell (`time limit`, the
+/// generic scanner's provider-authored label) neither fills a column nor
+/// suppresses the wallet fallback — the same fall-through the roster's rank
+/// uses, so the two surfaces cannot disagree about which figure speaks for
+/// the account.
+#[test]
+fn list_table_falls_through_to_the_wallet_over_a_non_canonical_bar_label() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    crate::testutil::register_names(&["z.ai"]);
+    // The captured bars with live (re-anchored) stamps, every label renamed to
+    // the generic scanner's shape: LIVE bars exist, none matches `5h`/`7d`, and
+    // the wallet row is what the rank falls through to.
+    let mut stats: crate::providers::ThirdPartyStats =
+        serde_json::from_slice(&crate::testutil::reanchored_bars_cache_bytes(
+            crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+        ))
+        .unwrap();
+    for bar in &mut stats.bars {
+        bar.label = "time limit".to_string();
+    }
+    stats.rows.push(crate::providers::StatRow {
+        label: "total".to_string(),
+        value: "31.45 CNY".to_string(),
+        kind: crate::providers::StatRowKind::Body,
+    });
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("z.ai"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("31.45 CNY"),
+        "a live but non-canonically-labeled bar does not suppress the wallet: {table}"
+    );
+    assert!(
+        !table.contains("12.5%"),
+        "a non-canonical bar never fills a column: {table}"
+    );
+}
+
+/// The wallet fallback: a scalar provider (DeepSeek) has no bars, so the first
+/// FUNDED wallet's spendable balance stands in for the headroom the columns
+/// exist to show — one figure, in the 5h column, same as the MCP headline.
+#[test]
+fn list_table_falls_back_to_the_first_funded_wallet_when_no_bar_exists() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.deepseek.com/anthropic";
+    let mut ds = Profile::new(
+        "deepseek".to_string(),
+        Some(url.to_string()),
+        Some("k".into()),
+    );
+    ds.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![ds],
+    };
+
+    crate::testutil::register_names(&["deepseek"]);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("deepseek"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, crate::testutil::DEEPSEEK_CACHE_BYTES).unwrap();
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE   PLAN        5H USED  7D USED  ENDPOINT",
+            "  deepseek  DeepSeek  31.45 CNY        -  https://api.deepseek.com/anthropic",
+        ],
+        "a scalar provider's funded wallet stands in for the 5h column"
+    );
+}
+
+/// The liveness filter inside the column lookup: the captured bars' own
+/// `resets_at` stamps (2026-08) are past, so writing the fixture VERBATIM —
+/// no re-anchoring — pins that a lapsed bar renders dashes rather than the
+/// previous window's last reading (#74's drop, held on the list surface too).
+#[test]
+fn list_table_dashes_a_lapsed_bars_last_reading() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    crate::testutil::register_names(&["z.ai"]);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("z.ai"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).unwrap();
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai        -        -  https://api.z.ai/api/anthropic",
+        ],
+        "a lapsed bar's last reading is no reading: the columns stay dashes"
+    );
+}
+
+/// The wallet fallback takes the first FUNDED wallet in ROW order (owner
+/// ruling 2026-08-28): a two-wallet cache listing the empty one first must
+/// render the funded figure, not the zero it would show on a `.last()` or
+/// amount-sorting read.
+#[test]
+fn list_table_ranks_the_first_funded_wallet_not_the_empty_first_listed() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.deepseek.com/anthropic";
+    let mut ds = Profile::new(
+        "deepseek".to_string(),
+        Some(url.to_string()),
+        Some("k".into()),
+    );
+    ds.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![ds],
+    };
+
+    crate::testutil::register_names(&["deepseek"]);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("deepseek"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE).unwrap();
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("498.18 CNY"),
+        "the first funded wallet (row order) is the figure, got:\n{table}"
+    );
+    assert!(
+        !table.contains("0.00 USD"),
+        "the empty wallet listed first must not win, got:\n{table}"
+    );
+}
+
+/// `x / y` used-and-total bars (z.ai's window shape) render the absolute
+/// amounts, not the percentage: the percentage is derived, `used / total` is
+/// the account's own reported figure.
+#[test]
+fn list_table_renders_a_bars_own_absolute_amounts_when_it_carries_them() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    crate::testutil::register_names(&["z.ai"]);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("z.ai"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // The 5h bar loses its `resets_at` (unstamped bars stay, the missing-data
+    // call every other surface makes) and gains `used`/`total`.
+    std::fs::write(
+        &path,
+        crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES
+            .replace(
+                "\"5h\",\"pct\":12.5,\"resets_at\":\"2026-08-15T12:00:00Z\"",
+                "\"5h\",\"pct\":12.5,\"used\":50.0,\"total\":400.0",
+            )
+            .replace("2026-08-20T00:00:00Z", &future_iso(7 * 86400)),
+    )
+    .unwrap();
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("50 / 400"),
+        "the 5h column shows the bar's own absolute amounts, got:\n{table}"
+    );
+}
+
 #[test]
 fn list_table_reports_no_accounts_when_empty() {
     let _home = HomeSandbox::new();
@@ -447,6 +701,10 @@ fn a_dead_api_key_is_told_the_key_was_rejected() {
 /// The table has no freshness column, so a warm cache old enough to be
 /// distrusted renders the `(stale)` suffix — the same cue `status --json`
 /// publishes, surfaced where the table's numbers would otherwise read as live.
+/// The third-party arm of that cue: a third-party row's marker rides the
+/// provider cache's own mtime past the same threshold, and it must KEEP riding
+/// once the columns carry figures (the marker qualifies the headroom the
+/// columns now show, so the two land together).
 #[test]
 fn list_table_marks_a_stale_reading() {
     let _home = HomeSandbox::new();
@@ -465,6 +723,42 @@ fn list_table_marks_a_stale_reading() {
     assert!(
         table.contains("(stale)"),
         "an old cache must render the stale cue, got:\n{table}"
+    );
+
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("zai".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+    crate::testutil::register_names(&["zai"]);
+    // Re-anchored bar stamps (live) under a backdated mtime: the marker and
+    // the figures must land together.
+    crate::testutil::write_captured_third_party_cache(
+        "zai",
+        crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+    );
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("zai"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(age_ms),
+    );
+    let table = render_table(
+        &config,
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
+    );
+    assert!(
+        table.contains("(stale)"),
+        "a third-party row's stale marker rides its own cache age, got:\n{table}"
+    );
+    assert!(
+        table.contains("48%") || table.contains("12.5%"),
+        "and the columns still carry the (stale-marked) figures, got:\n{table}"
     );
 }
 

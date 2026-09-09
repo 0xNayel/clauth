@@ -196,7 +196,10 @@ pub(crate) enum OauthAge {
     /// VISIBLE and read stale, because a figure of unknown age is the one a
     /// reader must discount hardest.
     Undated,
-    /// Seconds since the fetch that produced these figures.
+    /// Milliseconds since the fetch that produced these figures. Carried in
+    /// the unit `is_stale` compares in, so the verdict flips on the exact
+    /// threshold instant rather than up to a second late (the pre-R10 shape
+    /// divided to seconds here and multiplied back there).
     Dated(u64),
 }
 
@@ -205,7 +208,7 @@ impl OauthAge {
     /// number, which is why staleness is a separate question.
     pub(crate) fn secs(self) -> Option<u64> {
         match self {
-            Self::Dated(secs) => Some(secs),
+            Self::Dated(ms) => Some(ms / 1000),
             Self::Absent | Self::Undated => None,
         }
     }
@@ -224,7 +227,7 @@ impl OauthAge {
         match self {
             Self::Absent => false,
             Self::Undated => true,
-            Self::Dated(secs) => secs.saturating_mul(1000) > threshold_ms,
+            Self::Dated(ms) => ms > threshold_ms,
         }
     }
 }
@@ -239,7 +242,7 @@ pub(crate) fn oauth_age(usage: Option<&UsageInfo>, now_ms: u64) -> OauthAge {
     match usage.fetched_at {
         Some(at) => now_ms
             .checked_sub(at)
-            .map_or(OauthAge::Undated, |ms| OauthAge::Dated(ms / 1000)),
+            .map_or(OauthAge::Undated, OauthAge::Dated),
         None => OauthAge::Undated,
     }
 }
@@ -383,6 +386,55 @@ pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
             resets_at: w.resets_at.clone(),
         })
         .collect()
+}
+
+/// The headroom a THIRD-PARTY account's own cache holds, as the two figure
+/// strings `clauth list`'s 5h/7d columns render: the provider's own usage bars
+/// under those exact labels first (a LIVE bar's figures; a lapsed one is the
+/// previous window's last reading and drops, the same call [`oauth_windows`]
+/// makes), falling back to the first FUNDED wallet's balance — the same
+/// fall-through the MCP roster's rank uses, so a bar the roster ranks the
+/// account on cannot render as dashes here and vice versa. A live bar under a
+/// NON-canonical label (the generic scanner's provider-authored labels) is no
+/// match: it neither fills a column nor suppresses the wallet fallback. The
+/// OAuth figure gate stays OAuth-only (owner ruling 2026-09-09): a `Window`
+/// newtype would let a wallet masquerade as a window, so the plain pair keeps
+/// the two figure families from meeting.
+///
+/// `(None, None)` when the account has neither — the columns stay dashes, the
+/// missing-data call every other surface makes.
+pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String>) {
+    let Some(stats) = load_profile_cache::<ThirdPartyStats>(&p.name, THIRD_PARTY_CACHE_FILE) else {
+        return (None, None);
+    };
+    let bar = |label: &str| {
+        stats
+            .bars
+            .iter()
+            .find(|b| b.label == label && usage_bar_is_live(b))
+            .map(|b| match (b.used, b.total) {
+                // The account's own reported amounts outrank the derived
+                // percentage the same bar carries.
+                (Some(used), Some(total)) => format!(
+                    "{} / {}",
+                    crate::format::format_amount(used),
+                    crate::format::format_amount(total)
+                ),
+                _ => crate::format::format_pct(b.pct),
+            })
+    };
+    match (bar(crate::usage::LABEL_5H), bar(crate::usage::LABEL_7D)) {
+        (None, None) => {
+            // No label-matched live bar: the wallet row is the headroom a
+            // scalar provider (or a non-canonically-labeled one) publishes.
+            let wallet = crate::providers::funded_wallets(&stats.rows)
+                .into_iter()
+                .next()
+                .map(|w| w.value);
+            (wallet, None)
+        }
+        columns => columns,
+    }
 }
 
 /// The profile's OAuth usage windows, read fresh from the disk cache; empty
