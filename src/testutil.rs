@@ -980,9 +980,9 @@ pub(crate) fn reanchored_bars_cache_bytes(json: &str) -> Vec<u8> {
 /// own guess. A captured bar's `resets_at` is an ABSOLUTE stamp, so real time
 /// drifting past it turns a fixture meant to exercise the bars SHAPE into a
 /// lapsed-window case the liveness gate legitimately drops: every parseable
-/// bar stamp is re-anchored to keep its offset from the capture's own latest
-/// bar, so a captured cache renders its shape forever and lapsed behaviour is
-/// pinned only by the tests that mean it.
+/// bar stamp is re-stamped at now plus its own window length (see
+/// [`reanchored_bars_cache_bytes`]), so a captured cache renders its shape
+/// forever and lapsed behaviour is pinned only by the tests that mean it.
 pub(crate) fn write_captured_third_party_cache(name: &str, json: &str) {
     let bytes = reanchored_bars_cache_bytes(json);
     let parsed: crate::providers::ThirdPartyStats =

@@ -458,16 +458,21 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
 /// production paths only — the fixture is real bytes so the reader's
 /// assumptions are pinned by the wire shape, never hand-built.
 ///
-/// The bars carry `resets_at` stamps, but they are inert on this path: the
+/// The bars carry `resets_at` stamps, and they gate this path (#74 T2): the
 /// third-party rendering chain (`windows_payload` -> `third_party_headline`
-/// -> the third-party arm of `windows_prose`) never reads `resets_at`, and
-/// the only time-derived input it sees is the precomputed `stale` flag —
-/// which merely appends the suffix the contains form already tolerates — so
-/// the asserted substrings are a pure function of the stats. The countdown
-/// clause lives in `windows_prose`'s OAUTH arm only and is unreachable from
-/// a third-party row. The asserts stay contains-based on the plan label and
-/// each `label pct%` pair as belt-and-braces against any suffix the row gains
-/// later (a freshness clause, a tier), never against a countdown.
+/// -> the third-party arm of `windows_prose`) drops a bar whose reset has
+/// passed, so the asserted substrings are a pure function of the stats ONLY
+/// because the fixture is re-anchored before the write
+/// (`reanchored_bars_cache_bytes` stamps each bar at now + its own window
+/// length). A future edit to the re-anchor that let real time lapse a
+/// captured bar would drop the `label pct%` pair here — the contains asserts
+/// fail on exactly that. The precomputed `stale` flag is the only other
+/// time-derived input, and it merely appends the suffix the contains form
+/// already tolerates. The countdown clause lives in `windows_prose`'s OAUTH
+/// arm only and is unreachable from a third-party row. The asserts stay
+/// contains-based on the plan label and each `label pct%` pair as
+/// belt-and-braces against any suffix the row gains later (a freshness
+/// clause, a tier), never against a countdown.
 const CAPTURED_GLM_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"1","kind":"body"},{"label":"web-reader","value":"0","kind":"body"},{"label":"zread","value":"0","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"291.5M","kind":"body"},{"label":"GLM-5.2","value":"0","kind":"body"},{"label":"GLM-4.7","value":"174.4k","kind":"body"},{"label":"total","value":"291.3M  (2.8k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":0.0},{"label":"7d","pct":97.0,"resets_at":"2026-08-28T19:31:30+00:00"},{"label":"30d","pct":1.0,"resets_at":"2026-09-19T19:31:30+00:00","used":1.0,"total":1000.0}],"plan":"pro","best_effort":false}"#;
 
 /// The bars arm of `windows_payload` on the ROSTER's real cache reader: a z.ai
