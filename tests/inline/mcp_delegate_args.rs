@@ -678,7 +678,9 @@ fn a_background_handle_notes_where_the_result_file_will_land() {
         ..base()
     });
     assert_ne!(result.is_error, Some(true), "the handle is not an error");
-    let text = first_text(&result);
+    // The rendered path uses the platform separator; the shape under test is the
+    // jobs/results segment, so normalize before matching.
+    let text = first_text(&result).replace('\\', "/");
     assert!(
         text.contains("result will be written to ") && text.contains("jobs/results/"),
         "the handle names the result path: {text}",
@@ -710,7 +712,8 @@ fn a_background_fanout_notes_one_result_path_per_job() {
         Some(true),
         "the fan-out handle is not an error"
     );
-    let text = first_text(&result);
+    // Same normalization as the single-delegate handle test above.
+    let text = first_text(&result).replace('\\', "/");
     assert!(
         text.contains("results will be written to:"),
         "the fan-out names the result paths: {text}",
