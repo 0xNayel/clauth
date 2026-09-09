@@ -486,9 +486,10 @@ pub(crate) fn publish_status_with(
 
 /// The daemon's last `generated_at`, read off the feed this publish replaces.
 ///
-/// `None` when no feed is on disk or it does not parse: no daemon has ever
-/// published here, and the caller answers that with the epoch, which every
-/// staleness rule reads as "no daemon".
+/// `None` when no feed is on disk, it does not parse, or its `generated_at` is
+/// missing: no daemon has published a readable stamp here, and the caller
+/// answers that with the epoch, which every staleness rule reads as "no
+/// daemon".
 fn prior_generated_at() -> Option<String> {
     let Ok(dir) = clauth_dir() else { return None };
     let body = std::fs::read(dir.join(STATUS_FILE)).ok()?;
