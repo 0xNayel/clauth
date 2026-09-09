@@ -1366,8 +1366,10 @@ fn switch_installs_session_token_not_usage_oauth() {
     crate::profile::save_app_state(&config.state).expect("persist state");
     force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
 
-    crate::actions::switch_profile(&mut config, &crate::profile::ProfileName::from("b"))
-        .expect("switch to b");
+    crate::testutil::through_handle(config, |h| {
+        crate::actions::switch_profile(h, &crate::profile::ProfileName::from("b"))
+            .expect("switch to b");
+    });
 
     let live_target =
         std::fs::read_link(claude_credentials_path().expect("path")).expect("live is a symlink");
