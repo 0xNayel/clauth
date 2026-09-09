@@ -446,6 +446,42 @@ fn a_lowercase_verb_is_a_method_error_not_a_silent_match() {
     assert_eq!(control.status, 200, "the uppercase spelling still serves");
 }
 
+/// HEAD routes like GET, at the router itself.
+///
+/// The route table maps HEAD onto its GET handlers (RFC 9110 §9.3), so this
+/// seam answers a HEAD with the full GET response — status, body, and entity
+/// tag. The body is stripped one layer up, in the connection loop, by the
+/// method-level `Response::into_head` that covers the error arms too; the wire
+/// half is pinned in the http tests. Pinning here that the ROUTER answers
+/// HEAD as GET (and never 405) is what keeps the mapping from regressing.
+#[test]
+fn head_routes_like_get_at_the_router() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+
+    let resp = handle(&ctx, &req("HEAD", "/api/v1/health", Some(TOKEN), ""));
+    assert_eq!(resp.status, 200);
+
+    let status = handle(&ctx, &req("HEAD", "/api/v1/status", Some(TOKEN), ""));
+    assert_eq!(status.status, 200);
+
+    // The disabled-accounts query is a GET arm too: its HEAD keeps the ETag a
+    // conditional client re-arms from, and a matching If-None-Match answers
+    // 304 with the tag.
+    let tagged = handle(&ctx, &req("HEAD", "/api/v1/status?all=1", Some(TOKEN), ""));
+    assert_eq!(tagged.status, 200);
+    let etag = tagged
+        .etag
+        .as_deref()
+        .expect("the HEAD arm keeps the entity tag")
+        .to_string();
+    let mut conditional = req_tagged("/api/v1/status?all=1", Some(TOKEN), &etag);
+    conditional.method = "HEAD".to_string();
+    let not_modified = handle(&ctx, &conditional);
+    assert_eq!(not_modified.status, 304);
+    assert!(not_modified.etag.is_some(), "the 304 repeats the tag");
+}
+
 /// The routes live under `/api/v1`, and nothing answers beside it.
 ///
 /// Worth pinning because the prefix moved: an unversioned `/v1` was served

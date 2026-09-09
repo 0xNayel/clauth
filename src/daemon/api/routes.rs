@@ -110,7 +110,12 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request) -> Response {
     };
     match (req.method.as_str(), route) {
         ("GET", "/health") => health(),
+        ("HEAD", "/health") => health(),
         ("GET", "/status") => status(ctx, req),
+        // HEAD routes as GET (RFC 9110 §9.3: the server SHOULD respond as it
+        // would to GET, minus the content); the serve loop in `mod.rs` strips
+        // the body off whatever comes back, at every status.
+        ("HEAD", "/status") => status(ctx, req),
         ("POST", "/switch") => switch(ctx, req),
         // A known path reached with the wrong method is 405, so a client with a
         // typo'd verb gets told which half is wrong.

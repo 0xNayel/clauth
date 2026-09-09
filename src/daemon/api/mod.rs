@@ -339,7 +339,11 @@ fn serve_connection(
 
         served = served.saturating_add(1);
         let summary = http::request_summary(&request.method, &request.path);
-        let response = routes::handle(ctx, &request);
+        let response = if request.method == "HEAD" {
+            routes::handle(ctx, &request).into_head()
+        } else {
+            routes::handle(ctx, &request)
+        };
 
         // Both sides have to agree, and the budget is ours alone to enforce.
         // What is advertised is the budget genuinely left, so a client is never

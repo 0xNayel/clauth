@@ -449,6 +449,18 @@ impl Response {
             ..Self::error(401, "unauthorized")
         }
     }
+
+    /// The HEAD rendering of this answer: every header, no body. RFC 9110 ends
+    /// a HEAD response at the blank line regardless of what any header says, so
+    /// a body left on ANY answer — the error arms included — desyncs the next
+    /// response on a kept-alive connection. The connection loop applies this
+    /// to whatever the router produced, one rule for every route and status.
+    /// `Content-Length: 0` is deliberate: this server never frames a length
+    /// the client must not read.
+    pub(crate) fn into_head(mut self) -> Self {
+        self.body.clear();
+        self
+    }
 }
 
 /// What happens to the connection after this response.

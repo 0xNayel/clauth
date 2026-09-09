@@ -411,6 +411,35 @@ fn a_kept_alive_response_advertises_the_budget_it_was_given() {
     );
 }
 
+/// The HEAD rendering of ANY answer — a route's, or an error the router would
+/// produce — frames zero body bytes on a kept-alive connection. RFC 9110 ends a
+/// HEAD response at the blank line, so leftover bytes would sit between this
+/// response and the next one on the same connection: a desync a compliant
+/// client cannot recover from. The method-level `into_head` is what guarantees
+/// the error arms are covered, not just the routes that map HEAD onto GET.
+#[test]
+fn a_head_rendering_frames_no_body_on_any_answer() {
+    for resp in [
+        Response::error(404, "not_found"),
+        Response::error(405, "method_not_allowed"),
+        Response::error(500, "internal"),
+        Response::error(503, "token_tier_unknown"),
+        Response::json(200, &serde_json::json!({"ok": true})),
+    ] {
+        let head = resp.into_head();
+        assert!(head.body.is_empty());
+        let wire = render(&head, &keep_alive(60, 99));
+        assert!(
+            wire.ends_with("\r\n\r\n"),
+            "the wire is headers plus the blank line, nothing after: {wire}"
+        );
+        assert!(
+            wire.contains("Content-Length: 0\r\n"),
+            "a HEAD answer frames zero bytes, not the GET's length: {wire}"
+        );
+    }
+}
+
 /// Framing the response is what lets a client find the start of the next one on
 /// a reused connection, so the length must be exact for every shape.
 #[test]
