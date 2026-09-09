@@ -215,7 +215,7 @@ pub(crate) fn serve(
     // promotion), where the incumbent's port is free, a redundant instance
     // never reaches them, and a start that dies cannot have written
     // `auth_token.json`.
-    let (prepared, no_api) = listener_setup(listen, certs)?;
+    let (mut prepared, no_api) = listener_setup(listen, certs)?;
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
     // redundant instance must not GC the live daemon's runtime forest or walk
@@ -229,14 +229,26 @@ pub(crate) fn serve(
         StartMode::Replace => probe::claim_by_replacing(&dir)?,
         _ => claim_singleton(&dir, mode == StartMode::Standby)?,
     };
-    let _lock = match claim {
-        Claim::Active(lock) => lock,
-        Claim::Standby(slot) => stand_by(&dir, slot)?,
+    let (_lock, promoted) = match claim {
+        Claim::Active(lock) => (lock, false),
+        Claim::Standby(slot) => (stand_by(&dir, slot)?, true),
         Claim::Redundant => {
             logline!("clauth daemon: {}; exiting", redundant_reason(mode));
             return Ok(());
         }
     };
+
+    // A standby carried its pre-claim certificate through a park that is
+    // unbounded by design, so the promoted daemon re-reads it here: a renewal
+    // that landed during the park is what the listener serves, and a
+    // replacement that no longer reads fails the start fatally — the operator
+    // asked for a listener — rather than leaving a healthy-looking daemon on
+    // the stale identity. Every other start read the certificate moments ago
+    // and skips this.
+    if promoted && let Some(prepared) = prepared.as_mut() {
+        prepared.reload_certificate(certs)?;
+        logline!("clauth daemon: standby promoted; TLS certificate reloaded");
+    }
 
     log_rotate::warn_if_log_cap_defeated();
     // Tighten an existing looser tree (older builds / CLI umask left it 0o755)
@@ -252,10 +264,11 @@ pub(crate) fn serve(
 
     // After `boot` (the stores are seeded and the scheduler is up, so a request
     // arriving immediately gets real numbers) and before `run` (which never
-    // returns). The certificate was settled by `api::prepare` above the claim;
-    // the token mint and the bind happen here for the first time, on a port
-    // that is winnable exactly now: the incumbent under `--replace` is dead,
-    // and a promoted standby holds the claim it parked for.
+    // returns). The certificate was settled by `api::prepare` above the claim
+    // (a promoted standby re-read it right after its promotion); the token mint
+    // and the bind happen here for the first time, on a port that is winnable
+    // exactly now: the incumbent under `--replace` is dead, and a promoted
+    // standby holds the claim it parked for.
     if let Some(addr) = no_api {
         // Said here rather than above the claim so a redundant instance cannot
         // print it and then "already running": two lines from a process that

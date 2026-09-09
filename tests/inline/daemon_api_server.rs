@@ -1436,6 +1436,371 @@ fn a_redundant_start_leaves_a_damaged_token_file_untouched() {
     assert_eq!(health_status(&incumbent, TOKEN), 200);
 }
 
+// ── a standby's certificate across the park (#63 T19) ────────────────────────
+//
+// A standby parks with the config `prepare` built ABOVE the claim, and the
+// park is unbounded by design (the launchd/systemd pairing), so whatever the
+// certificate files become during it used to be invisible until the daemon's
+// next restart. The pins below drive the real standby arm of `serve` — an
+// incumbent holds the singleton, the contender parks, the incumbent exits —
+// with the certificate mutation landing MID-PARK, exactly where a `lego renew`
+// lands.
+
+/// Drive one `--standby` start against a test-held singleton: spawn `serve` on
+/// a thread, wait until it has parked, run `mutate` while it is parked, then
+/// release the incumbent and return `serve`'s verdict. The listen port is held
+/// by the test for the whole drive, so a start that wrongly proceeds past its
+/// certificate lands on the bind's own error instead of a live listener — the
+/// one outcome the pins must never produce.
+fn drive_parked_standby(
+    certs: crate::daemon::api::tls::CertSource,
+    mutate: impl FnOnce(),
+) -> anyhow::Result<()> {
+    let incumbent = incumbent_claim();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the held port");
+    let addr = held.local_addr().expect("held addr");
+    let parked = std::thread::spawn(move || {
+        crate::daemon::serve(crate::daemon::StartMode::Standby, Some(addr), &certs)
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !crate::daemon::probe::standby_waiting() {
+        assert!(
+            !parked.is_finished(),
+            "serve settled before parking; the certificate fixture never reached the park"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the standby never parked within 10s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    mutate();
+
+    drop(incumbent); // the incumbent exits: the parked contender promotes
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !parked.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the promoted standby did not settle within 10s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    parked
+        .join()
+        .expect("the standby serve thread must not panic")
+}
+
+/// The certificate file is deleted while the contender parks — the shape of a
+/// renewal mid-rewrite. The promotion must FAIL: `serve` returns an error
+/// naming the certificate before any listener exists and before the token
+/// mint, because a daemon that promoted anyway would look healthy while
+/// serving the stale identity to every client.
+#[test]
+fn a_promoted_standby_whose_certificate_vanished_fails_before_listening() {
+    let _home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(_home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_promoted_standby_whose_certificate_vanished_fails_before_listening: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let cert = paths.cert.clone();
+    let verdict =
+        drive_parked_standby(crate::daemon::api::tls::CertSource::Explicit(paths), || {
+            std::fs::remove_file(&cert).expect("remove the parked-away certificate")
+        });
+    let Err(err) = verdict else {
+        panic!("a promotion whose certificate replacement is unreadable must fail the start");
+    };
+    assert!(
+        format!("{err:#}").contains("failed to read the TLS certificate"),
+        "the failure must be the post-promotion reload, not the bind or anything later: {err:#}"
+    );
+    assert!(
+        !token_file().exists(),
+        "a promotion that never served must not mint a token"
+    );
+}
+
+/// A corrupted replacement (a torn write, PEM that parses to no certificate)
+/// fails the promotion exactly like a missing one: loudly, before the
+/// listener. Pre-fix this promoted silently and kept serving the stale
+/// certificate.
+#[test]
+fn a_promoted_standby_whose_certificate_corrupted_fails_before_listening() {
+    let _home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(_home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_promoted_standby_whose_certificate_corrupted_fails_before_listening: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let cert = paths.cert.clone();
+    let verdict =
+        drive_parked_standby(crate::daemon::api::tls::CertSource::Explicit(paths), || {
+            std::fs::write(&cert, "not a certificate: a torn renewal write")
+                .expect("corrupt the replacement")
+        });
+    let Err(err) = verdict else {
+        panic!("a promotion whose certificate replacement cannot be parsed must fail the start");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&format!("{SERVER_NAME}.crt")),
+        "the failure must name the file the operator has to fix: {msg}"
+    );
+    assert!(
+        !msg.contains("failed to bind"),
+        "the failure must come from the reload, not the bind — a reload after the bind would \
+         mean a listener existed: {msg}"
+    );
+    assert!(
+        !token_file().exists(),
+        "a promotion that never served must not mint a token"
+    );
+}
+
+/// The control, green before and after the fix: a plain start reads the
+/// certificate exactly once, above the claim, so whatever lands on disk AFTER
+/// `prepare` changes nothing about what it serves. What can red here is that
+/// one read's product — a config deferring any part of the identity to
+/// handshake time. `serve`'s plain arm (a won claim run through to
+/// `serve_prepared`) is not driven anywhere in this suite — every call site
+/// yields, dies pre-claim, or parks — so this seam is the plain path's only
+/// pin.
+#[test]
+fn a_plain_start_serves_exactly_the_certificate_it_read_above_the_claim() {
+    let _home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(_home.home()).expect("cert fixture dir");
+    let Some((paths, ca_crt)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_plain_start_serves_exactly_the_certificate_it_read_above_the_claim: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let ctx = ctx();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let port = addr.port();
+    let cert = paths.cert.clone();
+    let prepared = super::prepare(addr, &crate::daemon::api::tls::CertSource::Explicit(paths))
+        .expect("prepare reads the valid certificate");
+
+    // The one read has happened; whatever the files become now must not matter.
+    std::fs::write(&cert, "ruined after the one read").expect("ruin the certificate file");
+
+    let tls = std::sync::Arc::clone(&prepared.tls_config);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // Bounded for the same reason as the standby pin's worker: a leg
+            // that reddens before connecting must fail, not hang the scope.
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        serve_connection(stream, peer, &tls, &ctx, Limits::DEFAULT);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let client = client_config(&ca_crt).expect("client config");
+        let answer = round_trip(
+            port,
+            &client,
+            &format!(
+                "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .expect("the certificate read once still serves");
+        assert!(
+            answer.starts_with("HTTP/1.1 200 OK\r\n"),
+            "a plain start serves exactly what it read: {answer}"
+        );
+    });
+}
+
+/// The other control: a standby whose INITIAL certificate is unreadable still
+/// dies in the pre-claim read and never takes the standby slot — the promotion
+/// reload must not move the first read below the claim.
+#[test]
+fn a_standby_with_an_unreadable_initial_certificate_exits_before_claiming() {
+    let _home = HomeSandbox::new();
+    let incumbent = incumbent_claim();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
+    let addr = held.local_addr().expect("addr");
+
+    let Err(err) = crate::daemon::serve(
+        crate::daemon::StartMode::Standby,
+        Some(addr),
+        &unreadable_certs(_home.home()),
+    ) else {
+        panic!("an unreadable initial certificate must fail a standby start");
+    };
+    assert!(
+        format!("{err:#}").contains("failed to read the TLS certificate"),
+        "the failure must be the pre-claim read: {err:#}"
+    );
+    assert!(
+        !crate::daemon::probe::standby_waiting(),
+        "a start that died on its initial certificate must not hold the standby slot"
+    );
+    drop(incumbent);
+}
+
+/// The fix's happy half: the identity that lands during the park is what the
+/// promoted daemon serves. The renewal is a whole second identity — a new CA
+/// and a new leaf — copied over the same paths MID-PARK, so serving the
+/// pre-park config and serving the renewal differ by WHICH CA verifies the
+/// handshake. Drives the standby sequence itself at the seam —
+/// `claim_singleton` + `stand_by` for the park and promotion, then
+/// `reload_certificate`, then `serve_connection` with the config the reload
+/// left in `Prepared`. `serve`'s own standby arm is never entered here; that
+/// the arm calls this reload is witnessed by the two failure pins above,
+/// whose reds name the reload.
+#[test]
+fn a_promoted_standby_serves_the_certificate_that_landed_during_its_park() {
+    let _home = HomeSandbox::new();
+    let dir_a = tempfile::tempdir_in(_home.home()).expect("cert dir A");
+    let dir_b = tempfile::tempdir_in(_home.home()).expect("cert dir B");
+    let Some((paths_a, ca_a)) = generate_chain(dir_a.path()).expect("fixture A") else {
+        eprintln!(
+            "SKIPPED a_promoted_standby_serves_the_certificate_that_landed_during_its_park: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let Some((paths_b, ca_b)) = generate_chain(dir_b.path()).expect("fixture B") else {
+        eprintln!(
+            "SKIPPED a_promoted_standby_serves_the_certificate_that_landed_during_its_park: \
+             openssl is not usable here"
+        );
+        return;
+    };
+    let client_old = client_config(&ca_a).expect("client for the parked-away CA");
+    let ctx = ctx();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let port = addr.port();
+    // The same explicit source a `--cert`/`--key` start builds, twice: once
+    // for the pre-claim read, once for the post-promotion reload.
+    let source = || {
+        crate::daemon::api::tls::CertSource::Explicit(crate::daemon::api::tls::CertPaths {
+            cert: paths_a.cert.clone(),
+            issuer: None,
+            key: paths_a.key.clone(),
+        })
+    };
+
+    // serve's pre-claim read: the parked-away identity is valid.
+    let mut prepared =
+        super::prepare(addr, &source()).expect("prepare reads the valid parked-away certificate");
+
+    // serve's standby arm: take the slot, park, promote on the holder's exit.
+    let incumbent = incumbent_claim();
+    let dir = crate::profile::clauth_dir().expect("dir");
+    let crate::daemon::probe::Claim::Standby(slot) =
+        crate::daemon::probe::claim_singleton(&dir, true).expect("claim")
+    else {
+        panic!("the second instance takes the one standby slot");
+    };
+    let parked = {
+        let dir = dir.clone();
+        std::thread::spawn(move || crate::daemon::stand_by(&dir, slot))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !crate::daemon::probe::standby_waiting() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the standby never parked within 10s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // The renewal lands mid-park: same paths, a different CA's identity.
+    std::fs::copy(&paths_b.cert, &paths_a.cert).expect("renew the leaf");
+    std::fs::copy(&paths_b.key, &paths_a.key).expect("renew the key");
+    drop(incumbent); // the incumbent exits: promotion
+    let _promoted = parked
+        .join()
+        .expect("the stand_by thread must not panic")
+        .expect("the standby promotes once the holder exits");
+
+    // serve's post-promotion reload, then the config it would serve.
+    prepared
+        .reload_certificate(&source())
+        .expect("the renewed certificate reloads");
+
+    let renewed_tls = std::sync::Arc::clone(&prepared.tls_config);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // Two connections: the renewed client, then the stale one. Bounded,
+            // because on a reddening leg the second connection never happens
+            // and a blocking accept would hold the scope — and the verdict —
+            // hostage past the assertion that already failed.
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut served = 0;
+            while served < 2 && std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        stream.set_nonblocking(false).expect("blocking stream");
+                        serve_connection(stream, peer, &renewed_tls, &ctx, Limits::DEFAULT);
+                        served += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let renewed_client = client_config(&ca_b).expect("client for the renewed CA");
+        let answer = round_trip(
+            port,
+            &renewed_client,
+            &format!(
+                "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .expect("a handshake against the renewed identity");
+        assert!(
+            answer.starts_with("HTTP/1.1 200 OK\r\n"),
+            "the promoted daemon must serve under the renewed identity: {answer}"
+        );
+
+        // The stale identity must be gone from the listener: a client trusting
+        // only the pre-park CA cannot even complete the handshake.
+        let mut stale = Session::connect(port, &client_old).expect("tcp connect");
+        assert!(
+            stale
+                .send("GET /api/v1/health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .is_err(),
+            "the parked-away identity must not verify against the renewed listener"
+        );
+    });
+}
+
 /// The control, green both before and after the mint moves: a HEALTHY token is
 /// never rewritten by any start, because reading a valid token never writes.
 /// If this reddens, the mint stopped reading before writing.

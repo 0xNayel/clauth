@@ -158,9 +158,9 @@ fn claim_slot() -> Option<ConnectionSlot> {
 /// `wiki/Daemon.md` recommends `clauth daemon --replace --listen` as the
 /// post-`lego renew` hook, which makes the documented automation the trigger.
 /// Settled first, a bad renewal is a no-op: the incumbent keeps running.
-/// The cost of reading this early is a `--standby` instance's park: it carries
-/// the config built here through an unbounded wait, so a renewal that lands
-/// while it parks reaches the promoted daemon only at its next restart.
+/// The `--standby` park this config can be carried through is unbounded, so
+/// `daemon::serve` re-reads the certificate after a promotion
+/// ([`Prepared::reload_certificate`]) rather than serving what was built here.
 ///
 /// The token is NOT minted here: minting above the singleton claim let a
 /// contender replace a damaged `auth_token.json` before it knew whether it may
@@ -170,6 +170,23 @@ fn claim_slot() -> Option<ConnectionSlot> {
 pub(crate) struct Prepared {
     listen: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
+}
+
+impl Prepared {
+    /// Re-read the certificate into this listener's config, through the same
+    /// builder [`prepare`] used. `daemon::serve` calls this right after a
+    /// standby's promotion: the park it returns from is unbounded, and without
+    /// the re-read a renewal landing during it would be served only at the
+    /// daemon's next restart. An unreadable replacement is fatal on purpose,
+    /// exactly like every failure in [`serve_prepared`]: the operator asked for
+    /// a listener, and silently keeping the stale identity would look healthy
+    /// while every client's trust in it expired. Nothing else calls this — a
+    /// start that did not park read the certificate moments before serving.
+    pub(crate) fn reload_certificate(&mut self, certs: &tls::CertSource) -> Result<()> {
+        self.tls_config = tls::server_config(certs)
+            .context("failed to reload the TLS certificate after the standby promotion")?;
+        Ok(())
+    }
 }
 
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
