@@ -75,7 +75,7 @@ clauth list           # account table with cached usage, no network
 | `clauth sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
 | `clauth resume <id\|latest>` | `--profile <name>` | resume a session under a chosen account |
 | `clauth info <id\|latest>` | | print a session's resume command, workspace, and storage path |
-| `clauth daemon` | `--status`, `--standby`, `--replace`, `--no-standby`, `--listen`, `--cert`, `--key`, `--print-token`, `--rotate-token` | run the refresh + auto-switch loop with no TUI |
+| `clauth daemon` | `--status`, `--standby`, `--replace`, `--no-standby`, `--listen [ADDR:PORT]`, `--cert <path>`, `--key <path>`, `--print-token`, `--rotate-token` | run the refresh + auto-switch loop with no TUI |
 | `clauth status --json` | `--all`, `--disabled` | print the daemon's status shape once, from disk |
 | `clauth mcp` | | stdio MCP server; Claude Code launches this, not you |
 | `clauth completions <bash\|zsh\|fish\|install> [shell]` | | print or install a completion script |
