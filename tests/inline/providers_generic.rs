@@ -67,6 +67,76 @@ fn scan_scalar_balance_shape_yields_rows_not_bars() {
 }
 
 #[test]
+fn scan_cc_mirror_remaining_fraction_window_yields_one_bar() {
+    // Real shunt `GET /usage` shape: Anthropic-mirror pool windows as
+    // remaining FRACTIONS (0.93 left = 7% used), null for pools not in play.
+    let body = r#"{"pool":{"status":"ok","windows":{
+        "5h":{"remaining":null,"resets_at":null},
+        "7d":{"remaining":0.93,"resets_at":1789476836},
+        "fable":{"remaining":null,"resets_at":null}}}}"#;
+    let value: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert!(!is_error_envelope(&value));
+
+    let (plan, bars, rows) = scan(&value);
+    assert_eq!(bars.len(), 1, "null windows and the 7d bar only: {bars:?}");
+    // Parent map key, verbatim: overview_windows, roster_rank and
+    // window_duration_secs all match the literal `7d`.
+    assert_eq!(bars[0].label, "7d");
+    // (1.0 - 0.93) is not exact in f64.
+    assert!((bars[0].pct - 7.0).abs() < 1e-6, "pct was {}", bars[0].pct);
+    // 1789476836 is epoch SECONDS: the 10^12 ms-heuristic must pick seconds.
+    assert_eq!(
+        bars[0].resets_at.as_deref(),
+        Some(crate::usage::epoch_secs_to_iso(1789476836).as_str())
+    );
+    assert!(bars[0].used.is_none() && bars[0].total.is_none());
+    assert!(rows.is_empty(), "a bar formed → no scalar rows");
+    assert!(plan.is_none());
+}
+
+#[test]
+fn a_remaining_fraction_with_no_reset_sibling_is_not_a_window() {
+    // A balance-looking object (`remaining` 0..=1, no reset) must not become a
+    // window bar — the reset sibling is the discriminator.
+    let value: serde_json::Value = serde_json::from_str(r#"{"data":{"remaining":0.5}}"#).unwrap();
+    let (plan, bars, rows) = scan(&value);
+    assert!(bars.is_empty(), "no reset sibling → no bar: {bars:?}");
+    assert!(plan.is_none());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "remaining");
+    assert_eq!(rows[0].value, "0.50");
+}
+
+#[test]
+fn a_remaining_above_one_is_not_a_window() {
+    // z.ai carries `remaining` as an absolute TOKEN COUNT; only a fraction in
+    // 0..=1 is a window. Here without a percentage key, so the remaining arm
+    // is the one being guarded.
+    let value: serde_json::Value =
+        serde_json::from_str(r#"{"data":{"remaining":1000,"resets_at":1789476836}}"#).unwrap();
+    let (plan, bars, rows) = scan(&value);
+    assert!(bars.is_empty(), "remaining above 1 → no bar: {bars:?}");
+    assert!(plan.is_none());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value, "1000");
+}
+
+#[test]
+fn a_percentage_key_beats_the_remaining_fraction() {
+    // No double-bar when a CC-mirror object carries both shapes: the
+    // percentage key wins, the remaining arm fires only without one.
+    let body = r#"{"pool":{"windows":{"7d":{
+        "percentage":42,"remaining":0.93,"resets_at":1789476836}}}}"#;
+    let value: serde_json::Value = serde_json::from_str(body).unwrap();
+    let (plan, bars, rows) = scan(&value);
+    assert_eq!(bars.len(), 1);
+    assert!((bars[0].pct - 42.0).abs() < 1e-6, "pct was {}", bars[0].pct);
+    assert_eq!(bars[0].label, "usage");
+    assert!(rows.is_empty());
+    assert!(plan.is_none());
+}
+
+#[test]
 fn humanize_label_handles_cases() {
     assert_eq!(humanize_label("TIME_LIMIT"), "time limit");
     assert_eq!(humanize_label("modelCode"), "model code");
