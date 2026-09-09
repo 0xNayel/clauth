@@ -148,25 +148,10 @@ fn claim_slot() -> Option<ConnectionSlot> {
     None
 }
 
-/// The listener's TLS identity, read before anything is at stake.
-///
-/// Split from [`serve_prepared`] so `daemon::serve` can settle the certificate
-/// BEFORE claiming the singleton. Under `--replace` the claim terminates the
-/// running daemon, so a certificate that had just been renewed badly used to
-/// take the incumbent down and then abort — leaving the host with no daemon at
-/// all, and with it no refresh and no auto-switch, not merely no listener.
-/// `wiki/Daemon.md` recommends `clauth daemon --replace --listen` as the
-/// post-`lego renew` hook, which makes the documented automation the trigger.
-/// Settled first, a bad renewal is a no-op: the incumbent keeps running.
-/// The `--standby` park this config can be carried through is unbounded, so
-/// `daemon::serve` re-reads the certificate after a promotion
-/// ([`Prepared::reload_certificate`]) rather than serving what was built here.
-///
-/// The token is NOT minted here: minting above the singleton claim let a
-/// contender replace a damaged `auth_token.json` before it knew whether it may
-/// serve — a start that then died on this certificate, or yielded as redundant,
-/// had already revoked every client of the running daemon. [`serve_prepared`]
-/// mints, below the claim and below a standby's promotion.
+/// The listener's TLS identity and bind address, read by [`prepare`] above the
+/// singleton claim and consumed by [`serve_prepared`] below it — a standby
+/// carries one through its park. The certificate is re-read after a promotion
+/// ([`Prepared::reload_certificate`]), since the park is unbounded.
 pub(crate) struct Prepared {
     listen: SocketAddr,
     tls_config: Arc<rustls::ServerConfig>,
@@ -189,6 +174,26 @@ impl Prepared {
     }
 }
 
+/// Read the TLS identity and hold it for [`serve_prepared`], which binds and
+/// serves below the singleton claim.
+///
+/// Split from [`serve_prepared`] so `daemon::serve` can settle the certificate
+/// BEFORE claiming the singleton. Under `--replace` the claim terminates the
+/// running daemon, so a certificate that had just been renewed badly used to
+/// take the incumbent down and then abort — leaving the host with no daemon at
+/// all, and with it no refresh and no auto-switch, not merely no listener.
+/// `wiki/Daemon.md` recommends `clauth daemon --replace --listen` as the
+/// post-`lego renew` hook, which makes the documented automation the trigger.
+/// Settled first, a bad renewal is a no-op: the incumbent keeps running.
+/// The `--standby` park the result can be carried through is unbounded, so
+/// `daemon::serve` re-reads the certificate after a promotion
+/// ([`Prepared::reload_certificate`]) rather than serving what was built here.
+///
+/// The token is NOT minted here: minting above the singleton claim let a
+/// contender replace a damaged `auth_token.json` before it knew whether it may
+/// serve — a start that then died on this certificate, or yielded as redundant,
+/// had already revoked every client of the running daemon. [`serve_prepared`]
+/// mints, below the claim and below a standby's promotion.
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
     let tls_config = tls::server_config(certs)?;
     Ok(Prepared { listen, tls_config })

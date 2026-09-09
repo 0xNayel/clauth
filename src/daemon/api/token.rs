@@ -30,10 +30,10 @@ const TOKEN_LEN: usize = 64;
 const SCHEMA: u64 = 1;
 
 /// What this build's token is allowed to do: everything the API exposes — the
-/// feed, the switch, and the mirror.
+/// feed and the switch.
 ///
 /// The one value there is, and written now on purpose. A later build that wants
-/// a read-only token for a wall display, or a mirror-only one for a replica,
+/// a read-only token for a wall display
 /// then adds a value to a field every deployed file already carries, instead of
 /// bumping the schema and migrating them. Costing one line today buys that.
 const CONTROL_TIER: &str = "control";
@@ -59,7 +59,8 @@ impl std::fmt::Display for UnknownTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} carries tier {:?}, which this build does not know. \
+            "{} carries tier {:?}, which this build does not know \
+             (it serves only {CONTROL_TIER:?}). \
              Run the clauth that wrote it, or delete the file to mint a fresh control token",
             self.path.display(),
             self.tier
@@ -248,9 +249,8 @@ pub(crate) fn fail_next_home_once() {
 /// was no single command that rotated and restarted.
 ///
 /// Read per request rather than cached behind an mtime check. The whole traffic
-/// is a tray polling every 30s and a replica renewing a held request every 50s,
-/// so one ~100-byte read and a SHA-256 per request is not a cost worth a cache,
-/// a mutex, and a lock rank to avoid.
+/// is a tray polling every 30s, so one ~100-byte read and a SHA-256 per request
+/// is not a cost worth a cache, a mutex, and a lock rank to avoid.
 ///
 /// An unreadable or malformed file keeps `spawned` rather than locking every
 /// client out: that is a broken deployment, and refusing everyone is strictly

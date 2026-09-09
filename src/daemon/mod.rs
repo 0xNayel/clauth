@@ -503,9 +503,9 @@ fn prior_generated_at() -> Option<String> {
 /// Rewrite `status.json` from `config`, unconditionally.
 ///
 /// [`publish_status`]'s core, split out for the one caller that must NOT defer
-/// to a running daemon: the daemon's own `POST /v1/switch`. There the daemon IS
+/// to a running daemon: the daemon's own `POST /api/v1/switch`. There the daemon IS
 /// the process that just switched, so there is no other owner to wait for, and
-/// a client blocked on `GET /v1/status?wait=` is holding a connection open
+/// a client blocked on `GET /api/v1/status?wait=` is holding a connection open
 /// precisely to be told the moment this file names the new account. Leaving it
 /// to the next scheduler tick adds up to a second of nothing happening to every
 /// switch made through the API.
@@ -633,9 +633,6 @@ fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
     crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
-/// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
-/// state. Only the main thread touches `self`; the scheduler holds `Arc` clones
-/// of the individual stores.
 /// The live scheduler stores a published feed's [`LiveSignals`] are built from.
 ///
 /// Bundled so that anything publishing the feed takes the SAME snapshot the
@@ -763,6 +760,9 @@ impl LiveSnapshot {
     }
 }
 
+/// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
+/// state. Only the main thread touches `self`; the scheduler holds `Arc` clones
+/// of the individual stores.
 struct Daemon {
     config: ConfigHandle,
     usage_tokens: TokenList,
@@ -1004,15 +1004,6 @@ impl Daemon {
         }
     }
 
-    /// Snapshot the live freshness/countdown stores — each snapshot's lock is
-    /// fully released at the end of its own statement, so none is ever held
-    /// when the `config` lock below is taken — then build and atomically
-    /// write `status.json`.
-    ///
-    /// The config is snapshotted too: [`build_status`] stats and reads each
-    /// profile's cache files and sweeps the session flocks, and holding CONFIG
-    /// across that disk work every tick stalls every other config user (a switch,
-    /// a TUI edit) behind it. The clone is a handful of small strings.
     /// The live stores, bundled for anything that publishes the feed — the tick
     /// below and the REST API's rebuild alike, so the two cannot disagree.
     fn live_stores(&self) -> LiveStores {
@@ -1027,11 +1018,17 @@ impl Daemon {
         }
     }
 
+    /// Snapshot the live freshness/countdown stores — each snapshot's lock is
+    /// fully released at the end of its own statement, so none is ever held
+    /// when the `config` lock below is taken — then build and atomically
+    /// write `status.json`.
+    ///
+    /// The config is snapshotted too: [`build_status`] stats and reads each
+    /// profile's cache files and sweeps the session flocks, and holding CONFIG
+    /// across that disk work every tick stalls every other config user (a switch,
+    /// a TUI edit) behind it. The clone is a handful of small strings.
     fn write_status(&self) {
         let interval = self.refresh_interval.load(Ordering::Relaxed);
-        // Every live store, each lock released at the end of its own statement,
-        // so none is held when the `config` lock below is taken. Shared with the
-        // REST API's rebuild so the two publishers cannot diverge.
         let snapshot = self.live_stores().snapshot();
         let live = snapshot.signals();
         let cfg_snap = {

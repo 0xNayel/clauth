@@ -265,8 +265,7 @@ fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Respon
 /// long poll and a one-second one: the main loop rewrites the feed every tick,
 /// and on a quiet system that stamp is the ONLY field that moves. Digesting it
 /// would wake every waiting reader once a second to hand them a body identical
-/// in every respect they care about. `MirrorBody::etag` leaves its own timestamp
-/// out for the same reason.
+/// in every respect they care about.
 ///
 /// A body that will not parse is digested whole. That is the safe direction: a
 /// tag that changes too often costs a wakeup, while one that changes too rarely

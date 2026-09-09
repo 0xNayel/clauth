@@ -68,9 +68,10 @@ clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
 # claude-only host clauth is; the embedded tree is the committed `plugins/` dir.
 agentgear = "0.1.3"
 
-# `clauth daemon --listen` (the TLS REST API). Every crate below is ALREADY in
-# the tree via ureq; these lines only promote them to direct deps, so the
-# listener costs no new download and nothing new for cargo-deny to vet.
+# `clauth daemon --listen` (the TLS REST API). Every crate below already sits
+# in the lock graph via ureq, and all but `hex` are already compiled in the
+# tree; these lines only promote them to direct deps, so the listener costs no
+# new download and nothing new for cargo-deny to vet.
 #
 # `default-features = false` is load-bearing: rustls' defaults select the
 # aws-lc-rs provider, which would add a second crypto backend, a C toolchain to
@@ -95,7 +96,6 @@ hex = "0.4"
 # plugin.json` and CARGO_PKG_VERSION disagree (CC caches on that version).
 agentgear = "0.1.3"
 
-
 [dev-dependencies]
 # `test-util` alone, for `Builder::start_paused`. The blocking `delegate`'s
 # progress ticker sleeps on the real 2 s heartbeat throttle, so pinning its
@@ -104,7 +104,6 @@ agentgear = "0.1.3"
 # exact and instant. No new crate — tokio is already a dependency above — and
 # resolver 3 keeps a dev-dependency's features out of the normal build.
 tokio = { version = "1.53.1", features = ["test-util"] }
-
 
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.

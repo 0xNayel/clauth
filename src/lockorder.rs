@@ -18,7 +18,9 @@
 //! imposes nothing. The order below is the transitive closure of every nested
 //! holding in the codebase:
 //!
-//! - `RotationGuard` is held across the OAuth HTTP round trip — outermost.
+//! - `ApiSwitch` wraps a whole REST switch — feed, refresh, state flock — so it
+//!   enters `ensure_installable` and everything below it: outermost.
+//! - `RotationGuard` is held across the OAuth HTTP round trip.
 //! - `partition_due`: `last_fetched` → `activity`.
 //! - `apply_usage`: `usage_store` → `usage_status` → `config`.
 //! - rotation/save sites: `config` → state flock → `activity`.
@@ -148,7 +150,6 @@ pub(crate) mod rank {
         ThirdPartyStatus = 280;
         UsageStore = 300;
         UsageStatus = 350;
-
         Config = 400;
         /// `/profile` re-fetch TTL clock in `usage::fetch` (in-memory memo +
         /// durable stamp). A true leaf: every acquisition is take-read/insert-
