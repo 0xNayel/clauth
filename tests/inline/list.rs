@@ -27,8 +27,11 @@ fn oauth(name: &str) -> Profile {
 
 /// Warm `name`'s OAuth usage cache: a `Max 5x` plan and fixed 5h/7d utilization
 /// so the rounding and the plan label are pinned, not incidental.
+/// A cache a live fetch just wrote. Stamped, because an undated body is the
+/// one shape the age contract reads as stale, and these rows pin the healthy
+/// table.
 fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
-    warm_usage_at(name, five_h, seven_d, None);
+    warm_usage_at(name, five_h, seven_d, Some(crate::usage::now_ms()));
 }
 
 fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>) {

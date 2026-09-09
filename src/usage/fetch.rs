@@ -465,12 +465,13 @@ pub(crate) struct UsageInfo {
     /// those lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) open_at: Option<i64>,
-    /// Epoch-ms of the fetch that produced this body — the age clock the
-    /// `status.json` and TUI staleness arms key on (the MCP roster's
-    /// `ProfileWindows::stale` deliberately stays mtime-based). Stamped only on
-    /// live fetch outcomes, so a plan-only cache re-write advances no age;
-    /// `None` = undated (a plan-only cold fill, or a cache written before this
-    /// field existed).
+    /// Epoch-ms of the fetch that produced this body — the age clock EVERY
+    /// OAuth surface keys on, through the one contract in
+    /// [`crate::profile_json::oauth_age`]: `status.json`, the TUI stale cue and
+    /// the MCP payloads alike. Stamped only on live fetch outcomes, so a
+    /// plan-only cache re-write advances no age; `None` = undated (a plan-only
+    /// cold fill, or a cache written before this field existed), which reads
+    /// STALE with no age published rather than fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) fetched_at: Option<u64>,
 }

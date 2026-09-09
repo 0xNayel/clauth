@@ -811,6 +811,41 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         "the age arm is additive — no bump of its own"
     );
 
+    // A body this feed cannot date publishes `stale` and NO `fetched_at`: the
+    // figures stay visible, and nothing claims to date them. Both undatable
+    // shapes take the arm, and the file's mtime stays at now throughout, so a
+    // regression back to mtime would read every case as fresh.
+    for (case, fetched_at) in [
+        ("no stamp", None),
+        ("future stamp", Some(crate::usage::now_ms() + 3_600_000)),
+    ] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: 42.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                fetched_at,
+                ..Default::default()
+            },
+        );
+        let v = build_status(&config, 90_000, None, false);
+        let row = v["profiles"].as_array().unwrap()[0].clone();
+        assert_eq!(row["stale"], true, "{case}: an undatable body reads stale");
+        assert_eq!(
+            row["fetched_at"],
+            serde_json::Value::Null,
+            "{case}: the feed publishes no stamp it does not trust",
+        );
+        assert_eq!(
+            row["windows"].as_array().map(Vec::len),
+            Some(1),
+            "{case}: the figure it dates stays visible",
+        );
+    }
+
     // A live-maxed window under the spent-accounts opt-out is exempt from the
     // age arm: its figure cannot change by polling, so age distrusts nothing.
     config.state.refresh_spent_accounts = false;

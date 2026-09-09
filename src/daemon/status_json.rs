@@ -19,7 +19,8 @@ use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
 use crate::profile_json::{
-    Window, provider_label, published_windows, stale_after_ms, tier_label, usage_cache_file,
+    OauthAge, Window, oauth_age, provider_label, published_windows, publishes_a_live_window,
+    stale_after_ms, tier_label, usage_cache_file,
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
@@ -386,19 +387,34 @@ pub(crate) fn build_profile_entries(
             //   live-maxed exemption below is inherited via `spent_skipped`:
             //   a window pinned at the API's 100% cap cannot change by
             //   polling, so age distrusts nothing about it.
-            // OAuth dates off the `fetched_at` the live fetch stamped; the
-            // third-party leg still dates off its cache mtime (its only writer
-            // is a fetch outcome). An undated OAuth body reads as not stale —
-            // the same honest-undated semantics `cache_age_secs` gives a future
-            // mtime stamp.
-            let age_source_ms: Option<u64> = if p.usage_cache_is_third_party() {
-                mtime_ms
+            // OAuth goes through the one age contract (`oauth_age`), so this
+            // feed, the TUI cue and the MCP payloads cannot answer differently
+            // about the same file; the third-party leg still dates off its cache
+            // mtime, its only writer being a fetch outcome. An OAuth body with
+            // no stamp or a future one is stale with no age published: its
+            // figures stay visible, and nothing claims to date them.
+            let (age_source_ms, past_threshold) = if p.usage_cache_is_third_party() {
+                (
+                    mtime_ms,
+                    mtime_ms.is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms)),
+                )
             } else {
-                oauth_usage.as_ref().and_then(|u| u.fetched_at)
+                let age = oauth_age(oauth_usage.as_ref(), now);
+                // The stamp publishes only when this feed trusts it: an undated
+                // or future-stamped body carries `stale` with no `fetched_at`.
+                let at = match age {
+                    OauthAge::Dated(_) => oauth_usage.as_ref().and_then(|u| u.fetched_at),
+                    OauthAge::Absent | OauthAge::Undated => None,
+                };
+                (
+                    at,
+                    age.is_stale(
+                        stale_after_ms(interval_ms),
+                        oauth_usage.as_ref().is_some_and(publishes_a_live_window),
+                    ),
+                )
             };
-            let age_stale = !spent_skipped
-                && age_source_ms
-                    .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms));
+            let age_stale = !spent_skipped && past_threshold;
             let stale = match live {
                 Some(sig) => sig.status.get(name.as_str()).copied().is_some_and(|s| {
                     is_stuck_rate_limited(s, sig.streaks.get(name.as_str()).copied().unwrap_or(0))

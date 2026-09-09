@@ -2976,29 +2976,26 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
 #[test]
 fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
     let _home = HomeSandbox::new();
-    let usage = UsageInfo {
-        five_hour: Some(crate::usage::UsageWindow {
-            utilization: 12.0,
-            resets_at: None,
-        }),
-        ..Default::default()
-    };
-    let cache_path = crate::profile_cache::profile_cache_path(
-        &crate::profile::ProfileName::from("work"),
-        USAGE_CACHE_FILE,
-    )
-    .expect("cache path");
-
     crate::testutil::register_names(&["work"]);
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from("work"),
-        USAGE_CACHE_FILE,
-        &usage,
-    );
-    crate::testutil::set_mtime(
-        &cache_path,
-        std::time::SystemTime::now() - Duration::from_secs(240),
-    );
+    // The age rides the BODY's fetch stamp, so the fixture ages the stamp. The
+    // file's mtime is deliberately left at now: a surface reading it would date
+    // both legs of this test `just now`.
+    let seed = |secs_ago: u64| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: 12.0,
+                    resets_at: None,
+                }),
+                fetched_at: Some(crate::usage::now_ms() - secs_ago * 1000),
+                ..Default::default()
+            },
+        );
+    };
+
+    seed(240);
     let fresh = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
@@ -3015,10 +3012,7 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
     // Past the longest gap a live scheduler can leave (interval ceiling plus the
     // widen-only backoff ceiling, doubled for the fetch's own latency), so
     // nothing is maintaining this figure — and it still carries its number.
-    crate::testutil::set_mtime(
-        &cache_path,
-        std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60),
-    );
+    seed(3 * 60 * 60);
     let stale = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),

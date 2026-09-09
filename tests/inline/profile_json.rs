@@ -31,15 +31,22 @@ fn seed_provider_cache(name: &str, age: Duration) {
     set_mtime(&path, SystemTime::now() - age);
 }
 
-/// Write an OAuth usage cache for `name` and backdate it by `age`.
+/// Write an OAuth usage cache for `name` and backdate it by `age`. Both clocks
+/// move together: a live fetch stamps the BODY, and the file's mtime follows it.
+/// A test that needs them to disagree moves one afterwards.
 fn seed_usage_cache(name: &str, usage: &UsageInfo, age: Duration) {
     // The cache write is gated on the on-disk record; seeding this cache is the
     // helper's whole job, and the mtime below panics over a skipped write.
     crate::testutil::register_names(&[name]);
+    let mut usage = usage.clone();
+    usage.fetched_at = Some(
+        crate::usage::now_ms()
+            .saturating_sub(u64::try_from(age.as_millis()).expect("fixture ages fit in u64")),
+    );
     write_profile_cache(
         &crate::profile::ProfileName::from(name),
         USAGE_CACHE_FILE,
-        usage,
+        &usage,
     );
     let path =
         profile_cache_path(&crate::profile::ProfileName::from(name), USAGE_CACHE_FILE).unwrap();
@@ -64,13 +71,13 @@ fn profile_windows_reads_an_oauth_accounts_own_cache() {
     seed_usage_cache("kerry", &five_hour_at(12.0), Duration::from_secs(100));
 
     match profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry"))) {
-        ProfileWindows::Oauth { usage, age_secs } => {
+        ProfileWindows::Oauth { usage, age } => {
             assert_eq!(
                 usage.and_then(|u| u.five_hour).map(|w| w.utilization),
                 Some(12.0),
             );
-            let age = age_secs.expect("a cache on disk has an age");
-            assert!((90..=200).contains(&age), "age off its own file: {age}s");
+            let secs = age.secs().expect("a stamped cache has an age");
+            assert!((90..=200).contains(&secs), "age off its own body: {secs}s");
         }
         ProfileWindows::ThirdParty { .. } => panic!("an OAuth account has OAuth windows"),
     }
@@ -186,35 +193,149 @@ fn stale_after_ms_floors_at_the_degraded_ceiling_and_scales_with_interval() {
     assert!(stale_after_ms(ceiling) < stale_after_ms(3_600_000));
 }
 
-/// A cache stamp in the FUTURE is a clock that moved, not a fresh read. A
-/// saturating subtraction renders it as `cached just now` with `stale` false —
-/// maximum confidence for the one stamp that proves the age cannot be trusted.
+/// An OAuth body clauth cannot date reads STALE with no age published. Both
+/// undatable shapes take that arm: a stamp in the FUTURE, which proves the clock
+/// moved rather than that the read is fresh, and a missing stamp, which is what
+/// a plan-only cold fill and every pre-`fetched_at` cache carry. Publishing an
+/// age would be maximum confidence in the one figure nothing can date.
 #[test]
-fn a_future_cache_stamp_carries_no_age_at_all() {
+fn an_undatable_oauth_body_reads_stale_with_no_age() {
     let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("kerry");
     crate::testutil::register_names(&["kerry"]);
-    write_profile_cache(
-        &crate::profile::ProfileName::from("kerry"),
-        USAGE_CACHE_FILE,
-        &five_hour_at(12.0),
-    );
-    let path = profile_cache_path(
-        &crate::profile::ProfileName::from("kerry"),
-        USAGE_CACHE_FILE,
-    )
-    .unwrap();
-    set_mtime(&path, SystemTime::now() + Duration::from_secs(3600));
 
-    let windows = profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry")));
-    assert_eq!(
-        windows.age_secs(),
-        None,
-        "clauth cannot date this figure, and says so by dating it not at all",
+    for (case, fetched_at) in [
+        ("future stamp", Some(crate::usage::now_ms() + 3_600_000)),
+        ("no stamp at all", None),
+    ] {
+        let mut usage = five_hour_at(12.0);
+        usage.fetched_at = fetched_at;
+        write_profile_cache(&name, USAGE_CACHE_FILE, &usage);
+
+        let windows = profile_windows(&blank_profile(&name));
+        assert_eq!(
+            windows.age_secs(),
+            None,
+            "{case}: clauth cannot date this figure, and says so by dating it not at all",
+        );
+        assert!(windows.stale(), "{case}: an undatable figure reads stale");
+        match windows {
+            ProfileWindows::Oauth { usage, .. } => assert_eq!(
+                usage.and_then(|u| u.five_hour).map(|w| w.utilization),
+                Some(12.0),
+                "{case}: the figures stay visible",
+            ),
+            ProfileWindows::ThirdParty { .. } => panic!("{case}: an OAuth account"),
+        }
+    }
+}
+
+/// A staleness verdict qualifies a FIGURE. A body carrying only a plan has no
+/// window to qualify, so it never reads stale however undatable it is: the
+/// marker beside a dash would tell a reader that a number which does not exist
+/// is old. Owner ruling 2026-09-09.
+#[test]
+fn a_body_with_no_window_is_never_stale() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("dead");
+    crate::testutil::register_names(&["dead"]);
+
+    let plan_only = UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    };
+    for (case, fetched_at) in [
+        ("undated", None),
+        ("dated far past the threshold", Some(1_000_u64)),
+    ] {
+        let mut usage = plan_only.clone();
+        usage.fetched_at = fetched_at;
+        write_profile_cache(&name, USAGE_CACHE_FILE, &usage);
+        assert!(
+            !profile_windows(&blank_profile(&name)).stale(),
+            "{case}: no figure, so nothing to discount",
+        );
+    }
+
+    // Control: the same body carrying one window takes the verdict.
+    let mut with_window = five_hour_at(12.0);
+    with_window.fetched_at = None;
+    write_profile_cache(&name, USAGE_CACHE_FILE, &with_window);
+    assert!(
+        profile_windows(&blank_profile(&name)).stale(),
+        "one window is enough to qualify, and an undated one is stale",
     );
+}
+
+/// Every surface filters its rows through `window_row_is_live`, so a body whose
+/// windows have ALL lapsed renders dashes exactly like one carrying none. The
+/// verdict follows the figure a reader can see, not the field behind it.
+#[test]
+fn a_body_whose_windows_all_lapsed_is_never_stale() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("lapsed");
+    crate::testutil::register_names(&["lapsed"]);
+
+    let at = |offset: i64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + offset,
+            )),
+        }),
+        // Undated, so only the window's liveness can decide the verdict.
+        ..Default::default()
+    };
+
+    write_profile_cache(&name, USAGE_CACHE_FILE, &at(-3600));
+    let windows = profile_windows(&blank_profile(&name));
     assert!(
         !windows.stale(),
-        "an undatable figure is not a stale verdict"
+        "the only row it could mark was dropped for having lapsed",
     );
+    match &windows {
+        ProfileWindows::Oauth { usage, .. } => assert!(
+            crate::profile_json::oauth_windows(usage.as_deref().expect("a cache")).is_empty(),
+            "fixture control: the surfaces really do publish no row here",
+        ),
+        ProfileWindows::ThirdParty { .. } => panic!("an OAuth account"),
+    }
+
+    // Control: the same undated body with a LIVE window takes the verdict.
+    write_profile_cache(&name, USAGE_CACHE_FILE, &at(3600));
+    assert!(
+        profile_windows(&blank_profile(&name)).stale(),
+        "a live window is one a reader acts on, and an undated one is stale",
+    );
+}
+
+/// The age rides in the BODY, so a cache rewrite that produced no new reading
+/// cannot re-age any surface. A plan-only refresh rewrites the file (moving its
+/// mtime to now) while leaving `fetched_at` on the fetch that last read the
+/// account, which is why every surface dates off the body.
+#[test]
+fn a_plan_only_rewrite_does_not_refresh_the_oauth_age() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("kerry");
+    seed_usage_cache("kerry", &five_hour_at(12.0), Duration::from_secs(9_000));
+
+    // What a plan-only rewrite does: the file is written again, now-stamped,
+    // and the body's own fetch stamp is untouched.
+    set_mtime(
+        &profile_cache_path(&name, USAGE_CACHE_FILE).unwrap(),
+        SystemTime::now(),
+    );
+
+    let windows = profile_windows(&blank_profile(&name));
+    let age = windows.age_secs().expect("the body still dates itself");
+    assert!(
+        (8_900..=9_100).contains(&age),
+        "the age follows the fetch, not the file: {age}s"
+    );
+    assert!(windows.stale(), "9000s is past the MCP staleness threshold");
 }
 
 /// `tier_label` feeds the MCP `profiles` rows (roster and session scope), and

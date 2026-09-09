@@ -2417,8 +2417,9 @@ impl App {
                 // because the two can diverge on a spent account the
                 // scheduler dropped from its due set: reading the store there
                 // would publish the exact disagreement the exemption exists
-                // to prevent. OAuth dates off the body's `fetched_at`;
-                // third-party figures keep the cache mtime.
+                // to prevent. OAuth goes through the one age contract
+                // (`oauth_age`), the same one `status.json` and the MCP payloads
+                // read; third-party figures keep the cache mtime.
                 let oauth_usage = if p.usage_cache_is_third_party() {
                     None
                 } else {
@@ -2428,14 +2429,18 @@ impl App {
                     && oauth_usage
                         .as_ref()
                         .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
-                let age_source_ms: Option<u64> = if p.usage_cache_is_third_party() {
+                let past_threshold = if p.usage_cache_is_third_party() {
                     profile_cache_mtime_ms(&p.name, usage_cache_file(p))
+                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
                 } else {
-                    oauth_usage.as_ref().and_then(|u| u.fetched_at)
+                    crate::profile_json::oauth_age(oauth_usage.as_ref(), now).is_stale(
+                        stale_after_ms(interval_ms),
+                        oauth_usage
+                            .as_ref()
+                            .is_some_and(crate::profile_json::publishes_a_live_window),
+                    )
                 };
-                p.usage_stale = !spent_skipped
-                    && age_source_ms
-                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms));
+                p.usage_stale = !spent_skipped && past_threshold;
             }
 
             bells = cfg

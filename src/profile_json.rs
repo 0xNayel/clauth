@@ -162,7 +162,7 @@ pub(crate) enum ProfileWindows {
     /// this type is returned by value on every reply.
     Oauth {
         usage: Option<Box<UsageInfo>>,
-        age_secs: Option<u64>,
+        age: OauthAge,
     },
     /// A third-party account. The 5h/7d pool is not this account's pool at all,
     /// so that window is structurally none; its provider's own cached stats are
@@ -177,19 +177,95 @@ pub(crate) enum ProfileWindows {
     },
 }
 
-impl ProfileWindows {
-    /// How long ago the cache behind these figures was written. `None` when
-    /// there is no cache, which is also when there are no figures to date.
-    pub(crate) fn age_secs(&self) -> Option<u64> {
+/// How old an OAuth account's cached figures are, and whether anything dates
+/// them. The one age contract every OAuth surface reads: `status.json`, the TUI
+/// stale cue and the MCP payloads all derive from this, so no two of them can
+/// answer differently about the same file.
+///
+/// The stamp rides in the BODY ([`UsageInfo::fetched_at`], written only by a
+/// live fetch outcome), never on the file. A plan-only cache rewrite touches the
+/// mtime without producing a new reading, and dating off mtime let exactly that
+/// rewrite re-age a figure nothing had re-fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OauthAge {
+    /// No cache at all: nothing to date, and no figures to distrust.
+    Absent,
+    /// A cache with no usable stamp: missing (a plan-only cold fill, or a body
+    /// written before the field existed) or dated in the FUTURE, which proves
+    /// the clock moved rather than that the read is fresh. Its figures stay
+    /// VISIBLE and read stale, because a figure of unknown age is the one a
+    /// reader must discount hardest.
+    Undated,
+    /// Seconds since the fetch that produced these figures.
+    Dated(u64),
+}
+
+impl OauthAge {
+    /// The age a reader can publish. `None` for both arms that carry no trusted
+    /// number, which is why staleness is a separate question.
+    pub(crate) fn secs(self) -> Option<u64> {
         match self {
-            Self::Oauth { age_secs, .. } | Self::ThirdParty { age_secs, .. } => *age_secs,
+            Self::Dated(secs) => Some(secs),
+            Self::Absent | Self::Undated => None,
         }
     }
 
-    /// Whether these figures are past [`STALE_AFTER_MS`].
+    /// Whether the figures behind this age should be discounted. `Undated` is
+    /// stale on its own: there is a cache, and nothing says when it was read.
+    ///
+    /// `has_figures` is [`publishes_a_live_window`]: a verdict qualifies a
+    /// FIGURE, and a body publishing none is never stale, whatever its age
+    /// (owner ruling 2026-09-09). A `(stale)` marker beside a dash tells a
+    /// reader that a number they cannot see is old.
+    pub(crate) fn is_stale(self, threshold_ms: u64, has_figures: bool) -> bool {
+        if !has_figures {
+            return false;
+        }
+        match self {
+            Self::Absent => false,
+            Self::Undated => true,
+            Self::Dated(secs) => secs.saturating_mul(1000) > threshold_ms,
+        }
+    }
+}
+
+/// Classify an OAuth account's cached body against `now_ms`. `usage` is what the
+/// production reader returned, so an absent file and an unreadable one both
+/// arrive here as `None`.
+pub(crate) fn oauth_age(usage: Option<&UsageInfo>, now_ms: u64) -> OauthAge {
+    let Some(usage) = usage else {
+        return OauthAge::Absent;
+    };
+    match usage.fetched_at {
+        Some(at) => now_ms
+            .checked_sub(at)
+            .map_or(OauthAge::Undated, |ms| OauthAge::Dated(ms / 1000)),
+        None => OauthAge::Undated,
+    }
+}
+
+impl ProfileWindows {
+    /// How long ago the fetch behind these figures ran. `None` when nothing
+    /// dates them, which is a separate question from [`Self::stale`].
+    pub(crate) fn age_secs(&self) -> Option<u64> {
+        match self {
+            Self::Oauth { age, .. } => age.secs(),
+            Self::ThirdParty { age_secs, .. } => *age_secs,
+        }
+    }
+
+    /// Whether these figures are past [`STALE_AFTER_MS`], or carry no age to
+    /// judge against it.
     pub(crate) fn stale(&self) -> bool {
-        self.age_secs()
-            .is_some_and(|age| age.saturating_mul(1000) > STALE_AFTER_MS)
+        match self {
+            Self::Oauth { age, usage } => age.is_stale(
+                STALE_AFTER_MS,
+                usage.as_ref().is_some_and(|u| publishes_a_live_window(u)),
+            ),
+            Self::ThirdParty { age_secs, .. } => {
+                age_secs.is_some_and(|age| age.saturating_mul(1000) > STALE_AFTER_MS)
+            }
+        }
     }
 }
 
@@ -211,17 +287,19 @@ pub(crate) fn profile_windows_for(name: &ProfileName) -> ProfileWindows {
 
 fn windows_of(name: &ProfileName, third_party: bool, provider: Option<Provider>) -> ProfileWindows {
     let file = cache_file_of(third_party);
-    let age_secs = cache_age_secs(name, file);
     if third_party {
+        // The provider leg's only writer is a fetch outcome, so its file mtime
+        // IS its read time and it keeps dating off the file.
         return ProfileWindows::ThirdParty {
             stats: load_profile_cache::<ThirdPartyStats>(name, file),
-            age_secs,
+            age_secs: cache_age_secs(name, file),
             provider,
         };
     }
+    let usage = load_profile_cache::<UsageInfo>(name, file);
     ProfileWindows::Oauth {
-        usage: load_profile_cache::<UsageInfo>(name, file).map(Box::new),
-        age_secs,
+        age: oauth_age(usage.as_ref(), now_ms()),
+        usage: usage.map(Box::new),
     }
 }
 
@@ -261,6 +339,17 @@ pub(crate) fn window_row_is_live(w: &UsageWindow) -> bool {
         .as_deref()
         .and_then(crate::usage::iso_to_epoch_secs)
         .is_none_or(|resets_at| crate::usage::now_epoch_secs() < resets_at)
+}
+
+/// Whether a body still publishes a window a reader can act on. Every surface
+/// filters its rows through [`window_row_is_live`], so a body whose windows have
+/// all lapsed renders dashes exactly like one that carries none.
+///
+/// This is the figure a staleness verdict qualifies (owner ruling 2026-09-09):
+/// with no visible number there is nothing to discount, and a `(stale)` marker
+/// beside a dash tells a reader that a figure they cannot see is old.
+pub(crate) fn publishes_a_live_window(usage: &UsageInfo) -> bool {
+    usage.windows().iter().any(|(_, w)| window_row_is_live(w))
 }
 
 /// [`window_row_is_live`] for a third-party provider's cached bar: the same
