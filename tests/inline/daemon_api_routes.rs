@@ -188,7 +188,11 @@ fn a_wait_is_not_woken_by_the_timestamp_alone() {
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             second += 1;
             let stamp = format!("2026-09-02T06:00:{second:02}+00:00");
-            let _ = std::fs::write(&path, feed("alpha", &stamp));
+            // The production write path, not a truncate-in-place: the daemon's
+            // tick republishes through `atomic_write_600`, and a plain
+            // `fs::write` racing the wait loop's reads can hand it a torn body
+            // the fixture never meant to model.
+            let _ = crate::profile::atomic_write_600(&path, feed("alpha", &stamp).as_bytes());
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
@@ -256,6 +260,44 @@ fn a_zero_wait_conditional_read_reads_before_deciding() {
         &req_tagged("/api/v1/status?wait=0", Some(TOKEN), &now_tag),
     );
     assert_eq!(resp.status, 304);
+}
+
+/// The non-zero half of the same claim: a wait with a positive timeout serves
+/// the FIRST read's freshness rather than blocking. The bound is one poll
+/// interval, which is what separates the two failing shapes from the live
+/// one: a loop that parks the caller for the whole wait answers at `wait`,
+/// and one that delays its first read until after the first poll answers at
+/// exactly [`WAIT_POLL`] — a sleep never undershoots — while the live loop
+/// reads before its deadline test and answers in the time of one file read.
+/// The zero-wait test above pins the same read-before-decide order at
+/// `wait=0`, where the delayed shape answers 304 without ever reading.
+#[test]
+fn a_positive_wait_serves_the_first_reads_freshness_rather_than_parking() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let held = current_tag(&ctx);
+
+    // The feed has already moved by the time the reader arrives.
+    write_feed(&ctx, &feed("beta", "2026-09-02T06:00:05+00:00"));
+
+    let started = std::time::Instant::now();
+    let resp = handle(
+        &ctx,
+        &req_tagged("/api/v1/status?wait=10", Some(TOKEN), &held),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        body_json(&resp)["active_profile"],
+        serde_json::json!("beta")
+    );
+    assert!(
+        elapsed < WAIT_POLL,
+        "the first read is served before one poll interval could delay it, not \
+         parked for the 10s wait: {elapsed:?}"
+    );
 }
 
 /// A feed caught mid-replacement — a body that does not parse — is not a
@@ -435,21 +477,42 @@ fn all_equals_one_reads_the_live_stores_not_a_file_mtime() {
         .lock()
         .expect("status store")
         .insert("alpha".to_string(), crate::usage::FetchStatus::RateLimited);
+    // The other store `LiveStores::snapshot`'s own comment names as the
+    // regression: an `AuthExpired` third-party session writes no cache, so
+    // before the snapshot carried this store the rebuild could only publish
+    // the mtime derivation's `null` for it — indistinguishable from never
+    // fetched. beta has no cache either, so only this store can answer.
+    live.third_party_status
+        .lock()
+        .expect("third-party status store")
+        .insert("beta".to_string(), crate::usage::FetchStatus::AuthExpired);
     let ctx = ctx_with_live(seeded_config(), live);
 
     let resp = handle(&ctx, &req("GET", "/api/v1/status?all=1", Some(TOKEN), ""));
     assert_eq!(resp.status, 200);
     let body = body_json(&resp);
-    let alpha = body["profiles"]
-        .as_array()
-        .expect("profiles")
-        .iter()
-        .find(|p| p["name"] == serde_json::json!("alpha"))
-        .expect("alpha is in the roster");
+    let entry = |name: &str| {
+        body["profiles"]
+            .as_array()
+            .expect("profiles")
+            .iter()
+            .find(|p| p["name"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("{name} is in the roster"))
+            .clone()
+    };
+    let alpha = entry("alpha");
     assert_eq!(
         alpha["fetch_status"],
         serde_json::json!("RateLimited"),
-        "the store's value has to win; nothing wrote a cache file for it to derive from"
+        "the OAuth store's value has to win; nothing wrote a cache file for it to derive from"
+    );
+    let beta = entry("beta");
+    assert_eq!(
+        beta["fetch_status"],
+        serde_json::json!("AuthExpired"),
+        "the third-party store's verdict has to win; beta has no cache, so the \
+         mtime derivation would publish null: {}",
+        beta
     );
 }
 
@@ -701,6 +764,56 @@ fn a_second_concurrent_switch_is_refused_immediately() {
     });
 }
 
+/// The poisoned-gate half, pinned at the ROUTE rather than the primitive.
+///
+/// `RankedMutex::try_lock` recovers a poisoned mutex (its pin lives in
+/// `tests/inline/lockorder.rs`), but only a test through `handle` reds on the
+/// caller that matters: a future edit collapsing poison back into the lock
+/// error would answer every later switch with a permanent `409
+/// switch_in_progress`, and the primitive's pin would stay green while the
+/// route wedged.
+#[test]
+fn a_poisoned_gate_does_not_wedge_the_switch_route() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+
+    // Poison it the only way a mutex gets poisoned: panic while holding it.
+    let holder = std::sync::Arc::clone(&ctx);
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _gate = holder.switch_gate.lock().expect("gate");
+        panic!("a switch panicked under the gate");
+    }));
+    assert!(poisoned.is_err(), "precondition: the closure panicked");
+
+    let resp = handle(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(
+        resp.status,
+        200,
+        "a poisoned gate is recovered and the switch proceeds, not answered with a \
+         permanent 409: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
+    assert_eq!(body_json(&resp)["active"], serde_json::json!("beta"));
+    assert_eq!(
+        ctx.config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("beta"),
+        "the switch must still land in state, not just in the response"
+    );
+}
+
 /// The switch gate must not invert the lock order when the target's token has
 /// already expired.
 ///
@@ -719,14 +832,18 @@ fn a_second_concurrent_switch_is_refused_immediately() {
 /// Anthropic on every run.
 #[test]
 fn a_switch_to_a_clock_expired_target_does_not_invert_the_lock_order() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
 
     // Bound then dropped: the port is now closed, so a connect fails at once.
     let dead = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = dead.local_addr().expect("addr").port();
     drop(dead);
-    let dead_url = format!("http://127.0.0.1:{port}/token");
-    crate::oauth::set_endpoint_overrides(&dead_url, &dead_url);
+    // The RAII sandbox the other endpoint-override tests use, not a bare
+    // `set_endpoint_overrides`: this test exists to catch a PANIC (the
+    // lock-order assert), and a panic unwinds past a manual clear, leaving the
+    // dead-port redirect installed for every sibling test in the binary.
+    let _endpoints =
+        crate::testutil::EndpointSandbox::new(&home, &format!("http://127.0.0.1:{port}"));
 
     let config = seeded_config();
     {
@@ -756,7 +873,6 @@ fn a_switch_to_a_clock_expired_target_does_not_invert_the_lock_order() {
             r#"{"profile":"beta"}"#,
         ),
     );
-    crate::oauth::clear_endpoint_overrides();
 
     assert_eq!(
         resp.status, 409,

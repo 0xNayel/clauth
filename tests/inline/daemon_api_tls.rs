@@ -255,6 +255,14 @@ fn an_over_long_hostname_is_refused() {
 /// way on every target, so each target checks its own.
 #[test]
 fn the_default_certificate_directory_matches_the_platform() {
+    // Sandboxed: on Windows the default resolves under the operator's real
+    // %AppData%, and the env var is read before `dirs`' known-folder lookup,
+    // so the pin keeps the resolution inside the fixture on that leg. This
+    // test spawns no binary, so the in-process pin is enough.
+    let _home = HomeSandbox::new();
+    #[cfg(not(unix))]
+    let _appdata =
+        crate::testutil::EnvPin::new(&_home, &[("AppData", Some(_home.home().as_os_str()))]);
     let dir = default_cert_dir().expect("the platform default must resolve");
 
     #[cfg(unix)]
@@ -297,10 +305,21 @@ fn tls_config_is_written_with_the_platform_default_on_first_use() {
         "the default should be persisted, not just returned"
     );
 
-    let body = std::fs::read_to_string(&path).expect("read back");
-    assert!(
-        body.contains("cert_dir") && body.contains("schema"),
-        "the file an operator opens has to show both fields: {body}"
+    // The round trip, not the key names: a file that persisted an empty or
+    // wrong path would pass a `contains("cert_dir")` check while every later
+    // start silently served from somewhere else.
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+            .expect("the written file parses back");
+    assert_eq!(
+        written["schema"],
+        serde_json::json!(1),
+        "the file an operator opens has to show the schema it is read with: {written}"
+    );
+    assert_eq!(
+        written["cert_dir"].as_str().map(Path::new),
+        Some(dir.as_path()),
+        "what was written parses back to what was configured: {written}"
     );
 }
 

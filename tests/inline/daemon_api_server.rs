@@ -816,9 +816,12 @@ fn the_advertised_budget_is_the_one_enforced() {
         eprintln!("SKIPPED the_advertised_budget_is_the_one_enforced: openssl is not usable here");
         return;
     };
+    // A whole-second lifetime: `Keep-Alive: timeout=` is whole seconds, so a
+    // sub-second budget can only ever be advertised as zero and the timeout
+    // bound below degenerates into "advertised is zero".
     let limits = Limits {
         io_timeout: std::time::Duration::from_millis(100),
-        lifetime: std::time::Duration::from_millis(700),
+        lifetime: std::time::Duration::from_secs(2),
         max_requests: 100,
     };
 
@@ -838,16 +841,27 @@ fn the_advertised_budget_is_the_one_enforced() {
 
         // What is advertised is what remains, so it can never exceed the budget
         // the connection was actually given.
-        let advertised: u64 = head
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("Keep-Alive: timeout="))
-            .and_then(|rest| rest.split(',').next())
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or_else(|| panic!("no Keep-Alive timeout in {head}"));
+        let (advertised, requests_left) = keep_alive_figures(&head);
         assert!(
             advertised <= limits.lifetime.as_secs(),
             "advertised {advertised}s but the connection only has {}s: {head}",
             limits.lifetime.as_secs()
+        );
+
+        // The remaining-request count is the other advertised figure, and it
+        // must be the budget genuinely left — which means it decrements. Only
+        // this read pins it; a response advertising a constant passes the
+        // timeout bound alone.
+        session.send(&get).expect("second send");
+        let (head_two, _) = session.recv().expect("second recv");
+        let (_, requests_left_two) = keep_alive_figures(&head_two);
+        assert_eq!(
+            (requests_left, requests_left_two),
+            (
+                u64::from(limits.max_requests - 1),
+                u64::from(limits.max_requests - 2)
+            ),
+            "the advertised request budget is what is left, not a constant: {head}{head_two}"
         );
 
         // Idle past the whole budget: the connection must be gone, not lingering.
@@ -858,6 +872,29 @@ fn the_advertised_budget_is_the_one_enforced() {
             "a connection past its advertised budget must be closed"
         );
     });
+}
+
+/// The `Keep-Alive: timeout=N, max=M` figures a kept-alive response advertises.
+fn keep_alive_figures(head: &str) -> (u64, u64) {
+    let line = head
+        .lines()
+        .find(|l| l.trim().to_ascii_lowercase().starts_with("keep-alive:"))
+        .unwrap_or_else(|| panic!("no Keep-Alive header in {head}"));
+    let figures = line.split_once(':').expect("the prefix was matched").1;
+    let mut timeout = None;
+    let mut max = None;
+    for part in figures.split(',') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("timeout=") {
+            timeout = v.trim().parse().ok();
+        } else if let Some(v) = part.strip_prefix("max=") {
+            max = v.trim().parse().ok();
+        }
+    }
+    (
+        timeout.unwrap_or_else(|| panic!("no timeout figure in {head}")),
+        max.unwrap_or_else(|| panic!("no max figure in {head}")),
+    )
 }
 
 /// An unauthenticated caller gets no connection to hold. Persistent connections
@@ -1116,7 +1153,7 @@ fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
     };
     let msg = format!("{err:#}");
     assert!(
-        msg.contains(&empty.path().display().to_string()) || msg.contains(".crt"),
+        msg.contains(&empty.path().display().to_string()),
         "the failure names the path the operator has to fix: {msg}"
     );
 }
@@ -1221,8 +1258,7 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
         panic!("an unreadable certificate must fail serve, not pass");
     };
     assert!(
-        format!("{err:#}").contains(&empty.path().display().to_string())
-            || format!("{err:#}").contains(".crt"),
+        format!("{err:#}").contains(&empty.path().display().to_string()),
         "the failure names the path the operator has to fix: {err:#}"
     );
 
