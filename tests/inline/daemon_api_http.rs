@@ -52,11 +52,23 @@ fn parses_a_get_with_a_bearer_token() {
     assert!(req.body.is_empty());
 }
 
+/// Method names are case-sensitive on the wire, so the verb reaches the router
+/// exactly as the client spelled it: a plain client sending `get` has to be
+/// answered 405 by the route table, never silently read as `GET`. The
+/// mixed-case input is what separates verbatim from a normalizer that passes
+/// all-lowercase through untouched — `GeT` is as wrong as `get`, and a
+/// pass-lowercase-else-uppercase rule would hand the router `GET` for it.
 #[test]
-fn splits_the_query_and_lowercases_nothing_but_the_method() {
+fn splits_the_query_and_preserves_the_method_verbatim() {
+    for sent in ["get", "GeT", "gEt"] {
+        let req = parse(&format!(
+            "{sent} /api/v1/status?all=1 HTTP/1.1\r\nHost: h\r\n\r\n"
+        ))
+        .unwrap_or_else(|_| panic!("should parse {sent:?}"));
+        assert_eq!(req.method, sent, "the method is matched as sent");
+    }
     let req = parse("get /api/v1/status?all=1 HTTP/1.1\r\nHost: h\r\n\r\n")
         .unwrap_or_else(|_| panic!("should parse"));
-    assert_eq!(req.method, "GET", "the method is normalized");
     assert_eq!(req.path, "/api/v1/status", "the path is not");
     assert_eq!(req.query, "all=1");
     assert!(req.flag("all"));
@@ -665,4 +677,13 @@ fn an_untagged_response_carries_no_etag() {
 
     let text = String::from_utf8(out).unwrap_or_else(|_| panic!("utf8"));
     assert!(!text.contains("ETag"), "got {text}");
+}
+
+/// The table promises phrases only "for the statuses this server actually
+/// emits": no route or error constructor answers 403 — auth failures are 401,
+/// refusals 409 — so an arm for it is that doc quietly false. It must fall to
+/// the fallback phrase instead.
+#[test]
+fn a_status_no_route_emits_has_no_reason_phrase() {
+    assert_eq!(reason_phrase(403), "Unknown");
 }

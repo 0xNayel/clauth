@@ -38,8 +38,10 @@ pub(crate) struct Request {
     pub(crate) query: String,
     /// The `Authorization: Bearer <token>` value, if one was presented.
     pub(crate) bearer: Option<String>,
-    /// The `If-None-Match` value, verbatim including its quotes. Only
-    /// `/api/v1/mirror` reads it; every other route answers unconditionally.
+    /// The `If-None-Match` value, verbatim including its quotes. It is compared
+    /// against a tag this server produced, so any normalizing would have to be
+    /// done identically on both sides to be worth doing; the status routes —
+    /// plain and `?all` — answer conditionally off it.
     pub(crate) if_none_match: Option<String>,
     pub(crate) body: Vec<u8>,
     /// Whether the client is willing to reuse this connection: HTTP/1.1 unless
@@ -242,7 +244,11 @@ impl<S: Read> RequestReader<S> {
             return Err(RequestError::Malformed);
         }
         let (method, target) = match (parsed.method, parsed.path) {
-            (Some(m), Some(t)) => (m.to_ascii_uppercase(), t.to_string()),
+            // Method names are case-sensitive on the wire, so the verb reaches
+            // the router exactly as the client spelled it: normalizing it here
+            // would make a lowercase `get` silently answer as `GET`, and the
+            // route table is the one place that decides what matches.
+            (Some(m), Some(t)) => (m.to_string(), t.to_string()),
             _ => return Err(RequestError::Malformed),
         };
         let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
@@ -557,7 +563,6 @@ fn reason_phrase(status: u16) -> &'static str {
         304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
-        403 => "Forbidden",
         404 => "Not Found",
         408 => "Request Timeout",
         405 => "Method Not Allowed",

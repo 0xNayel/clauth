@@ -147,7 +147,8 @@ fn health() -> Response {
 /// the API wakes every waiting reader immediately.
 ///
 /// `?all=1` never waits: it builds its body from config rather than the file,
-/// so there is no file to watch for it.
+/// so there is no file to watch for it — but it is still conditional off its
+/// built body's tag, so a roster that has not moved answers 304.
 fn status(ctx: &ApiContext, req: &Request) -> Response {
     let include_disabled = req.flag("all");
     if !include_disabled {
@@ -199,7 +200,18 @@ fn status(ctx: &ApiContext, req: &Request) -> Response {
         include_disabled,
     );
     match serde_json::to_vec(&body) {
-        Ok(bytes) => Response::raw_json(200, bytes),
+        Ok(bytes) => {
+            // The one `etag_for` the whole route family uses, so a client's
+            // conditional-request code works against the query the same way it
+            // does against the published feed: `?all` waits on nothing (there
+            // is no file to watch), but an unchanged roster is still answered
+            // 304 rather than resending every profile entry on every poll.
+            let etag = etag_for(&bytes);
+            if req.if_none_match.as_deref() == Some(etag.as_str()) {
+                return Response::not_modified(etag);
+            }
+            Response::raw_json_tagged(200, bytes, etag)
+        }
         Err(e) => {
             logline!("clauth api: failed to serialize a status body: {e}");
             Response::error(500, "internal")

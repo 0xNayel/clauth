@@ -425,6 +425,27 @@ fn an_unknown_path_is_404_and_a_wrong_method_is_405() {
     );
 }
 
+/// Methods are case-sensitive on the wire, so a lowercase verb is the wrong
+/// verb: a plain client sending `get` at a known path is told which half is
+/// wrong (405), never silently answered as `GET`. The parser-side half of this
+/// pin lives in `daemon_api_http.rs` — the verb has to ARRIVE here lowercase
+/// for this arm to be reachable from a real connection.
+#[test]
+fn a_lowercase_verb_is_a_method_error_not_a_silent_match() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+
+    let resp = handle(&ctx, &req("get", "/api/v1/status", Some(TOKEN), ""));
+    assert_eq!(resp.status, 405);
+    assert_eq!(
+        body_json(&resp)["error"],
+        serde_json::json!("method_not_allowed")
+    );
+
+    let control = handle(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
+    assert_eq!(control.status, 200, "the uppercase spelling still serves");
+}
+
 /// The routes live under `/api/v1`, and nothing answers beside it.
 ///
 /// Worth pinning because the prefix moved: an unversioned `/v1` was served
@@ -588,6 +609,44 @@ fn all_reveals_disabled_accounts_that_the_plain_feed_hides() {
     };
     assert!(!names(&plain).contains(&"beta".to_string()), "{plain}");
     assert!(names(&all).contains(&"beta".to_string()), "{all}");
+}
+
+/// `?all=1` is conditional like the plain route: its built body is tagged
+/// through the same `etag_for`, a matching `If-None-Match` answered 304, a
+/// moved feed answered 200 with a new tag. A client reusing its
+/// conditional-request code against the query used to get the whole body
+/// resent on every poll. `generated_at` moves on every rebuild and the tag
+/// ignores it, so the 304 leg is not racing the clock.
+#[test]
+fn the_all_query_is_tagged_and_answers_304_to_a_matching_tag() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+
+    let first = handle(&ctx, &req("GET", "/api/v1/status?all=1", Some(TOKEN), ""));
+    assert_eq!(first.status, 200);
+    let tag = first
+        .etag
+        .clone()
+        .expect("the ?all body carries an entity tag");
+
+    let second = handle(&ctx, &req_tagged("/api/v1/status?all=1", Some(TOKEN), &tag));
+    assert_eq!(second.status, 304, "an unchanged roster is not resent");
+    assert_eq!(second.etag.as_deref(), Some(tag.as_str()));
+
+    // The feed moves: the active account changes, so the body a reader could
+    // act on changes with it.
+    config.lock().expect("config").state.active_profile = Some("beta".into());
+    let third = handle(&ctx, &req_tagged("/api/v1/status?all=1", Some(TOKEN), &tag));
+    assert_eq!(third.status, 200, "a moved feed is answered, not 304'd");
+    let moved = third.etag.clone().expect("a 200 carries an entity tag");
+    assert_ne!(moved, tag, "and the feed's move is visible in the tag");
+
+    let fourth = handle(
+        &ctx,
+        &req_tagged("/api/v1/status?all=1", Some(TOKEN), &moved),
+    );
+    assert_eq!(fourth.status, 304, "the new tag is now the current one");
 }
 
 // -------------------------------------------------------------- switch
