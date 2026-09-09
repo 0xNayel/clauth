@@ -8,7 +8,7 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
     ActivityStore, ClaudeRollingPacing, EpochMs, FetchLeg, FetchStamp, LastFetchedAt, LegKey,
-    ProfileActivity, RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry,
+    ProfileActivity, RESET_ANCHOR_GRACE_MS, SuppressedAuthExpiredStore, ThirdPartyEntry,
     ThirdPartyFetcher, TokenEntry, anchor_post_reset_oauth, clear_activity, clear_orphaned_forced,
     collect_oauth_seed_names, collect_third_party_entries, collect_tokens, fetch_third_party_due,
     filter_suppressed, generic_slot_deferral, mark_activity, memoized_identity, partition_due,
@@ -4704,20 +4704,21 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
 /// map (the steady state for healthy profiles) is a no-op fast path.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let suppressed_auth_expired: SuppressedAuthExpiredStore =
+        Arc::new(RankedMutex::new(HashMap::new()));
     let victim = tp_entry("no-data");
-    suppressed
+    suppressed_auth_expired
         .lock()
         .unwrap()
         .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
-    let out = filter_suppressed(&suppressed, snap);
+    let out = filter_suppressed(&suppressed_auth_expired, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
 
     // Empty map → identity (the fast path).
-    let empty: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let empty: SuppressedAuthExpiredStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
     assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
 }
@@ -4729,19 +4730,20 @@ fn filter_suppressed_drops_only_named_entries() {
 /// (`daemon::tick::rebuild_tokens`), so the changed credential is the signal.
 #[test]
 fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let suppressed_auth_expired: SuppressedAuthExpiredStore =
+        Arc::new(RankedMutex::new(HashMap::new()));
     let expired = alibaba_entry("qwen", "dead-console-token");
-    suppressed
+    suppressed_auth_expired
         .lock()
         .unwrap()
         .insert("qwen".to_string(), expired.credential_fingerprint());
 
     // Same credential → still suppressed, no cadence retry.
-    assert!(filter_suppressed(&suppressed, vec![expired]).is_empty());
+    assert!(filter_suppressed(&suppressed_auth_expired, vec![expired]).is_empty());
 
     // Re-login wrote a new console session; the rebuilt entry carries it.
     let relogged = alibaba_entry("qwen", "fresh-console-token");
-    let out = filter_suppressed(&suppressed, vec![relogged]);
+    let out = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
     assert_eq!(
         out.len(),
         1,
@@ -4753,15 +4755,19 @@ fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
 /// suppression clears on a rotated key by the same mechanism.
 #[test]
 fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let suppressed_auth_expired: SuppressedAuthExpiredStore =
+        Arc::new(RankedMutex::new(HashMap::new()));
     let old = tp_entry("proxy");
-    suppressed
+    suppressed_auth_expired
         .lock()
         .unwrap()
         .insert("proxy".to_string(), old.credential_fingerprint());
     let mut rotated = tp_entry("proxy");
     rotated.api_key = "a-different-key".to_string();
-    assert_eq!(filter_suppressed(&suppressed, vec![rotated]).len(), 1);
+    assert_eq!(
+        filter_suppressed(&suppressed_auth_expired, vec![rotated]).len(),
+        1
+    );
 }
 
 fn tp_entry(name: &str) -> ThirdPartyEntry {
@@ -4821,7 +4827,7 @@ fn third_party_state_at_interval(
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -4924,7 +4930,11 @@ fn fetch_third_party_due_inserts_generic_auth_expired() {
     let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
     assert_eq!(
-        state.suppressed_generic.lock().unwrap().get("generic-dead"),
+        state
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .get("generic-dead"),
         Some(&fp)
     );
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
@@ -4947,7 +4957,11 @@ fn fetch_third_party_due_inserts_known_auth_expired() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert_eq!(
-        state.suppressed_generic.lock().unwrap().get("qwen-dead"),
+        state
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .get("qwen-dead"),
         Some(&fp)
     );
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
@@ -4968,7 +4982,7 @@ fn fetch_third_party_due_does_not_insert_generic_failed_without_cache() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert!(
-        state.suppressed_generic.lock().unwrap().is_empty(),
+        state.suppressed_auth_expired.lock().unwrap().is_empty(),
         "a generic no-data result must not suppress — it rescans on the cadence"
     );
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
@@ -4985,7 +4999,7 @@ fn fetch_third_party_due_does_not_insert_rate_limited() {
     let state = third_party_state(stub_rate_limited);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
@@ -5012,7 +5026,7 @@ fn fetch_third_party_due_does_not_insert_cached() {
     let state = third_party_state(stub_network_error);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
@@ -5027,7 +5041,7 @@ fn fetch_third_party_due_does_not_insert_known_failed() {
     let state = third_party_state(stub_network_error);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
     assert_eq!(
         state.third_party_status.lock().unwrap().get("qwen-failed"),
@@ -5894,7 +5908,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
@@ -5987,7 +6001,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
@@ -6084,7 +6098,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // A DIFFERENT lease over the same file → its acquire() is denied while
         // `other` holds the flock.
@@ -6187,7 +6201,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -6308,7 +6322,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -6420,7 +6434,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -7013,7 +7027,7 @@ fn completion_order_state() -> super::SchedulerState {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -10363,7 +10377,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -10579,7 +10593,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),

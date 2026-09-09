@@ -21,7 +21,7 @@ pub(crate) use scheduler::{
     ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,
     NextRefreshPerProfile, OpResult, OpResultReceiver, OpResultSender, PendingSwitch,
     PendingSwitchOff, PollStreaks, ProfileActivity, RefetchQueue, StartupReceiver, StartupSender,
-    StartupSignal, StatusStore, StreakCounts, SuppressedGenericStore, ThirdPartyList,
+    StartupSignal, StatusStore, StreakCounts, SuppressedAuthExpiredStore, ThirdPartyList,
     ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore, any_busy, bootstrap_fetch,
     bootstrap_third_party, clear_activity, collect_oauth_seed_names, collect_third_party_entries,
     collect_tokens, end_rotation, is_idle, is_stuck_rate_limited, is_stuck_streak,

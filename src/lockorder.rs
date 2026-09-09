@@ -178,10 +178,10 @@ pub(crate) mod rank {
         /// `UsageThrottle` (150) — holding this across that probe inverts the
         /// order and asserts here rather than deadlocking in production.
         IdentityMemo = 1250;
-        /// Session-scoped set of generic profiles suppressed from the timer until
+        /// Session-scoped set of auth-expired profiles suppressed from the timer until
         /// a manual refresh (`usage::scheduler`). Leaf — acquired standalone in
         /// `tick`/`fetch_third_party_due`, never under another lock.
-        SuppressedGeneric = 1300;
+        SuppressedAuthExpired = 1300;
         /// CLA-ROLL re-stamp pacing (`usage::scheduler::ClaudeRollingPacing`).
         /// A true leaf: every acquisition — the scan gate up front, the
         /// departed-name retain sweep after candidates, the per-candidate hold

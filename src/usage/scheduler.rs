@@ -438,8 +438,8 @@ pub(crate) type ThirdPartyStatusStore =
 /// changing on disk, which is the only clearing path a headless daemon has.
 /// A leftover row whose fingerprint no longer matches anything is inert: it
 /// filters nothing and the next suppression for that name overwrites it.
-pub(crate) type SuppressedGenericStore =
-    Arc<RankedMutex<HashMap<String, u64>, rank::SuppressedGeneric>>;
+pub(crate) type SuppressedAuthExpiredStore =
+    Arc<RankedMutex<HashMap<String, u64>, rank::SuppressedAuthExpired>>;
 
 /// Per-profile next-fetch epoch-ms. Written after each `partition_due` run for
 /// overview countdown display without re-running the partition math on the render thread.
@@ -2638,10 +2638,10 @@ pub(crate) fn collect_oauth_seed_names(config: &crate::profile::AppConfig) -> Ve
 /// lock, so there is no ordering hazard for `lockorder` to police, and cloning
 /// the map to avoid it would copy state this loop is the only reader of.
 fn filter_suppressed(
-    suppressed: &SuppressedGenericStore,
+    suppressed_auth_expired: &SuppressedAuthExpiredStore,
     snapshot: Vec<ThirdPartyEntry>,
 ) -> Vec<ThirdPartyEntry> {
-    let Ok(sup) = suppressed.lock() else {
+    let Ok(sup) = suppressed_auth_expired.lock() else {
         return snapshot;
     };
     if sup.is_empty() {
@@ -2900,7 +2900,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 // that. 429 keeps the server-directed deferral; a generic
                 // no-data result (cached or not) defers to the degraded floor.
                 if matches!(status, FetchStatus::AuthExpired)
-                    && let Ok(mut sup) = state.suppressed_generic.lock()
+                    && let Ok(mut sup) = state.suppressed_auth_expired.lock()
                 {
                     sup.insert(name.to_string(), fingerprint);
                 }
@@ -3155,7 +3155,7 @@ pub(crate) struct SchedulerState {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
-    suppressed_generic: SuppressedGenericStore,
+    suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     /// Single-fetcher lease (issue #27): `acquire()` reports whether THIS
     /// instance is the current usage fetcher. Won first-come, held for life; a
@@ -3251,7 +3251,7 @@ fn tick(state: &SchedulerState) {
     // when the outcome lands. Done before the snapshot so the name survives the
     // suppressed-name filter below.
     if !forced.is_empty()
-        && let Ok(mut sup) = state.suppressed_generic.lock()
+        && let Ok(mut sup) = state.suppressed_auth_expired.lock()
     {
         for name in &forced {
             sup.remove(name);
@@ -3271,7 +3271,7 @@ fn tick(state: &SchedulerState) {
     // Drop profiles with a dead usage credential (session-suppressed) from the
     // third-party leg so they aren't re-fetched every cadence. Only a manual
     // refresh (forced, cleared above) re-admits one for a single retry.
-    let tp_snapshot = filter_suppressed(&state.suppressed_generic, tp_snapshot);
+    let tp_snapshot = filter_suppressed(&state.suppressed_auth_expired, tp_snapshot);
 
     // Partition both before either fetches, then publish in one window so the
     // countdown map never shows a leg as momentarily missing (and a deleted
@@ -3584,7 +3584,7 @@ pub(crate) fn spawn_refresher(
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
-    suppressed_generic: SuppressedGenericStore,
+    suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
 ) {
@@ -3643,7 +3643,7 @@ pub(crate) fn spawn_refresher(
         third_party_tokens,
         third_party_usage_store,
         third_party_status,
-        suppressed_generic,
+        suppressed_auth_expired,
         shutting_down,
         fetch_lease,
         standdown_active: AtomicBool::new(false),
