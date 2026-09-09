@@ -164,6 +164,25 @@ fn an_unnamed_array_nested_window_falls_back_to_usage() {
 }
 
 #[test]
+fn a_case_variant_window_literal_name_stays_a_literal() {
+    // `5H` in an array element's name field is the same window as a map
+    // key's `5h`: normalised to the lowercase literal so the window
+    // machinery parses it, never humanized to "5 h".
+    let value: serde_json::Value = serde_json::from_str(
+        r#"{"windows":[{"name":"5H","remaining":0.5,"resets_at":1789476836}]}"#,
+    )
+    .unwrap();
+    let (plan, bars, rows) = scan(&value);
+    assert_eq!(bars.len(), 1, "{bars:?}");
+    assert_eq!(bars[0].label, "5h");
+    assert_eq!(
+        crate::usage::window_duration_secs(&bars[0].label),
+        Some(5 * 3600)
+    );
+    assert!(rows.is_empty() && plan.is_none());
+}
+
+#[test]
 fn a_map_nested_windows_key_beats_its_own_label_field() {
     // For a map entry the key IS the window name and stays the label even
     // when the object describes itself: literal `5h` is what the window

@@ -214,7 +214,9 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
         // window name — overview_windows, roster_rank and window_duration_secs
         // match the literal `5h`/`7d`, so a humanized label silently loses
         // every window-derived feature); an array element or root object has
-        // no key, so its own label field; else "usage".
+        // no key, so its own label field; else "usage". A label field that
+        // already parses as a window literal passes verbatim for the same
+        // reason (a case-variant `5H` humanized to "5 h" would miss it).
         let label = match parent_key {
             Some(k) => k.to_string(),
             None => obj
@@ -223,7 +225,10 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
                     is_label_key(k)
                         .then(|| v.as_str())
                         .flatten()
-                        .map(humanize_label)
+                        .map(|s| match window_literal(s) {
+                            Some(lit) => lit,
+                            None => humanize_label(s),
+                        })
                 })
                 .unwrap_or_else(|| "usage".to_string()),
         };
@@ -465,6 +470,15 @@ fn is_total_key(k: &str) -> bool {
 
 fn is_remaining_key(k: &str) -> bool {
     matches!(k.to_ascii_lowercase().as_str(), "remaining" | "left")
+}
+
+/// Normalise `s` to a canonical window literal (`5h`, `7d`) when it parses as
+/// one case-insensitively; `None` for any other shape. A provider's `name`
+/// field carrying `5H`/`7D` is the same window as a map key's `5h`, so it
+/// must reach `window_duration_secs` as a literal, never humanized.
+fn window_literal(s: &str) -> Option<String> {
+    let lower = s.to_ascii_lowercase();
+    crate::usage::window_duration_secs(&lower).map(|_| lower)
 }
 
 #[cfg(test)]
