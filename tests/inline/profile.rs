@@ -1461,6 +1461,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
     // flock (rank-ordered) and writes credentials.json before config.toml.

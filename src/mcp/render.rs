@@ -326,12 +326,14 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 }
 
 /// One-line cached headline for a third-party profile from
-/// `third_party_cache.json`: non-empty bars join as `label pct%`, else the first
-/// funded wallet row (an empty wallet a two-wallet provider lists first must not
-/// win the headline over the funded one), else the first stat row that carries a
-/// value; the plan label prefixes the line when present. Value-less rows (e.g.
-/// DeepSeek's `USD balance` heading) are skipped so the headline never renders a
-/// dangling `label:` with nothing after it.
+/// `third_party_cache.json`: LIVE bars join as `label pct%` (a lapsed bar is
+/// the previous window's last reading and drops), and when no live bar remains
+/// the chain falls through to the first funded wallet row (an empty wallet a
+/// two-wallet provider lists first must not win the headline over the funded
+/// one), then the first stat row that carries a value; the plan label prefixes
+/// the line when present. Value-less rows (e.g. DeepSeek's `USD balance`
+/// heading) are skipped so the headline never renders a dangling `label:` with
+/// nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     // The verdict row `ThirdPartyStats::unfunded` appends, identified by its
     // value rather than its `Danger` kind: OpenRouter marks its own overdrawn
@@ -343,12 +345,21 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
         .find(|r| r.value == crate::providers::LOW_BALANCE)
         .map(|r| r.value.as_str());
 
-    let mut body = if !s.bars.is_empty() {
-        s.bars
-            .iter()
-            .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
-            .collect::<Vec<_>>()
-            .join(", ")
+    // A bar whose reset has passed is the previous window's last reading
+    // (#74): it drops the same way the OAuth row drops, so the headline
+    // renders the account's live headroom rather than a stale figure. All
+    // bars lapsed leaves the wallet/row arms, which is the honest answer
+    // for an account no live bar speaks for.
+    let live_bars = s
+        .bars
+        .iter()
+        .filter(|b| crate::profile_json::usage_bar_is_live(b))
+        .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut body = if !live_bars.is_empty() {
+        live_bars
     } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
         format!("{}: {}", wallet.label, wallet.value)
     } else if let Some(row) = s
@@ -627,11 +638,18 @@ pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
             pct_clause(five),
             pct_clause(seven)
         ));
-        // An age dates a FIGURE. With neither window cached there is no figure
-        // to date, and stamping the cache's age onto two `unknown`s would read
-        // as a measurement clauth does not have.
+        // An age rides this clause whichever shape the pair takes. With a
+        // figure it dates the figure; with both shares reading `unknown` —
+        // never cached, or cached and lapsed past their own resets — it dates
+        // the unknown itself (owner ruling 2026-09-08: the cache's age is the
+        // one signal separating an all-lapsed pair from a never-fetched
+        // account). The `stale` word rides the figure-bearing clause only: a
+        // verdict qualifies a figure, and beside two unknowns it would claim
+        // one the prose does not show.
         if five.is_some() || seven.is_some() {
             out.push_str(&freshness_clause(lu));
+        } else {
+            out.push_str(&age_clause(lu));
         }
     }
     if let Some(w) = lu.get("throughput_warning").and_then(Value::as_str) {
@@ -836,8 +854,12 @@ fn age_clause(v: &Value) -> String {
 /// plus the response's bars at the source — matching the rendered figure for a
 /// `5h` substring would make the copy decide its own meaning.
 ///
-/// A freshness clause rides the FIGURE it dates and nothing else: stamping a
-/// cache's age onto `unknown` asserts a measurement clauth does not have.
+/// A freshness clause rides the FIGURE it dates, and the `stale` word never
+/// rides an unknown: a verdict qualifies a figure, and beside one the prose
+/// does not print it would claim a number the reader cannot see. The AGE may
+/// date an unknown (owner ruling 2026-09-08: date the unknowns, so a reader
+/// can tell how stale the unknown is) — the same split
+/// [`live_usage_prose`]'s all-lapsed arm implements.
 fn windows_prose(windows: &Value) -> String {
     match windows.get("kind").and_then(Value::as_str) {
         Some("third_party") => {
@@ -846,7 +868,7 @@ fn windows_prose(windows: &Value) -> String {
                 .and_then(Value::as_str)
                 .filter(|b| !b.is_empty())
             else {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             };
             let mut out = if windows
                 .get("provider_windows")
@@ -867,7 +889,7 @@ fn windows_prose(windows: &Value) -> String {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             if ws.is_empty() {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             }
             let mut out = ws
                 .iter()

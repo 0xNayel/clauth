@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::usage::{ActivityStore, ProfileActivity, any_busy};
 
 fn make_activity(entries: &[(&str, ProfileActivity)]) -> ActivityStore {
-    let mut map = HashMap::new();
+    let store = Arc::new(RankedMutex::new(HashMap::new()));
     for (name, activity) in entries {
-        map.insert(name.to_string(), *activity);
+        crate::usage::mark_activity(&store, &crate::profile::ProfileName::from(*name), *activity);
     }
-    Arc::new(RankedMutex::new(map))
+    store
 }
 
 fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
@@ -73,6 +73,62 @@ fn bootstrap_active_false_with_refreshing_slot_still_busy() {
     let flag = Arc::new(AtomicBool::new(false));
     let activity = make_activity(&[("alice", ProfileActivity::Refreshing)]);
     assert!(bootstrap_busy(&flag, &activity));
+}
+
+/// A rotation result reaches the UI thread a tick or more after its worker
+/// returned. Clearing the whole profile there drops an OAuth refetch spinner the
+/// rotation never raised, so the drain retires the rotation marker alone.
+#[test]
+fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("alice");
+
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
+    // the scheduler re-opens the OAuth leg before the UI drains the result.
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Fetching);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        !crate::usage::is_idle(&app.activity, &name),
+        "the refetch spinner outlives the rotation result it did not belong to"
+    );
+
+    // Control: with no later refetch the drain leaves the profile idle, so the
+    // assert above cannot pass on a drain that clears nothing at all.
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        crate::usage::is_idle(&app.activity, &name),
+        "the rotation marker itself retires on its own result"
+    );
+
+    // A switch gate opened after the rotation belongs to the gate's own drain.
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Switching);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        !crate::usage::is_idle(&app.activity, &name),
+        "a pending switch outlives an unrelated rotation result"
+    );
 }
 
 // ── compact mode ─────────────────────────────────────────────────────────
@@ -7505,6 +7561,114 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
     );
 }
 
+/// #74 degraded cue, FEED half: `apply_usage` derives `usage_stale` off the
+/// DISK body's `fetched_at` vs `stale_after_ms`, with the spent-account
+/// exemption reading the disk cache too (never the live store — a spent
+/// account the scheduler dropped from its due set keeps its store entry, so
+/// the two sources disagree exactly on the exempted state). The render pins
+/// in `tui_render_usage.rs` hold only if this derivation is right.
+#[test]
+fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
+    let stale_for = |disk: UsageInfo| {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = {
+            let mut profile =
+                crate::testutil::blank_profile(&crate::profile::ProfileName::from(GATE_PROFILE));
+            profile.bell_threshold = None;
+            App::new(crate::profile::AppConfig {
+                state: crate::profile::AppState {
+                    profiles: vec![GATE_PROFILE.into()],
+                    // The spent skip exists only under the opt-out (the
+                    // default is ON), so the exempt arm below needs it OFF.
+                    refresh_spent_accounts: false,
+                    ..crate::profile::AppState::default()
+                },
+                profiles: vec![profile],
+            })
+        };
+        // The live store carries a NON-maxed body while the disk cache is
+        // maxed (spent): the exemption must read the disk side, so a
+        // store-reading derivation flips stale on for a spent account and
+        // reds the exempt arm below.
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        {
+            let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+            store.insert(
+                GATE_PROFILE.to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 42.0,
+                        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                    }),
+                    ..UsageInfo::default()
+                },
+            );
+        }
+        crate::testutil::register_names(&[GATE_PROFILE]);
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(GATE_PROFILE),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &disk,
+        );
+        app.apply_usage();
+        {
+            let cfg = app.config();
+            cfg.profiles
+                .iter()
+                .find(|p| p.name.as_str() == GATE_PROFILE)
+                .expect("profile present")
+                .usage_stale
+        }
+    };
+    let interval = crate::profile::AppState::default().refresh_interval_ms;
+    let body = |util: f64, resets_at: &str, fetched_at: Option<u64>| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: Some(resets_at.to_string()),
+        }),
+        fetched_at,
+        ..UsageInfo::default()
+    };
+    let dated = |age_ms: u64, util: f64| {
+        body(
+            util,
+            "2999-01-01T00:00:00+00:00",
+            Some(crate::usage::now_ms() - age_ms),
+        )
+    };
+    let threshold = crate::profile_json::stale_after_ms(interval);
+
+    assert!(
+        !stale_for(dated(threshold / 2, 42.0)),
+        "a cache under the threshold must not read stale"
+    );
+    assert!(
+        stale_for(dated(threshold + 60_000, 42.0)),
+        "a cache past the threshold must read stale"
+    );
+    // `windows_maxed` keys on the DISK body (100%, a far-future reset): the
+    // exempt arm holds even at an age far past the threshold, and holds
+    // against the live store's non-maxed body.
+    assert!(
+        !stale_for(dated(threshold + 60_000, 100.0)),
+        "a live-maxed window is exempt: its figure cannot change by polling"
+    );
+    // The age rides the BODY. An undated one is stale on its own, and only
+    // this arm separates the contract from the cache-mtime derivation it
+    // replaced: the fixture writes the file NOW, so an mtime reading calls it
+    // fresh.
+    assert!(
+        stale_for(body(42.0, "2999-01-01T00:00:00+00:00", None)),
+        "a body nothing can date reads stale"
+    );
+    // ...and the verdict qualifies a figure, so a body whose only window has
+    // lapsed carries no marker however undatable it is.
+    assert!(
+        !stale_for(body(42.0, "2000-01-01T00:00:00+00:00", None)),
+        "an all-lapsed body publishes no row for a marker to qualify"
+    );
+}
+
 /// The read half: the log is written by whichever process holds the fetch lease,
 /// so a file that appeared or grew since the last look must be picked up off its
 /// mtime. Written here AFTER the `App` is built, standing in for the daemon
@@ -8227,6 +8391,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 

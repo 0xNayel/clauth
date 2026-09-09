@@ -47,11 +47,11 @@ use crate::profile::{
     load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
-    PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
-    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore,
-    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
-    collect_tokens, spawn_refresher,
+    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
+    PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
+    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
+    TokenList, UsageStore, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
+    collect_third_party_entries, collect_tokens, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
@@ -677,7 +677,7 @@ impl Default for LiveStores {
 pub(crate) struct LiveSnapshot {
     status: HashMap<String, FetchStatus>,
     third_party_status: HashMap<String, FetchStatus>,
-    next_refresh: HashMap<String, u64>,
+    next_refresh: HashMap<LegKey, u64>,
     streaks: HashMap<String, u32>,
     pending_switch: Option<String>,
     queue_anchor: Option<i64>,
@@ -898,9 +898,10 @@ impl Daemon {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
-    /// TUI's `start_scheduler` makes). The suppressed-generic set is daemon-local.
+    /// TUI's `start_scheduler` makes). The suppressed-auth-expired set is daemon-local.
     fn spawn_scheduler(&self) {
-        let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let suppressed_auth_expired: SuppressedAuthExpiredStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
@@ -919,7 +920,7 @@ impl Daemon {
             Arc::clone(&self.third_party_tokens),
             Arc::clone(&self.third_party_usage_store),
             Arc::clone(&self.third_party_status),
-            suppressed,
+            suppressed_auth_expired,
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
             // like any instance. It normally boots first (launchd) and wins the

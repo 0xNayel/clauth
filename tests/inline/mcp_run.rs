@@ -1954,7 +1954,15 @@ fn a_running_check_renders_a_bar_shaped_provider_cache_too() {
         THIRD_PARTY_CACHE_FILE,
     )
     .unwrap();
-    std::fs::write(&cache, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).expect("provider cache");
+    // Through the captured-cache writer, which re-anchors the bars' absolute
+    // `resets_at` stamps to now: this test pins the bars SHAPE, and the raw
+    // captured stamps drift past as real time moves.
+    std::fs::create_dir_all(cache.parent().unwrap()).expect("cache dir");
+    std::fs::write(
+        &cache,
+        crate::testutil::reanchored_bars_cache_bytes(crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES),
+    )
+    .expect("provider cache");
     seed_running("d-bars-0", "bars", now_ms());
 
     let text = monitor_text("d-bars-0");
@@ -2971,29 +2979,26 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
 #[test]
 fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
     let _home = HomeSandbox::new();
-    let usage = UsageInfo {
-        five_hour: Some(crate::usage::UsageWindow {
-            utilization: 12.0,
-            resets_at: None,
-        }),
-        ..Default::default()
-    };
-    let cache_path = crate::profile_cache::profile_cache_path(
-        &crate::profile::ProfileName::from("work"),
-        USAGE_CACHE_FILE,
-    )
-    .expect("cache path");
-
     crate::testutil::register_names(&["work"]);
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from("work"),
-        USAGE_CACHE_FILE,
-        &usage,
-    );
-    crate::testutil::set_mtime(
-        &cache_path,
-        std::time::SystemTime::now() - Duration::from_secs(240),
-    );
+    // The age rides the BODY's fetch stamp, so the fixture ages the stamp. The
+    // file's mtime is deliberately left at now: a surface reading it would date
+    // both legs of this test `just now`.
+    let seed = |secs_ago: u64| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: 12.0,
+                    resets_at: None,
+                }),
+                fetched_at: Some(crate::usage::now_ms() - secs_ago * 1000),
+                ..Default::default()
+            },
+        );
+    };
+
+    seed(240);
     let fresh = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
@@ -3010,10 +3015,7 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
     // Past the longest gap a live scheduler can leave (interval ceiling plus the
     // widen-only backoff ceiling, doubled for the fetch's own latency), so
     // nothing is maintaining this figure — and it still carries its number.
-    crate::testutil::set_mtime(
-        &cache_path,
-        std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60),
-    );
+    seed(3 * 60 * 60);
     let stale = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
@@ -4926,6 +4928,282 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     assert_eq!(
         roster_rank(&crate::profile::ProfileName::from("never-cached")),
         RosterRank::Unknown
+    );
+}
+
+/// A window whose reset has passed is the previous window's last reading, not
+/// headroom anyone can spend (#74). The rank must not sort a lapsed 5h at
+/// `100% used` to the bottom of the roster: it falls through to the next live
+/// figure, exactly as the dropped row leaves `usage unknown` in the prose.
+#[test]
+fn roster_rank_skips_a_window_whose_reset_has_passed() {
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::UsageInfo;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["lapsed"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("lapsed"),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(stamp(-3600)),
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 25.0,
+                resets_at: Some(stamp(3600)),
+            }),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("lapsed")),
+        RosterRank::Window(75.0),
+        "a lapsed 5h at 100% ranks on the live 7d beside it, never as 0% free",
+    );
+}
+
+/// The same rule for the third-party arm (#74): a provider's cached bar whose
+/// reset has passed is not headroom, so the rank falls to the next live bar —
+/// never to the wallet arm, which would rank a windows-publishing provider as a
+/// scalar account.
+#[test]
+fn roster_rank_skips_a_third_party_bar_whose_reset_has_passed() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["zai"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let bar = |label: &str, pct: f64, resets_at: Option<String>| UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at,
+        used: None,
+        total: None,
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("zai"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![crate::providers::StatRow {
+                label: "total".to_string(),
+                value: "1117.10 CNY".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            }],
+            bars: vec![
+                bar("5h", 100.0, Some(stamp(-3600))),
+                bar("7d", 30.0, Some(stamp(3600))),
+            ],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("zai")),
+        RosterRank::Window(70.0),
+        "a lapsed 5h bar at 100% ranks on the live 7d beside it, not as 0% free and not on the wallet",
+    );
+
+    // Every bar lapsed: nothing a window could say, so the wallet arm takes
+    // over exactly as it does for a provider that never published bars.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("zai"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![crate::providers::StatRow {
+                label: "total".to_string(),
+                value: "1117.10 CNY".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            }],
+            bars: vec![bar("5h", 100.0, Some(stamp(-3600)))],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("zai")),
+        RosterRank::Balance {
+            currency: "CNY".to_string(),
+            amount: 1117.10,
+        },
+        "with no live bar the wallet arm takes over, the same rank a barless provider gets",
+    );
+}
+
+/// A retyped profile — an endpoint account that used to be OAuth — keeps its
+/// old `usage_cache.json` from that earlier life. The leftover is not headroom:
+/// the shared cache selector says the account's figures live in the
+/// third-party cache, so the rank falls through to that arm exactly as
+/// `published_windows` drops the leftover, never sorting the account on a
+/// stale Anthropic window its own published `windows[]` carries none of (#74).
+#[test]
+fn roster_rank_ignores_a_retyped_profiles_leftover_oauth_cache() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["retyped", "oauth"]);
+    let retyped = crate::profile::Profile::new(
+        "retyped".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("k".to_string()),
+    );
+    crate::profile::save_profile(&retyped).expect("save the retyped profile");
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let leftover = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(stamp(3600)),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("retyped"),
+        USAGE_CACHE_FILE,
+        &leftover,
+    );
+
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        RosterRank::Unknown,
+        "a retyped profile's leftover OAuth cache is not headroom it ranks on",
+    );
+
+    // The fall-through lands on the provider's own figures when they exist.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("retyped"),
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![UsageBar {
+                label: "5h".to_string(),
+                pct: 20.0,
+                resets_at: Some(stamp(3600)),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("retyped")),
+        RosterRank::Window(80.0),
+        "the retyped profile ranks on its own live provider bar",
+    );
+
+    // Control: the same cache on an OAuth profile still ranks.
+    write_profile_cache(
+        &crate::profile::ProfileName::from("oauth"),
+        USAGE_CACHE_FILE,
+        &leftover,
+    );
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("oauth")),
+        RosterRank::Window(60.0),
+        "an OAuth profile's own cache still ranks",
+    );
+}
+
+/// A 19h-lapsed 5h at the 100% cap still published `5h_used_pct: 100.0` beside
+/// the already-filtered `windows[]` (#74): one reply saying two things about one
+/// window. A lapsed share reads `null` — the same unknown the dropped row
+/// renders — while a live window beside it keeps its number, and an unstamped
+/// window stays: no stamp is missing data, not a lapsed window.
+#[test]
+fn a_folded_live_usage_clause_gates_the_pct_fields_on_window_liveness() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["work"]);
+    let stamp = |offset_secs: i64| {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + offset_secs)
+    };
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("cache path");
+    let seeded = |five: Option<crate::usage::UsageWindow>,
+                  seven: Option<crate::usage::UsageWindow>| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: five,
+                seven_day: seven,
+                ..Default::default()
+            },
+        );
+        crate::testutil::set_mtime(
+            &cache_path,
+            std::time::SystemTime::now() - Duration::from_secs(240),
+        );
+        fold_delegate_live_usage(
+            serde_json::json!({"is_error": false, "result": "ok"}),
+            &crate::profile::ProfileName::from("work"),
+            delegate_call_endpoint("work", &HashMap::new()),
+            None,
+            0,
+            DigestMode::Skip,
+        )
+    };
+
+    let live = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(stamp(3600)),
+        }),
+        None,
+    );
+    assert_eq!(live["live_usage"]["5h_used_pct"], 42.0);
+
+    let lapsed = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(stamp(-3600)),
+        }),
+        Some(crate::usage::UsageWindow {
+            utilization: 25.0,
+            resets_at: Some(stamp(3600)),
+        }),
+    );
+    assert_eq!(
+        lapsed["live_usage"]["5h_used_pct"],
+        serde_json::Value::Null,
+        "a lapsed 5h publishes no share: the row dropped, so the figure beside it is not a reading",
+    );
+    assert_eq!(
+        lapsed["live_usage"]["7d_used_pct"], 25.0,
+        "the live 7d beside it keeps its number",
+    );
+
+    let unstamped = seeded(
+        Some(crate::usage::UsageWindow {
+            utilization: 30.0,
+            resets_at: None,
+        }),
+        None,
+    );
+    assert_eq!(
+        unstamped["live_usage"]["5h_used_pct"], 30.0,
+        "no stamp is missing data, not a lapsed window: the row stays, the share stays",
     );
 }
 

@@ -356,7 +356,10 @@ fn a_plain_get_rebuilds_rather_than_serving_a_torn_feed() {
         body["active_profile"], "alpha",
         "the answer is the rebuilt body, never the truncated file bytes"
     );
-    assert_eq!(body["schema"], serde_json::json!(1));
+    assert_eq!(
+        body["schema"],
+        serde_json::json!(crate::daemon::SCHEMA_VERSION)
+    );
 }
 
 // ---------------------------------------------------------------- auth

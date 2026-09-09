@@ -252,13 +252,13 @@ fn scalar_value(key: &str, value: &Value) -> Option<String> {
         return None;
     }
     if let Some(n) = value.as_f64() {
-        return Some(format_number(n));
+        return Some(crate::format::format_amount(n));
     }
     // Some providers return balances as numeric strings ("10.50").
     if let Some(s) = value.as_str()
         && let Ok(n) = s.trim().parse::<f64>()
     {
-        return Some(format_number(n));
+        return Some(crate::format::format_amount(n));
     }
     None
 }
@@ -291,14 +291,6 @@ fn parse_reset(value: &Value) -> Option<String> {
         return Some(crate::usage::epoch_secs_to_iso(secs));
     }
     None
-}
-
-fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
-    }
 }
 
 /// Split camelCase / snake_case / kebab-case into lowercase words. `TIME_LIMIT`

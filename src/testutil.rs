@@ -864,6 +864,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         credentials: None,
         usage: None,
         fetch_status: None,
+        usage_stale: false,
         provider: None,
         third_party_usage: None,
     }
@@ -967,14 +968,41 @@ pub(crate) const CAPTURED_TWO_WALLET_DS_CACHE: &str = r#"{"is_available":true,"r
 /// as before.
 pub(crate) const CAPTURED_ONE_WALLET_DS_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"3640.55 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"3640.55 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
 
+/// Parse a captured `third_party_cache.json`, re-anchor its bar stamps (see
+/// [`write_captured_third_party_cache`]), and hand back the re-serialized
+/// bytes — for a test whose route to disk is a raw file write rather than the
+/// production cache writer.
+pub(crate) fn reanchored_bars_cache_bytes(json: &str) -> Vec<u8> {
+    let mut parsed: crate::providers::ThirdPartyStats =
+        serde_json::from_str(json).expect("captured cache parses");
+    let now = crate::usage::now_epoch_secs();
+    for bar in &mut parsed.bars {
+        // Each bar is stamped now + its own window length, read off the label
+        // the provider itself wrote — not the captured stamp, whose offset
+        // from another bar's can be internally inconsistent (one capture held
+        // a 5h bar resetting days before its own 30d bar) and preserving it
+        // would re-create lapsed bars as real time moves. An unparseable label
+        // still gets a future stamp: a shape fixture is not a lapsed case.
+        let span = crate::usage::window_duration_secs(&bar.label).unwrap_or(3600);
+        bar.resets_at = Some(crate::usage::epoch_secs_to_iso(now + span));
+    }
+    serde_json::to_vec(&parsed).expect("re-serialized cache parses")
+}
+
 /// Parse a captured `third_party_cache.json` and write it at `name`'s
 /// sandboxed path through the production cache writer — the same route the
 /// fetch leg takes — so a consumer is driven by captured bytes, never a
 /// hand-built [`crate::providers::ThirdPartyStats`] that mirrors the reader's
-/// own guess.
+/// own guess. A captured bar's `resets_at` is an ABSOLUTE stamp, so real time
+/// drifting past it turns a fixture meant to exercise the bars SHAPE into a
+/// lapsed-window case the liveness gate legitimately drops: every parseable
+/// bar stamp is re-stamped at now plus its own window length (see
+/// [`reanchored_bars_cache_bytes`]), so a captured cache renders its shape
+/// forever and lapsed behaviour is pinned only by the tests that mean it.
 pub(crate) fn write_captured_third_party_cache(name: &str, json: &str) {
+    let bytes = reanchored_bars_cache_bytes(json);
     let parsed: crate::providers::ThirdPartyStats =
-        serde_json::from_str(json).expect("captured cache parses");
+        serde_json::from_slice(&bytes).expect("captured cache parses");
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from(name),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,

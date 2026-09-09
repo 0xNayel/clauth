@@ -360,6 +360,13 @@ pub(crate) struct Profile {
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
+    /// Cache age past [`crate::profile_json::stale_after_ms`] — the Usage tab's
+    /// degraded cue (#74). Fed by `tui::app::apply_usage` from the same age
+    /// source `status.json`'s `stale` arm reads (the body's `fetched_at` for
+    /// OAuth, the cache mtime for third-party), keyed to the live refresh
+    /// interval; a fact orthogonal to `fetch_status`, so a `cached` pill and
+    /// this cue can coexist.
+    pub(crate) usage_stale: bool,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
     /// Provider-specific usage data (e.g. DeepSeek balance).
@@ -390,6 +397,7 @@ impl Profile {
             credentials: slot(None),
             usage: None,
             fetch_status: None,
+            usage_stale: false,
             provider,
             third_party_usage: None,
         }
@@ -1550,15 +1558,29 @@ pub(crate) fn append_usage_sample_at(
     next: &UsageInfo,
     ts: u64,
 ) {
-    let Ok(next_json) = serde_json::to_string(next) else {
+    // `fetched_at` is a cache-age clock, not a usage figure: two live reads of
+    // the same numbers differ only in that stamp, so the unchanged check (and
+    // the lines it writes) exclude it. Otherwise a quiet account would append
+    // one line per poll instead of only when the numbers moved.
+    let mut next_body = next.clone();
+    next_body.fetched_at = None;
+    let Ok(next_json) = serde_json::to_string(&next_body) else {
         return;
     };
-    let bridge_json = prev.and_then(|p| serde_json::to_string(p).ok());
+    let bridge_json = prev.and_then(|p| {
+        let mut p = p.clone();
+        p.fetched_at = None;
+        serde_json::to_string(&p).ok()
+    });
     let unchanged = match &bridge_json {
         Some(json) => json == &next_json,
         None => load_usage_history(name)
             .last()
-            .and_then(|(_, info)| serde_json::to_string(info).ok())
+            .and_then(|(_, info)| {
+                let mut info = info.clone();
+                info.fetched_at = None;
+                serde_json::to_string(&info).ok()
+            })
             .is_some_and(|json| json == next_json),
     };
     if unchanged {
@@ -2287,6 +2309,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         credentials: slot(credentials),
         usage: None,
         fetch_status: None,
+        usage_stale: false,
         provider,
         third_party_usage,
     };

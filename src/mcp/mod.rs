@@ -121,10 +121,25 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
 /// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
 /// cache (no caching across tool calls per the design). The roster's own rank
 /// reads this: it asks for the two figures it sorts on, and consults the
-/// third-party cache itself for an account that has no such window.
+/// third-party cache itself for an account that has no such window. A window
+/// whose reset has passed reads `None` (#74) — the same liveness the published
+/// `windows` array filters on — so a lapsed 5h at the cap ranks on the next
+/// live figure instead of sorting the account to the bottom of the roster.
+/// The shared cache selector gates the read itself: a retyped profile's
+/// leftover `usage_cache.json` is a fossil from its OAuth life, not headroom,
+/// so it is dropped here exactly as `published_windows` drops it from the feed
+/// and the rank falls to the provider's own bars or wallet (#74).
 fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    let live = |w: &Option<UsageWindow>| {
+        w.as_ref()
+            .filter(|w| crate::profile_json::window_row_is_live(w))
+            .cloned()
+    };
+    if crate::profile::stored_usage_cache_is_third_party(name) {
+        return (None, None);
+    }
     match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
-        Some(u) => (u.five_hour, u.seven_day),
+        Some(u) => (live(&u.five_hour), live(&u.seven_day)),
         None => (None, None),
     }
 }
@@ -285,8 +300,15 @@ fn roster_rank(name: &ProfileName) -> RosterRank {
     if let Some(bar) = stats
         .bars
         .iter()
+        .filter(|b| crate::profile_json::usage_bar_is_live(b))
         .find(|b| b.label == "5h")
-        .or_else(|| stats.bars.iter().find(|b| b.label == "7d"))
+        .or_else(|| {
+            stats
+                .bars
+                .iter()
+                .filter(|b| crate::profile_json::usage_bar_is_live(b))
+                .find(|b| b.label == "7d")
+        })
     {
         return RosterRank::Window(100.0 - bar.pct);
     }
@@ -351,16 +373,17 @@ fn live_usage_json(profile: Option<&str>, windows: Option<&ProfileWindows>) -> s
     // are the pools every other such figure in clauth refers to.
     if let ProfileWindows::Oauth { usage, .. } = windows {
         let usage = usage.as_deref();
-        payload["5h_used_pct"] = serde_json::json!(
-            usage
-                .and_then(|u| u.five_hour.as_ref())
+        // The same liveness the published `windows` array filters on (#74):
+        // a lapsed share reads `null` beside the row that already dropped, so
+        // one reply cannot call one window both spent and gone.
+        let live_pct = |w: Option<&UsageWindow>| {
+            w.filter(|w| crate::profile_json::window_row_is_live(w))
                 .map(|w| w.utilization)
-        );
-        payload["7d_used_pct"] = serde_json::json!(
-            usage
-                .and_then(|u| u.seven_day.as_ref())
-                .map(|w| w.utilization)
-        );
+        };
+        payload["5h_used_pct"] =
+            serde_json::json!(usage.and_then(|u| live_pct(u.five_hour.as_ref())));
+        payload["7d_used_pct"] =
+            serde_json::json!(usage.and_then(|u| live_pct(u.seven_day.as_ref())));
     }
     payload
 }

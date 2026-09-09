@@ -45,17 +45,19 @@ use crate::profile::{
     ModelSettings, PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
     load_config, reload_fingerprint, save_app_state, save_profile,
 };
+use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
+use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, OpResult,
-    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
+    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
+    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
     ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
-    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
-    now_ms, spawn_refresher, switch_gate_in_flight,
+    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
+    TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
+    clear_activity, collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle,
+    mark_activity, now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -2227,24 +2229,25 @@ impl App {
             // past). The first tick re-marks (idempotent); each worker flips itself
             // to Fetching when its request fires and clears on landing.
             let now = now_ms();
-            let due_now: Vec<String> = match h.last_fetched.lock() {
+            let due_now: Vec<crate::usage::LegKey> = match h.last_fetched.lock() {
                 Ok(lf) => snapshot
                     .iter()
-                    .map(|e| e.name.to_string())
-                    .chain(third_party.iter().map(|e| e.name.to_string()))
-                    .filter(|n| {
-                        lf.get(n)
-                            .is_none_or(|t| t.as_millis().saturating_add(interval_ms) <= now)
+                    .map(|e| FetchLeg::OAuth.key(e.name.clone()))
+                    .chain(
+                        third_party
+                            .iter()
+                            .map(|e| FetchLeg::ThirdParty.key(e.name.clone())),
+                    )
+                    .filter(|key| {
+                        lf.get(key).is_none_or(|stamp| {
+                            stamp.as_millis().saturating_add(interval_ms) <= now
+                        })
                     })
                     .collect(),
                 Err(_) => Vec::new(),
             };
-            for name in &due_now {
-                mark_activity(
-                    &h.activity,
-                    &ProfileName::from(name.clone()),
-                    ProfileActivity::Queued,
-                );
+            for key in &due_now {
+                crate::usage::mark_fetch_activity(&h.activity, key, ProfileActivity::Queued);
             }
         });
     }
@@ -2344,10 +2347,11 @@ impl App {
     /// Bundle scheduler `Arc`s and launch the background refresher.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
-        // Session-scoped suppressed-generic set: rebuilt fresh each TUI launch,
+        // Session-scoped suppressed-auth-expired set: rebuilt fresh each TUI launch,
         // dropped on exit. Purely scheduler-internal — the App never touches it
         // (manual refresh clears suppression via the shared forced queue).
-        let suppressed_generic: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let suppressed_auth_expired: SuppressedAuthExpiredStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -2366,7 +2370,7 @@ impl App {
             h.third_party_tokens,
             h.third_party_usage_store,
             h.third_party_status,
-            suppressed_generic,
+            suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
             // like any instance, standing its refresher down while another holds
@@ -2387,6 +2391,9 @@ impl App {
             let info_map = self.usage_store.lock().ok();
             let status_map = self.usage_status.lock().ok();
             let mut cfg = self.config();
+            let now = now_ms();
+            let interval_ms = cfg.state.refresh_interval_ms;
+            let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             for p in &mut cfg.profiles {
                 if let Some(s) = info_map.as_ref() {
                     p.usage = s.get(p.name.as_str()).cloned();
@@ -2404,6 +2411,38 @@ impl App {
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
                 }
+                // #74 degraded cue: cache age past the derived threshold reads
+                // stale, independent of fetch_status. Same threshold, same
+                // maxed-window exemption, and same age source as
+                // `status.json`'s `age_stale` arm — the exemption reads the
+                // DISK cache (`load_profile_cache`), never the live store,
+                // because the two can diverge on a spent account the
+                // scheduler dropped from its due set: reading the store there
+                // would publish the exact disagreement the exemption exists
+                // to prevent. OAuth goes through the one age contract
+                // (`oauth_age`), the same one `status.json` and the MCP payloads
+                // read; third-party figures keep the cache mtime.
+                let oauth_usage = if p.usage_cache_is_third_party() {
+                    None
+                } else {
+                    load_profile_cache::<UsageInfo>(&p.name, USAGE_CACHE_FILE)
+                };
+                let spent_skipped = !refresh_spent_accounts
+                    && oauth_usage
+                        .as_ref()
+                        .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
+                let past_threshold = if p.usage_cache_is_third_party() {
+                    profile_cache_mtime_ms(&p.name, usage_cache_file(p))
+                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
+                } else {
+                    crate::profile_json::oauth_age(oauth_usage.as_ref(), now).is_stale(
+                        stale_after_ms(interval_ms),
+                        oauth_usage
+                            .as_ref()
+                            .is_some_and(crate::profile_json::publishes_a_live_window),
+                    )
+                };
+                p.usage_stale = !spent_skipped && past_threshold;
             }
 
             bells = cfg
@@ -2565,12 +2604,18 @@ impl App {
     /// `/profile` TTL so the next fetch re-pulls plan/tier — set for an explicit
     /// single-profile refresh, cleared for the bulk refresh-all.
     fn enqueue_refetch(&self, name: &ProfileName, refresh_plan: bool) {
-        // Light a pending spinner immediately so the UI reflects the keypress.
-        // Only when idle — don't clobber an in-flight switch/refresh marker. The
-        // next tick's worker flips Queued→Fetching when its request fires; a name
-        // no leg owns is cleared by the tick's orphan sweep.
-        if is_idle(&self.activity, name) {
-            mark_activity(&self.activity, name, ProfileActivity::Queued);
+        // Light the selected cache leg immediately. Account-scoped refresh/switch
+        // work stays untouched and outranks this marker in the render helper.
+        let leg = {
+            let config = self.config();
+            config.find(name).map(crate::usage::FetchLeg::for_profile)
+        };
+        if let Some(leg) = leg {
+            crate::usage::mark_fetch_activity(
+                &self.activity,
+                &leg.key(name.clone()),
+                ProfileActivity::Queued,
+            );
         }
         if refresh_plan {
             crate::usage::expire_profile_ttl(name);
@@ -9613,11 +9658,9 @@ fn update_banner(app: &mut App) {
 fn drain_op_results(app: &mut App) {
     let mut needs_token_snapshot_rebuild = false;
     while let Ok(OpResult { name, outcome }) = app.op_results.try_recv() {
-        if let Ok(mut a) = app.activity.lock()
-            && a.get(&name).copied() == Some(ProfileActivity::Refreshing)
-        {
-            a.remove(&name);
-        }
+        // The rotation marker alone: this result arrives a tick or more after
+        // its worker returned, so the OAuth leg may already belong to a refetch.
+        crate::usage::end_rotation(&app.activity, &ProfileName::from(name.clone()));
         match outcome {
             Ok(()) => {
                 needs_token_snapshot_rebuild = true;
