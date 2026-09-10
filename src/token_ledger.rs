@@ -52,7 +52,7 @@ const LEDGER_FILE: &str = "token_ledger.json";
 /// The usage-shape classifier version this build re-derives recorded days
 /// under. Each classifier change bumps it; every ledger stamped below it owes
 /// exactly one re-derive pass.
-pub(crate) const SHAPE_CLF_VERSION: u16 = 2;
+pub(crate) const SHAPE_CLF_VERSION: u16 = 3;
 
 /// One model's stored split for one day (mirrors [`ModelTokens`] without the
 /// redundant `model` name, which is the map key). `hours` is the schema-v2
@@ -348,27 +348,19 @@ impl Ledger {
 
     /// Correct the stored days from a re-derived transcript corpus
     /// ([`crate::tokens::backfill_corpus`], whose parse classifies + corrects
-    /// per (file, model)). Exact-or-correct, both directions:
-    ///
-    /// - a stored row whose re-derivation equals it on all four fields keeps
-    ///   its values and gains the re-derived `shape` — a day that holds no
-    ///   correction, or one an earlier classifier already corrected the way
-    ///   this one does;
-    /// - a stored row whose re-derivation classifies
-    ///   [`UsageShape::WholePromptInput`] with
-    ///   `input == stored_input - stored_cache_read` (a pre-classifier row
-    ///   that never got its subtraction) adopts the corrected split, hours,
-    ///   and marker;
-    /// - a stored row whose re-derivation classifies a never-correcting shape
-    ///   with `input == stored_input + stored_cache_read` (a row an earlier
-    ///   classifier over-subtracted) adopts the re-derived split, hours, and
-    ///   marker.
-    ///
-    /// Any other mismatch means the corpus no longer covers the day: the row
-    /// keeps its recorded values and gets the [`UsageShape::Healthy`] marker,
-    /// which never corrects — unverifiable rather than silently corrected.
-    /// Days the corpus cannot reach at all stay entirely untouched (same
-    /// marker rule). Stamps [`SHAPE_CLF_VERSION`] either way.
+    /// per (file, model)). Coverage-gated: a stored row whose re-derivation
+    /// equals it on output, cache-read and cache-create was built from the
+    /// same rows, so whatever its `input` delta is, it is pure classification
+    /// — adopt the re-derived input, shape and hours. No per-direction
+    /// arithmetic can gate this: a mixed day (some files legitimately
+    /// corrected, some over- or under-corrected by an earlier classifier)
+    /// matches no exact relation against the stored split, so the v2
+    /// re-derive left exactly those days uncorrected. Any other mismatch
+    /// means the corpus no longer covers the day (pruned): the row keeps its
+    /// recorded values and gets the [`UsageShape::Healthy`] marker, which
+    /// never corrects — unverifiable rather than silently corrected. Days the
+    /// corpus cannot reach at all stay entirely untouched (same marker
+    /// rule). Stamps [`SHAPE_CLF_VERSION`] either way.
     pub(crate) fn rederive_shapes(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
         for ((date, model), acc) in derived {
             let Some(day) = self.days.get_mut(date) else {
@@ -377,33 +369,12 @@ impl Ledger {
             let Some(w) = day.get_mut(model) else {
                 continue;
             };
-            let covers = acc.flat.output == w.output
-                && acc.flat.cache_read == w.cache_read
-                && acc.flat.cache_create == w.cache_create;
-            if covers
-                && acc.flat.shape == UsageShape::WholePromptInput
-                && acc.flat.input == w.input.saturating_sub(w.cache_read)
-            {
-                // A pre-classifier row that never got its subtraction: adopt
-                // the corrected split + hours + shape.
-                w.input = acc.flat.input;
-                w.hours = Some(acc.hours.map(WireHour::from));
-                w.shape = UsageShape::WholePromptInput;
-            } else if covers
-                && acc.flat.shape != UsageShape::WholePromptInput
-                && acc.flat.input == w.input.saturating_add(w.cache_read)
-            {
-                // A row an earlier classifier over-subtracted: adopt the
-                // re-derived split + hours + shape.
-                w.input = acc.flat.input;
-                w.hours = Some(acc.hours.map(WireHour::from));
-                w.shape = acc.flat.shape;
-            } else if acc.flat.input == w.input
-                && acc.flat.output == w.output
+            if acc.flat.output == w.output
                 && acc.flat.cache_read == w.cache_read
                 && acc.flat.cache_create == w.cache_create
             {
-                // Equal on all four: stamp the re-derived shape.
+                w.input = acc.flat.input;
+                w.hours = Some(acc.hours.map(WireHour::from));
                 w.shape = acc.flat.shape;
             }
             // Any other mismatch: unverifiable — keep values, keep the

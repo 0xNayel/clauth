@@ -2942,6 +2942,84 @@ fn rederive_unpoisons_over_subtracted_day() {
     assert!(has_hours, "un-poisoned row gains hourly buckets");
 }
 
+/// A stored pre-classifier day whose correction delta is MIXED — one file's
+/// whole-prompt subtraction, not the day's whole cache_read — matches no
+/// per-direction arithmetic (stored − cr and stored + cr both miss), so only
+/// the coverage gate can adopt it.
+#[test]
+fn rederive_adopts_mixed_day_beyond_exact_arithmetic() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    // Stored raw row: in=1_199_999, out=48, cr=499_995 (the corpus sums).
+    write_v0_ledger_day(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        "glm-5.3",
+        (1_199_999, 48, 499_995, 0),
+    );
+
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    // Whole-prompt file: flat cache_read under constant input, no dips, no
+    // accumulation — classifies WholePromptInput and contributes
+    // in - cr = 400_000 of its 800_000 raw input.
+    for i in 0..8 {
+        s.push_str(
+            r#"{"timestamp":"2026-06-15T0I:00:00+00:00","message":{"id":"wI","model":"glm-5.3","role":"assistant","usage":{"input_tokens":100000,"output_tokens":3,"cache_read_input_tokens":50000,"cache_creation_input_tokens":0}}}"#
+                .replace("I", &i.to_string())
+                .as_str(),
+        );
+        s.push('\n');
+    }
+    std::fs::write(proj.join("sess-w.jsonl"), s).expect("write");
+    set_mtime(
+        &proj.join("sess-w.jsonl"),
+        epoch_day("2026-06-15") + Duration::from_secs(60),
+    );
+    // The anthropic rows sit in their own file: classification is per
+    // (file, model), and one 16-row group would merge the two shapes.
+    let mut a = String::new();
+    a.push_str(
+        r#"{"timestamp":"2026-06-15T08:00:00+00:00","message":{"id":"a0","model":"glm-5.3","role":"assistant","usage":{"input_tokens":390003,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+    );
+    a.push('\n');
+    for i in 1..8 {
+        a.push_str(
+            r#"{"timestamp":"2026-06-15T0I:30:00+00:00","message":{"id":"aI","model":"glm-5.3","role":"assistant","usage":{"input_tokens":1428,"output_tokens":3,"cache_read_input_tokens":14285,"cache_creation_input_tokens":0}}}"#
+                .replace("I", &i.to_string())
+                .as_str(),
+        );
+        a.push('\n');
+    }
+    std::fs::write(proj.join("sess-a.jsonl"), a).expect("write");
+    set_mtime(
+        &proj.join("sess-a.jsonl"),
+        epoch_day("2026-06-15") + Duration::from_secs(90),
+    );
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut progress = |_: usize, _: usize| {};
+    assert!(super::run_rederive(
+        &claude_dir,
+        &mut ledger,
+        "2026-06-20",
+        &mut progress
+    ));
+    assert_eq!(ledger.shape_clf(), crate::token_ledger::SHAPE_CLF_VERSION);
+    let (input, output, cr, cc, shape, has_hours) = ledger
+        .wire_model_fields("2026-06-15", "glm-5.3")
+        .expect("day row present");
+    // The delta is 400_000 (the whole-prompt file's cache_read), not the
+    // day's 499_995 — stored - cr and stored + cr both miss it.
+    assert_eq!(input, 799_999, "the mixed correction is adopted");
+    assert_eq!((output, cr, cc), (48, 499_995, 0));
+    assert_eq!(shape, crate::tokens::UsageShape::WholePromptInput);
+    assert!(has_hours, "adopted row gains hourly buckets");
+}
+
 /// A v1 file whose `rederive_done` flag read true still owes the versioned
 /// pass: the dropped key is ignored on load and the version reads 0.
 #[test]
