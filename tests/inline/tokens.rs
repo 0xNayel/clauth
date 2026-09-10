@@ -2066,7 +2066,7 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
         .expect("ledger day folded");
     assert!(row.hours.is_none(), "nothing filled, nothing changed");
 }
-// ── usage-shape classification (A1/A2/B) ─────────────────────────────────────
+// ── usage-shape classification ─────────────────────────────────────
 
 /// Load one committed shape fixture (trimmed real transcript bytes, the
 /// `wire-parity.md` precedent: golden shape from real usage, not synthesized).
@@ -2116,7 +2116,10 @@ fn raw_sums(path: &std::path::Path) -> (u64, u64, u64, u64) {
 fn a1_fixture_corrects_input_to_uncached_tail() {
     let path = shape_fixture("tokens-shape-a1.jsonl");
     let (raw_in, raw_out, raw_cr, raw_cc) = raw_sums(&path);
-    assert_eq!(raw_cc, 0, "A1 never reports cache writes");
+    assert_eq!(
+        raw_cc, 0,
+        "a whole-prompt reporter never reports cache writes"
+    );
     let (input, output, cr, cc, shape, _) = fixture_totals(&path);
     assert_eq!(shape, UsageShape::WholePromptInput);
     assert_eq!(
@@ -2157,24 +2160,29 @@ fn b_fixture_reads_no_cache_reporting() {
     assert!(input > 0 && output > 0);
 }
 
-/// Pin both sides of the 2.0 threshold: a ratio below 2 classifies A1,
-/// at or above 2 classifies A2. Same row count so only the ratio decides.
+/// Pin both whole-prompt discriminators on files a sum-ratio reading cannot
+/// separate: constant cache reads under growing input classify whole-prompt
+/// (the chain never accumulates), rows with `input < cache_read` classify
+/// NoCacheWrites (a whole-prompt reporter's input contains its cached prefix).
+/// Same row count so only the row structure decides.
 #[test]
-fn ratio_threshold_pins_both_sides() {
+fn ladder_pins_whole_prompt_vs_anthropic() {
     let sb = HomeSandbox::new();
     let claude_dir = make_claude_dir(&sb);
     let proj = claude_dir.join("projects/p1");
     std::fs::create_dir_all(&proj).expect("mkdir");
 
-    // 8 rows; per-row input = cr + 50 keeps the in-row subtraction safe.
-    // below: sum(cr)=440, sum(in)=840 → 440 < 2*840 → A1.
+    // 8 rows; per-row input = cr + 500 keeps the in-row subtraction safe.
+    // below: sum(cr)=440_000, sum(in)=444_428 → 0.99 < 2 → whole-prompt under the old
+    // ratio classifier; cr stays flat while input grows, so the accumulation
+    // identity never holds.
     let mut below = String::new();
     for i in 0..8 {
-        let cr = 55;
+        let cr = 55_000;
         below.push_str(&jsonl_line(
             &format!("2026-06-11T0{i}:00:00+00:00"),
             "m",
-            cr + 50 + i,
+            cr + 500 + i,
             1,
             cr,
             0,
@@ -2193,15 +2201,15 @@ fn ratio_threshold_pins_both_sides() {
         UsageShape::WholePromptInput
     );
 
-    // above: sum(cr)=16_000, sum(in)=8_428 → ratio ≥ 2 → A2. Per-row
-    // input stays below its cache_read, the healthy-tail inversion A2 shows.
+    // above: sum(cr)=1_600_000, sum(in)=80_428 → ratio ≥ 2 → write-missing. Per-row
+    // input stays below its cache_read, the healthy-tail inversion it shows.
     let mut above = String::new();
     for i in 0..8 {
-        let cr = 2_008;
+        let cr = 200_000;
         above.push_str(&jsonl_line(
             &format!("2026-06-12T0{i}:00:00+00:00"),
             "m",
-            1_000 + i,
+            10_000 + i,
             1,
             cr,
             0,
@@ -2221,7 +2229,339 @@ fn ratio_threshold_pins_both_sides() {
     );
 }
 
-/// Fewer than 8 usage rows classifies Healthy even with A1-shaped numbers:
+/// C: the gpt-5.6-sol accumulator family, trimmed real usage bytes from
+/// `27e9bbc1…/subagents/agent-a91f441e8262888f9.jsonl` — small Anthropic
+/// tails under a growing `cache_read`, interleaved with huge field-absent
+/// rows that drag the file-wide read sum low. Every read-bearing row dips
+/// below its `cache_read`, so the evidence dominates and the input stays
+/// unreduced inside the sum zone the old ratio classifier subtracted in.
+#[test]
+fn c_fixture_low_ratio_rows_below_cache_read_stay_anthropic() {
+    let path = shape_fixture("tokens-shape-c.jsonl");
+    let (raw_in, _, raw_cr, raw_cc) = raw_sums(&path);
+    assert!(raw_cr < 2 * raw_in, "fixture sits in the old subtract zone");
+    let recs = super::parse_file(&path);
+    let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
+    assert!(
+        usage.iter().any(|r| r.input < r.cache_read),
+        "fixture carries rows only an Anthropic-shaped reporter emits"
+    );
+    assert_eq!(
+        usage
+            .iter()
+            .map(|r| r.shape)
+            .max_by_key(|s| super::shape_rank(*s))
+            .unwrap(),
+        UsageShape::NoCacheWrites
+    );
+    let input: u64 = usage.iter().map(|r| r.input).sum();
+    assert_eq!(
+        input, raw_in,
+        "input stays the uncached tail the reporter sent"
+    );
+    assert_eq!(raw_cc, 0);
+}
+
+/// D: an Anthropic-shaped reporter whose every turn's tail exceeds its
+/// cached prefix — no row dips below `cache_read`, file-wide ratio under any
+/// whole-prompt reading. No corpus instance of this shape has been observed
+/// (2026-09-10, full-corpus sweep); the test pins the accumulation-identity
+/// safety net that classifies it anyway.
+#[test]
+fn d_inline_tails_above_cache_chain_accumulates() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    // cr(t+1) = cr(t) + in(t) exactly, with in(t+1) > cr(t+1) every turn.
+    let rows: [(u64, u64); 12] = [
+        (10_000, 0),
+        (15_000, 10_000),
+        (25_500, 25_000),
+        (51_000, 50_500),
+        (102_000, 101_500),
+        (204_000, 203_500),
+        (408_000, 407_500),
+        (816_000, 815_500),
+        (1_632_000, 1_631_500),
+        (3_264_000, 3_263_500),
+        (6_528_000, 6_527_500),
+        (13_056_000, 13_055_500),
+    ];
+    for (i, (inp, cr)) in rows.iter().enumerate() {
+        s.push_str(&jsonl_line(
+            &format!("2026-06-11T{:02}:00:00+00:00", i),
+            "glm-5.3",
+            *inp,
+            1,
+            *cr,
+            0,
+        ));
+        s.push('\n');
+    }
+    let p = proj.join("d.jsonl");
+    std::fs::write(&p, s).expect("write");
+    let recs = super::parse_file(&p);
+    let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
+    assert_eq!(usage.len(), 12);
+    let raw_in: u64 = usage.iter().map(|r| r.input).sum();
+    let raw_cr: u64 = usage.iter().map(|r| r.cache_read).sum();
+    assert!(raw_cr < 2 * raw_in, "fixture sits in the old subtract zone");
+    assert!(
+        usage.iter().all(|r| r.input >= r.cache_read),
+        "fixture never dips a row below its cache_read"
+    );
+    assert_eq!(
+        usage
+            .iter()
+            .map(|r| r.shape)
+            .max_by_key(|s| super::shape_rank(*s))
+            .unwrap(),
+        UsageShape::NoCacheWrites
+    );
+    assert_eq!(
+        usage.iter().map(|r| r.input).sum::<u64>(),
+        rows.iter().map(|r| r.0).sum::<u64>(),
+        "input stays the uncached tail the reporter sent"
+    );
+}
+
+/// The dip fraction gates at half the read-bearing rows, inclusively: a
+/// mixed file whose anthropic prefix is a minority (endpoint swap
+/// mid-session) keeps its whole-prompt majority classification, while the
+/// same file one dip richer classifies NoCacheWrites.
+#[test]
+fn dip_fraction_boundary_is_inclusive_half() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    // Six read-bearing rows: the first three dip below their cache_read,
+    // the last three sit above it; two field-absent rows pad past the floor.
+    // cache_read never accumulates, so the identity cannot rescue the file.
+    let read_rows: [(u64, u64); 6] = [
+        (100_000, 1_000_000),
+        (200_000, 1_000_000),
+        (300_000, 1_000_000),
+        (900_000, 500_000),
+        (800_000, 500_000),
+        (700_000, 500_000),
+    ];
+    for (name, third_row, expect) in [
+        ("half", (300_000, 1_000_000), UsageShape::NoCacheWrites),
+        (
+            "under",
+            (1_300_000, 1_000_000),
+            UsageShape::WholePromptInput,
+        ),
+    ] {
+        let mut rows = read_rows;
+        rows[2] = third_row;
+        let mut s = String::new();
+        for (i, (inp, cr)) in rows.iter().enumerate() {
+            s.push_str(&jsonl_line(
+                &format!("2026-06-11T{:02}:30:00+00:00", i),
+                "glm-5.3",
+                *inp,
+                1,
+                *cr,
+                0,
+            ));
+            s.push('\n');
+        }
+        for i in 0..2 {
+            s.push_str(&jsonl_line(
+                &format!("2026-06-12T{:02}:00:00+00:00", i),
+                "glm-5.3",
+                400_000 + i,
+                0,
+                0,
+                0,
+            ));
+            s.push('\n');
+        }
+        let p = proj.join(format!("{name}.jsonl"));
+        std::fs::write(&p, s).expect("write");
+        let recs = super::parse_file(&p);
+        assert_eq!(
+            recs.iter()
+                .filter(|r| r.has_usage)
+                .map(|r| r.shape)
+                .max_by_key(|s| super::shape_rank(*s))
+                .unwrap(),
+            expect,
+            "{name}: three-of-six dipping rows must sit exactly on the boundary"
+        );
+    }
+}
+
+/// E: a fully-cached whole-prompt reporter emits `input == cache_read`
+/// exactly, per row — the correction zeroes input and keeps the read.
+#[test]
+fn e_fixture_fully_cached_whole_prompt_zeroes_input() {
+    let path = shape_fixture("tokens-shape-e.jsonl");
+    let (raw_in, raw_out, raw_cr, raw_cc) = raw_sums(&path);
+    assert!(raw_in == raw_cr, "fixture is fully cached by construction");
+    let (input, output, cr, cc, shape, _) = fixture_totals(&path);
+    assert_eq!(shape, UsageShape::WholePromptInput);
+    assert_eq!(input, 0, "the whole prompt rides cache_read alone");
+    assert_eq!((output, cr, cc), (raw_out, raw_cr, raw_cc));
+}
+
+/// The exact `input == cache_read` signature decides even below the row
+/// floor: it is per-row arithmetic, not statistical evidence.
+#[test]
+fn fully_cached_signature_decides_below_row_floor() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    for i in 0..4 {
+        s.push_str(&jsonl_line(
+            &format!("2026-06-11T0{i}:00:00+00:00"),
+            "z-ai/glm-5.3-free",
+            1920 + i,
+            1,
+            1920 + i,
+            0,
+        ));
+        s.push('\n');
+    }
+    let p = proj.join("eq.jsonl");
+    std::fs::write(&p, s).expect("write");
+    let recs = super::parse_file(&p);
+    let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
+    assert_eq!(usage.len(), 4);
+    assert!(
+        usage
+            .iter()
+            .all(|r| r.shape == UsageShape::WholePromptInput)
+    );
+    assert!(usage.iter().all(|r| r.input == 0));
+    let cr_sum: u64 = usage.iter().map(|r| r.cache_read).sum();
+    assert_eq!(cr_sum, 1920 + 1921 + 1922 + 1923);
+}
+
+/// The streamed-turn collapse keeps first-occurrence order: the shape
+/// ladder's chain arm reads consecutive turns, and a dedup map's iteration
+/// order is not an order.
+#[test]
+fn collapse_keeps_first_occurrence_order() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    // Three distinct ids in file order; the second emits a larger delta
+    // afterwards, which must replace it in place rather than move it.
+    s.push_str(&jsonl_line_with_ids(
+        "2026-06-11T01:00:00+00:00",
+        "r1",
+        "m1",
+        "m",
+        100,
+        1,
+    ));
+    s.push('\n');
+    s.push_str(&jsonl_line_with_ids(
+        "2026-06-11T02:00:00+00:00",
+        "r2",
+        "m2",
+        "m",
+        200,
+        1,
+    ));
+    s.push('\n');
+    s.push_str(&jsonl_line_with_ids(
+        "2026-06-11T03:00:00+00:00",
+        "r3",
+        "m3",
+        "m",
+        300,
+        1,
+    ));
+    s.push('\n');
+    s.push_str(&jsonl_line_with_ids(
+        "2026-06-11T02:00:00+00:00",
+        "r2",
+        "m2",
+        "m",
+        200,
+        500,
+    ));
+    s.push('\n');
+    let p = proj.join("order.jsonl");
+    std::fs::write(&p, s).expect("write");
+    let recs = super::parse_file(&p);
+    let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
+    assert_eq!(usage.len(), 3);
+    assert_eq!(
+        usage.iter().map(|r| r.input).collect::<Vec<_>>(),
+        vec![100, 200, 300],
+        "ids stay in file order across the in-place replacement"
+    );
+    assert_eq!(usage[1].output, 500, "the larger delta won its slot");
+}
+
+/// A minimal usage row for the shape-helper unit tests.
+fn lrec(input: u64, cache_read: u64) -> super::LineRec {
+    super::LineRec {
+        date: "2026-06-11".to_owned(),
+        hour: 0,
+        uuid: String::new(),
+        session: String::new(),
+        is_message: true,
+        has_usage: true,
+        tok_key: String::new(),
+        model: "m".to_owned(),
+        input,
+        output: 1,
+        cache_read,
+        cache_create: 0,
+        shape: UsageShape::Healthy,
+        tool_calls: 0,
+    }
+}
+
+/// The accumulation identity's absolute slack floor: block-quantized
+/// counters (multiples of 64) on small early pairs deviate past the relative
+/// bound on rounding alone, and the floor keeps those pairs passing.
+#[test]
+fn identity_slack_floor_covers_small_early_pairs() {
+    // Every pair deviates by exactly 128 tokens; the first pairs' expected
+    // values sit under 2_560, where 5% is less than 128, so only the floor
+    // passes them.
+    let mut rows = vec![lrec(100, 1_000)];
+    for _ in 0..7 {
+        let prev = rows.last().expect("non-empty");
+        rows.push(lrec(200, prev.cache_read + prev.input + 128));
+    }
+    let idxs: Vec<usize> = (0..rows.len()).collect();
+    assert!(super::majority_pairs_cache_read_accumulates(
+        &rows,
+        &idxs[..]
+    ));
+}
+
+/// A pair whose earlier row reports no read metric is not counted: the
+/// identity degenerates to `cache_read(t+1) ≈ input(t)`, which a whole-prompt
+/// reporter that also caches the prior response satisfies within its output.
+#[test]
+fn identity_skips_pairs_after_a_read_absent_row() {
+    // One exact pair after a read-absent row: the majority is 1/1 with the
+    // skip, and the read-absent pair's failure would make it 1/2 without.
+    let rows = [
+        lrec(100_000, 0),
+        lrec(50_000, 50_000),
+        lrec(60_000, 100_000),
+    ];
+    let idxs = [0usize, 1, 2];
+    assert!(super::majority_pairs_cache_read_accumulates(&rows, &idxs));
+}
+
+/// Fewer than 8 usage rows classifies Healthy even with whole-prompt-shaped numbers:
 /// never correct on thin evidence.
 #[test]
 fn thin_evidence_classifies_healthy() {
@@ -2231,7 +2571,7 @@ fn thin_evidence_classifies_healthy() {
     std::fs::create_dir_all(&proj).expect("mkdir");
     let mut s = String::new();
     for i in 0..7 {
-        // Ratio ~0.5 (A1-shaped) but only 7 rows; distinct input per row so
+        // Ratio ~0.5 (whole-prompt-shaped) but only 7 rows; distinct input per row so
         // the id-less composite dedup key keeps all 7.
         s.push_str(&jsonl_line(
             &format!("2026-06-11T0{i}:00:00+00:00"),
@@ -2257,7 +2597,7 @@ fn thin_evidence_classifies_healthy() {
     );
 }
 
-/// A model can be A1 in one file and healthy in another (official z.ai vs
+/// A model can be whole-prompt in one file and healthy in another (official z.ai vs
 /// tokenrouter, same model id): per-(file, model) classification keeps them
 /// separate, and an aggregate merging both carries the strongest shape.
 #[test]
@@ -2272,9 +2612,9 @@ fn same_model_two_files_two_shapes() {
         a1.push_str(&jsonl_line(
             &format!("2026-06-11T0{i}:00:00+00:00"),
             "glm-5.3",
-            100 + i,
+            100_000 + i,
             1,
-            50,
+            50_000,
             0,
         ));
         a1.push('\n');
@@ -2286,9 +2626,9 @@ fn same_model_two_files_two_shapes() {
         healthy.push_str(&jsonl_line(
             &format!("2026-06-12T0{i}:00:00+00:00"),
             "glm-5.3",
-            100,
+            100_000,
             1,
-            50,
+            50_000,
             5,
         ));
         healthy.push('\n');
@@ -2322,7 +2662,7 @@ fn same_model_two_files_two_shapes() {
     );
 }
 
-// ── shape re-derive (pre-classifier ledger days) ─────────────────────────────
+// ── shape re-derive (older-classifier ledger days) ──────────────────────────
 
 /// Write a pre-classifier ledger row: no `shape` key on the wire, so it
 /// loads `Healthy` and owes the re-derive pass.
@@ -2346,7 +2686,31 @@ fn write_v0_ledger_day(
     std::fs::write(clauth_dir.join("token_ledger.json"), json).expect("write ledger");
 }
 
-/// A stored pre-classifier day whose corpus re-derives as A1 with exactly
+/// Write a ledger row carrying an explicit `shape` — a day recorded under the
+/// v1 ratio classifier.
+fn write_v1_ledger_day(
+    clauth_dir: &std::path::Path,
+    recorded_through: &str,
+    day: &str,
+    model: &str,
+    values: (u64, u64, u64, u64),
+    shape: &str,
+) {
+    let (input, output, cache_read, cache_create) = values;
+    std::fs::create_dir_all(clauth_dir).expect("mkdir");
+    let json = r#"{"recorded_through":"RT","days":{"D":{"M":{"input":I,"output":O,"cache_read":C,"cache_create":K,"shape":"S"}}}}"#
+        .replace("RT", recorded_through)
+        .replace("D", day)
+        .replace("M", model)
+        .replace("I", &input.to_string())
+        .replace("O", &output.to_string())
+        .replace("C", &cache_read.to_string())
+        .replace("K", &cache_create.to_string())
+        .replace("S", shape);
+    std::fs::write(clauth_dir.join("token_ledger.json"), json).expect("write ledger");
+}
+
+/// A stored pre-classifier day whose corpus re-derives as whole-prompt with exactly
 /// `stored_input - stored_cache_read` gets the corrected values, hours, and
 /// the WholePromptInput marker.
 #[test]
@@ -2360,24 +2724,26 @@ fn rederive_corrects_a1_day_from_corpus() {
         "2026-06-16",
         "2026-06-15",
         "glm-5.3",
-        (1_000, 50, 400, 0),
+        (1_000_000, 50, 400_000, 0),
     );
 
-    // Corpus: 8 A1-shaped rows (input holds cache_read; distinct ids), summed
-    // input=1_000, cr=400, output=50 — exactly the stored row.
+    // Corpus: 8 whole-prompt-shaped rows (input holds cache_read; distinct ids), summed
+    // input=1_000_000, cr=400_000, output=50 — exactly the stored row. Row
+    // magnitudes sit above the identity's absolute slack floor, so flat
+    // cache_read under growing input never reads as accumulation.
     let proj = claude_dir.join("projects/p1");
     std::fs::create_dir_all(&proj).expect("mkdir");
     let mut s = String::new();
-    // sum: in=1_000, out=50, cr=400 — exactly the stored raw row.
+    // sum: in=1_000_000, out=48, cr=400_000 — exactly the stored raw row.
     let rows = [
-        (125u64, 6u64, 50u64),
-        (125, 6, 50),
-        (125, 6, 50),
-        (125, 6, 50),
-        (125, 7, 50),
-        (125, 7, 50),
-        (125, 6, 50),
-        (125, 6, 50),
+        (125_000u64, 6u64, 50_000u64),
+        (125_000, 6, 50_000),
+        (125_000, 6, 50_000),
+        (125_000, 6, 50_000),
+        (125_000, 7, 50_000),
+        (125_000, 7, 50_000),
+        (125_000, 6, 50_000),
+        (125_000, 6, 50_000),
     ];
     for (i, (inp, out, cr)) in rows.iter().enumerate() {
         s.push_str(
@@ -2407,13 +2773,16 @@ fn rederive_corrects_a1_day_from_corpus() {
         ran = true;
     }
     assert!(ran, "the re-derive pass ran");
-    assert!(ledger.rederive_done());
+    assert_eq!(ledger.shape_clf(), crate::token_ledger::SHAPE_CLF_VERSION);
 
     let (input, output, cr, cc, shape, has_hours) = ledger
         .wire_model_fields("2026-06-15", "glm-5.3")
         .expect("day row present");
-    assert_eq!(input, 600, "corrected: stored 1_000 minus cr 400");
-    assert_eq!(cr, 400);
+    assert_eq!(
+        input, 600_000,
+        "corrected: stored 1_000_000 minus cr 400_000"
+    );
+    assert_eq!(cr, 400_000);
     assert_eq!(output, 50);
     assert_eq!(cc, 0);
     assert_eq!(shape, crate::tokens::UsageShape::WholePromptInput);
@@ -2505,7 +2874,7 @@ fn rederive_marks_pruned_day_unverifiable() {
         "2026-06-20",
         &mut progress
     ));
-    assert!(ledger.rederive_done());
+    assert_eq!(ledger.shape_clf(), crate::token_ledger::SHAPE_CLF_VERSION);
     let (input, _, _, _, shape, _) = ledger
         .wire_model_fields("2026-06-15", "glm-5.3")
         .expect("row");
@@ -2513,7 +2882,92 @@ fn rederive_marks_pruned_day_unverifiable() {
     assert_eq!(shape, crate::tokens::UsageShape::Healthy);
 }
 
-/// The pass runs at most once: after `rederive_done`, `rederive_through`
+/// A stored v1-classifier day the ratio arm over-subtracted — recorded with
+/// `input = true_input - cache_read` and the WholePromptInput marker — whose
+/// corpus re-derives as a never-correcting shape gets its input back, the
+/// re-derived shape, and hourly buckets.
+#[test]
+fn rederive_unpoisons_over_subtracted_day() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    // 7 rows (in=125, cr=50) + 1 row (in=50, cr=400): sum in=925, out=50,
+    // cr=750. The last row's in < cr is Anthropic-shaped evidence, so the
+    // corpus classifies NoCacheWrites and keeps input unreduced.
+    write_v1_ledger_day(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        "gpt-5.6-sol",
+        (175, 50, 750, 0),
+        "whole_prompt_input",
+    );
+
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    for i in 0..7 {
+        s.push_str(
+            r#"{"timestamp":"2026-06-15T0I:00:00+00:00","message":{"id":"msg_I","model":"gpt-5.6-sol","role":"assistant","usage":{"input_tokens":125,"output_tokens":6,"cache_read_input_tokens":50,"cache_creation_input_tokens":0}}}"#
+                .replace("I", &i.to_string())
+                .as_str(),
+        );
+        s.push('\n');
+    }
+    s.push_str(
+        r#"{"timestamp":"2026-06-15T07:00:00+00:00","message":{"id":"msg_7","model":"gpt-5.6-sol","role":"assistant","usage":{"input_tokens":50,"output_tokens":8,"cache_read_input_tokens":400,"cache_creation_input_tokens":0}}}"#,
+    );
+    s.push('\n');
+    std::fs::write(proj.join("sess.jsonl"), s).expect("write");
+    set_mtime(
+        &proj.join("sess.jsonl"),
+        epoch_day("2026-06-15") + Duration::from_secs(60),
+    );
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut progress = |_: usize, _: usize| {};
+    assert!(super::run_rederive(
+        &claude_dir,
+        &mut ledger,
+        "2026-06-20",
+        &mut progress
+    ));
+    assert_eq!(ledger.shape_clf(), crate::token_ledger::SHAPE_CLF_VERSION);
+    let (input, output, cr, cc, shape, has_hours) = ledger
+        .wire_model_fields("2026-06-15", "gpt-5.6-sol")
+        .expect("day row present");
+    assert_eq!(input, 925, "the v1 subtraction is undone");
+    assert_eq!((output, cr, cc), (50, 750, 0));
+    assert_eq!(shape, crate::tokens::UsageShape::NoCacheWrites);
+    assert!(has_hours, "un-poisoned row gains hourly buckets");
+}
+
+/// A v1 file whose `rederive_done` flag read true still owes the versioned
+/// pass: the dropped key is ignored on load and the version reads 0.
+#[test]
+fn rederive_v1_flag_file_owes_versioned_pass() {
+    let sb = HomeSandbox::new();
+    let clauth_dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("mkdir");
+    std::fs::write(
+        clauth_dir.join("token_ledger.json"),
+        r#"{"recorded_through":"2026-06-15","days":{"2026-06-14":{"glm-5.3":{"input":100,"output":5,"cache_read":40,"cache_create":0,"shape":"no_cache_writes"}}},"rederive_done":true}"#,
+    )
+    .expect("write ledger");
+    let ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    assert_eq!(
+        ledger.rederive_through("2026-06-20").as_deref(),
+        Some("2026-06-15"),
+        "the v1 flag no longer short-circuits the pass"
+    );
+    let (input, _, cr, _, shape, _) = ledger
+        .wire_model_fields("2026-06-14", "glm-5.3")
+        .expect("day row present");
+    assert_eq!((input, cr), (100, 40));
+    assert_eq!(shape, crate::tokens::UsageShape::NoCacheWrites);
+}
+
+/// The pass runs at most once: after the version stamp, `rederive_through`
 /// returns None even when uncorrected rows remain.
 #[test]
 fn rederive_runs_once() {

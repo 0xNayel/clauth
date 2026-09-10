@@ -49,6 +49,11 @@ use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs};
 
 const LEDGER_FILE: &str = "token_ledger.json";
 
+/// The usage-shape classifier version this build re-derives recorded days
+/// under. Each classifier change bumps it; every ledger stamped below it owes
+/// exactly one re-derive pass.
+pub(crate) const SHAPE_CLF_VERSION: u16 = 2;
+
 /// One model's stored split for one day (mirrors [`ModelTokens`] without the
 /// redundant `model` name, which is the map key). `hours` is the schema-v2
 /// hourly axis.
@@ -125,11 +130,13 @@ pub(crate) struct Ledger {
     /// pre-upgrade ledger owe exactly one pass.
     #[serde(default)]
     backfill_done: bool,
-    /// Set once the one-shot pre-classifier shape re-derive pass has run,
-    /// which corrects A1 days recorded before the shape classifier existed.
-    /// Absent → `false`: every pre-classifier ledger owes exactly one pass.
+    /// Version of the usage-shape classifier the recorded days were last
+    /// re-derived under. Absent (0) in every file written before the field
+    /// existed — including v1 files whose `rederive_done` flag read true, a
+    /// key serde now ignores — so each older ledger owes exactly one pass
+    /// under the current classifier.
     #[serde(default)]
-    rederive_done: bool,
+    shape_clf: u16,
 }
 
 impl Ledger {
@@ -326,40 +333,42 @@ impl Ledger {
     }
 
     /// The watermark date the one-shot shape re-derive may sweep up to, when
-    /// that pass still has work: the flag unset AND at least one day strictly
-    /// before `today` holding a row whose `shape` is not
-    /// [`UsageShape::WholePromptInput`] (both the pre-classifier `Healthy`
-    /// default and every other uncorrected class qualify — a stored row is
-    /// either already corrected or owed the re-derive's exact-match check).
-    /// Also `None` when there is no watermark to derive a cutoff from.
+    /// that pass still has work: `shape_clf` below [`SHAPE_CLF_VERSION`] and
+    /// at least one day strictly before `today`. Every row re-checks,
+    /// whole-prompt-marked ones included — a wrong classifier stamps wrong
+    /// markers, so no stored shape short-circuits the pass. Also `None` when
+    /// there is no watermark to derive a cutoff from.
     pub(crate) fn rederive_through(&self, today: &str) -> Option<String> {
-        if self.rederive_done {
+        if self.shape_clf >= SHAPE_CLF_VERSION {
             return None;
         }
-        let owed = self.days.iter().any(|(date, models)| {
-            date.as_str() < today
-                && models
-                    .values()
-                    .any(|w| w.shape != UsageShape::WholePromptInput)
-        });
+        let owed = self.days.keys().any(|date| date.as_str() < today);
         owed.then(|| self.recorded_through.clone()).flatten()
     }
 
-    /// Correct the pre-classifier stored days from a re-derived transcript
-    /// corpus ([`crate::tokens::backfill_corpus`], which now applies
-    /// [`crate::tokens::apply_usage_shapes`]). Exact-or-correct: a stored row
-    /// whose corpus re-derivation equals its stored numbers on the
-    /// cache-read / cache-create / output fields — i.e. the corpus covers the
-    /// day and holds no A1 correction for it — is left byte-identical and
-    /// its `shape` set from the re-derived rows. A row whose re-derived
-    /// `input` equals `stored_input - stored_cache_read` (the A1
-    /// correction) gets the corrected values, its per-hour buckets, and the
-    /// [`UsageShape::WholePromptInput`] marker. Any other mismatch means the
-    /// corpus no longer covers the day: the row keeps its recorded values
-    /// and gets the [`UsageShape::Healthy`] marker, which never corrects —
-    /// unverifiable rather than silently corrected. Days the corpus cannot
-    /// reach at all stay entirely untouched (same marker rule). Marks
-    /// `rederive_done` either way.
+    /// Correct the stored days from a re-derived transcript corpus
+    /// ([`crate::tokens::backfill_corpus`], whose parse classifies + corrects
+    /// per (file, model)). Exact-or-correct, both directions:
+    ///
+    /// - a stored row whose re-derivation equals it on all four fields keeps
+    ///   its values and gains the re-derived `shape` — a day that holds no
+    ///   correction, or one an earlier classifier already corrected the way
+    ///   this one does;
+    /// - a stored row whose re-derivation classifies
+    ///   [`UsageShape::WholePromptInput`] with
+    ///   `input == stored_input - stored_cache_read` (a pre-classifier row
+    ///   that never got its subtraction) adopts the corrected split, hours,
+    ///   and marker;
+    /// - a stored row whose re-derivation classifies a never-correcting shape
+    ///   with `input == stored_input + stored_cache_read` (a row an earlier
+    ///   classifier over-subtracted) adopts the re-derived split, hours, and
+    ///   marker.
+    ///
+    /// Any other mismatch means the corpus no longer covers the day: the row
+    /// keeps its recorded values and gets the [`UsageShape::Healthy`] marker,
+    /// which never corrects — unverifiable rather than silently corrected.
+    /// Days the corpus cannot reach at all stay entirely untouched (same
+    /// marker rule). Stamps [`SHAPE_CLF_VERSION`] either way.
     pub(crate) fn rederive_shapes(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
         for ((date, model), acc) in derived {
             let Some(day) = self.days.get_mut(date) else {
@@ -368,41 +377,45 @@ impl Ledger {
             let Some(w) = day.get_mut(model) else {
                 continue;
             };
-            if w.shape == UsageShape::WholePromptInput {
-                continue; // already corrected — never rewritten
-            }
-            if acc.flat.output == w.output
+            let covers = acc.flat.output == w.output
                 && acc.flat.cache_read == w.cache_read
-                && acc.flat.cache_create == w.cache_create
-                && acc.flat.input == w.input.saturating_sub(w.cache_read)
+                && acc.flat.cache_create == w.cache_create;
+            if covers
                 && acc.flat.shape == UsageShape::WholePromptInput
+                && acc.flat.input == w.input.saturating_sub(w.cache_read)
             {
-                // The corpus re-derives as A1 with exactly the correction the
-                // stored row needs: adopt the corrected split + hours + shape.
+                // A pre-classifier row that never got its subtraction: adopt
+                // the corrected split + hours + shape.
                 w.input = acc.flat.input;
                 w.hours = Some(acc.hours.map(WireHour::from));
                 w.shape = UsageShape::WholePromptInput;
+            } else if covers
+                && acc.flat.shape != UsageShape::WholePromptInput
+                && acc.flat.input == w.input.saturating_add(w.cache_read)
+            {
+                // A row an earlier classifier over-subtracted: adopt the
+                // re-derived split + hours + shape.
+                w.input = acc.flat.input;
+                w.hours = Some(acc.hours.map(WireHour::from));
+                w.shape = acc.flat.shape;
             } else if acc.flat.input == w.input
                 && acc.flat.output == w.output
                 && acc.flat.cache_read == w.cache_read
                 && acc.flat.cache_create == w.cache_create
             {
-                // The corpus re-derives equal to the stored row: the day
-                // holds no A1 usage, or it was recorded post-classifier.
-                // Stamp the re-derived shape (the strongest class the
-                // re-derivation saw, e.g. NoCacheWrites for A2 days).
+                // Equal on all four: stamp the re-derived shape.
                 w.shape = acc.flat.shape;
             }
             // Any other mismatch: unverifiable — keep values, keep the
             // never-correcting `Healthy` marker.
         }
-        self.rederive_done = true;
+        self.shape_clf = SHAPE_CLF_VERSION;
     }
 
-    /// Test-only: the re-derive pass's done flag.
+    /// Test-only: the shape-classifier version the days were re-derived under.
     #[cfg(test)]
-    pub(crate) fn rederive_done(&self) -> bool {
-        self.rederive_done
+    pub(crate) fn shape_clf(&self) -> u16 {
+        self.shape_clf
     }
 
     /// Test-only: one stored day/model row's fields.

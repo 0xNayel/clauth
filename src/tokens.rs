@@ -67,13 +67,19 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(90);
 
 /// How one (transcript file, model)'s usage lines report cache. CC-side
 /// Anthropic-compat endpoints misreport in two known ways, detected from the
-/// usage shape itself — never from model names or hostnames, since the same
-/// model id is served by both a healthy and a broken endpoint on different
-/// days (the `glm-5.3` official-z.ai vs tokenrouter split). Measured
-/// 2026-09-08: `sum(cache_read) / sum(input)` per (file, model) reads 0.5-1.0
-/// on whole-prompt-input files, 37+ on write-metric-missing and healthy
-/// files, so [`USAGE_RATIO_THRESHOLD`] = 2.0 has an 18x margin to the nearest
-/// healthy file.
+/// usage rows' own structure — never from model names or hostnames, since the
+/// same model id is served by both a healthy and a broken endpoint on different
+/// days (the `glm-5.3` official-z.ai vs tokenrouter split). The discriminators,
+/// measured 2026-09-10 over the operator corpus: a whole-prompt reporter's
+/// `input` contains its cached prefix, so `input >= cache_read` on every
+/// non-degenerate row (a degenerate or mixed-segment row can dip below — the
+/// ladder's half-of-read-bearing fraction gate absorbs those);
+/// an Anthropic-shaped reporter accumulates
+/// `cache_read(t+1) ≈ cache_read(t) + input(t)` (under 1% deviation per
+/// pair, while a whole-prompt reporter that also caches the prior response
+/// reaches only `cache_read(t+1) ≈ input(t) + output(t)` and misses the
+/// `cache_read(t)` term at ~50% deviation); a fully-cached whole-prompt
+/// reporter emits `input == cache_read` exactly, per row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UsageShape {
@@ -86,22 +92,31 @@ pub(crate) enum UsageShape {
     /// double-counts it. `input` is corrected to `input - cache_read` per row.
     WholePromptInput,
     /// `cache_read` is present but no cache write is ever reported (always 0
-    /// `cache_create` with a high read/input ratio): the read metric is
-    /// truthful, the write metric is absent. Nothing corrected, marked.
+    /// `cache_create`): the read metric is truthful, the write metric is
+    /// absent. Nothing corrected, marked.
     NoCacheWrites,
     /// No cache metrics at all (both always 0): the provider reports only
     /// in/out. Nothing corrected, no cache lens.
     NoCacheReporting,
 }
 
-/// `sum(cache_read) / sum(input)` boundary between [`UsageShape::WholePromptInput`]
-/// (below) and [`UsageShape::NoCacheWrites`] (at or above). See
-/// [`UsageShape`] for the measured margin.
-const USAGE_RATIO_THRESHOLD: u64 = 2;
-
 /// Usage rows below this count classify as [`UsageShape::Healthy`] — never
-/// correct on thin evidence.
+/// correct on statistical evidence. The exact per-row signature
+/// (`input == cache_read`) is not statistical and checks before the floor.
 const USAGE_ROW_FLOOR: usize = 8;
+
+/// Relative deviation (percent) the accumulation identity
+/// `cache_read(t+1) ≈ cache_read(t) + input(t)` tolerates: measured
+/// 2026-09-10 over the operator corpus, true Anthropic-shaped pairs sit
+/// under 1%, while whole-prompt reporters that also cache the prior response
+/// miss the `cache_read(t)` term and deviate ~50%.
+const CHAIN_IDENTITY_TOLERANCE_PCT: u64 = 5;
+
+/// Absolute token slack the accumulation identity tolerates below its
+/// relative bound: cache counters are block-quantized (multiples of 64), so
+/// genuine early pairs with small denominators exceed the relative bound on
+/// rounding alone.
+const CHAIN_IDENTITY_SLACK_FLOOR: u64 = 128;
 
 /// Rank for merging shapes across rows of one aggregate: the strongest claim
 /// wins, so an aggregate touching any corrected row renders its marker.
@@ -127,12 +142,37 @@ impl UsageShape {
 }
 
 /// Classify each (model)'s usage rows within one transcript file and correct
-/// A1's double-counted `input` in place, stamping the class onto every usage
-/// row so downstream accumulations carry it. Runs after
-/// [`collapse_streamed_turns`], so streaming deltas never skew the sums.
+/// whole-prompt `input` in place, stamping the class onto every usage row so
+/// downstream accumulations carry it. Runs after
+/// [`collapse_streamed_turns`], so streaming deltas never skew the evidence.
 /// Per (file, model) — the finest attribution the transcript offers (no
 /// endpoint field exists), which is what separates a model id served by a
 /// healthy endpoint on one day from a broken one on another.
+///
+/// The ladder, exact per-row evidence first:
+///
+/// 1. Any `cache_create > 0`: the write metric exists — Anthropic semantics,
+///    [`UsageShape::Healthy`]. Outranks every other signature: a file mixing
+///    write-bearing rows with fully-cached-looking ones is Anthropic-shaped,
+///    never corrected.
+/// 2. `input == cache_read` on a majority of read-bearing rows: the whole
+///    prompt is reported as fully cached — [`UsageShape::WholePromptInput`].
+///    Exact, so it decides even below [`USAGE_ROW_FLOOR`]; a majority, so one
+///    partial or degenerate row does not defeat the class.
+/// 3. Thin evidence means Anthropic semantics: [`UsageShape::Healthy`].
+/// 4. No read metric at all: [`UsageShape::NoCacheReporting`].
+/// 5. Anthropic-shaped read evidence dominates — [`UsageShape::NoCacheWrites`]:
+///    rows with `input < cache_read` reach at least half the read-bearing rows
+///    (a whole-prompt reporter's `input` contains its cached prefix, so a
+///    dipping row is Anthropic evidence; a mixed file after a mid-session
+///    endpoint swap or a degenerate row dips far below half), or the
+///    accumulation identity holds for a majority of pairs. The consequence
+///    `cache_read(t+1) > input(t)` alone is NOT the test, since a whole-prompt
+///    reporter that also caches the prior response reaches
+///    `cache_read(t+1) ≈ input(t) + output(t)` and beats it.
+/// 6. Otherwise `input` grows past a lagging read metric: whole-prompt
+///    reporting with a partially cached prompt —
+///    [`UsageShape::WholePromptInput`].
 fn apply_usage_shapes(recs: &mut [LineRec]) {
     let mut by_model: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, r) in recs.iter().enumerate() {
@@ -141,21 +181,21 @@ fn apply_usage_shapes(recs: &mut [LineRec]) {
         }
     }
     for idxs in by_model.values() {
-        let total_input: u64 = idxs.iter().map(|&i| recs[i].input).sum();
-        let total_cache_read: u64 = idxs.iter().map(|&i| recs[i].cache_read).sum();
         let any_cache_create = idxs.iter().any(|&i| recs[i].cache_create > 0);
         let any_cache_read = idxs.iter().any(|&i| recs[i].cache_read > 0);
 
-        // Thin evidence and an ever-present write metric both mean
-        // Anthropic semantics; keep them as one arm.
-        let shape = if idxs.len() < USAGE_ROW_FLOOR || any_cache_create {
+        let shape = if any_cache_create {
+            UsageShape::Healthy
+        } else if majority_read_rows_input_eq_cache_read(recs, idxs) {
+            UsageShape::WholePromptInput
+        } else if idxs.len() < USAGE_ROW_FLOOR {
             UsageShape::Healthy
         } else if !any_cache_read {
             UsageShape::NoCacheReporting
-        } else if total_cache_read < USAGE_RATIO_THRESHOLD * total_input {
-            UsageShape::WholePromptInput
-        } else {
+        } else if anthropic_read_evidence(recs, idxs) {
             UsageShape::NoCacheWrites
+        } else {
+            UsageShape::WholePromptInput
         };
 
         if shape == UsageShape::WholePromptInput {
@@ -169,6 +209,77 @@ fn apply_usage_shapes(recs: &mut [LineRec]) {
             recs[i].shape = shape;
         }
     }
+}
+
+/// Whether `input == cache_read` on a majority of the rows that report a
+/// read metric (at least one): the whole-prompt-fully-cached signature.
+/// Read-bearing rows only, so a cold-start or cache-field-absent row never
+/// votes; a majority, so one partial or degenerate row does not defeat the
+/// class.
+fn majority_read_rows_input_eq_cache_read(recs: &[LineRec], idxs: &[usize]) -> bool {
+    let mut bearing = 0usize;
+    let mut equal = 0usize;
+    for &i in idxs {
+        if recs[i].cache_read > 0 {
+            bearing += 1;
+            if recs[i].input == recs[i].cache_read {
+                equal += 1;
+            }
+        }
+    }
+    bearing > 0 && equal * 2 > bearing
+}
+
+/// Whether the Anthropic-shaped read evidence dominates: rows with
+/// `input < cache_read` reach at least half the read-bearing rows, or the
+/// accumulation identity holds for a majority of pairs. A whole-prompt
+/// reporter's `input` contains its cached prefix, so a dipping row is
+/// Anthropic evidence — but a mixed file (an endpoint swap mid-session) or a
+/// degenerate row dips without the file being Anthropic-shaped, and those
+/// measure far below half while the identity stays broken, so the fraction
+/// gates the sparse cases.
+fn anthropic_read_evidence(recs: &[LineRec], idxs: &[usize]) -> bool {
+    let mut bearing = 0usize;
+    let mut dips = 0usize;
+    for &i in idxs {
+        if recs[i].cache_read > 0 {
+            bearing += 1;
+            if recs[i].input < recs[i].cache_read {
+                dips += 1;
+            }
+        }
+    }
+    dips * 2 >= bearing || majority_pairs_cache_read_accumulates(recs, idxs)
+}
+
+/// Whether a majority of consecutive row pairs where BOTH rows report a read
+/// metric satisfy the accumulation identity `cache_read(t+1) ≈ cache_read(t) +
+/// input(t)` — the new tail joins the cached prefix — within
+/// [`CHAIN_IDENTITY_TOLERANCE_PCT`] relative deviation or
+/// [`CHAIN_IDENTITY_SLACK_FLOOR`] absolute tokens. A pair whose earlier row
+/// reports no read metric cannot discriminate: the identity degenerates to
+/// `cache_read(t+1) ≈ input(t)`, which a whole-prompt reporter that also
+/// caches the prior response satisfies within its `output(t)`; a pair whose
+/// later row reports none breaks the chain entirely. Neither is counted.
+fn majority_pairs_cache_read_accumulates(recs: &[LineRec], idxs: &[usize]) -> bool {
+    let mut counted = 0usize;
+    let mut accumulates = 0usize;
+    for w in idxs.windows(2) {
+        let (prev, next) = (&recs[w[0]], &recs[w[1]]);
+        if prev.cache_read == 0 || next.cache_read == 0 {
+            continue;
+        }
+        counted += 1;
+        let expected = prev.cache_read.saturating_add(prev.input);
+        let deviation = next.cache_read.abs_diff(expected);
+        let bound = (expected / 100)
+            .saturating_mul(CHAIN_IDENTITY_TOLERANCE_PCT)
+            .max(CHAIN_IDENTITY_SLACK_FLOOR);
+        if deviation <= bound {
+            accumulates += 1;
+        }
+    }
+    accumulates * 2 > counted
 }
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -1369,25 +1480,32 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
 /// output grows from 0 to the final value on distinct line uuids. Deduping on
 /// the id at merge time would keep the first (output=0) partial, so collapse
 /// here to the occurrence with the largest total footprint. This also makes the
-/// message/session/hour counters see one turn instead of every delta.
+/// message/session/hour counters see one turn instead of every delta. Output
+/// keeps first-occurrence order — replaced in place, never re-emitted from the
+/// dedup map — because the usage-shape ladder's chain arm reads consecutive
+/// turns.
 fn collapse_streamed_turns(recs: Vec<LineRec>) -> Vec<LineRec> {
-    let mut best: HashMap<String, LineRec> = HashMap::new();
-    let mut plain: Vec<LineRec> = Vec::new();
+    let mut out: Vec<LineRec> = Vec::new();
+    let mut idx_of: HashMap<String, usize> = HashMap::new();
     for rec in recs {
         if !rec.has_usage {
-            plain.push(rec);
+            out.push(rec);
             continue;
         }
-        let key = rec.tok_key.clone();
-        let keep = best
-            .get(&key)
-            .is_some_and(|prev| prev.total() >= rec.total());
-        if !keep {
-            best.insert(key, rec);
+        match idx_of.entry(rec.tok_key.clone()) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let prev = &mut out[*e.get()];
+                if prev.total() < rec.total() {
+                    *prev = rec;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(out.len());
+                out.push(rec);
+            }
         }
     }
-    plain.extend(best.into_values());
-    plain
+    out
 }
 
 /// Fold one transcript file into per-(model, day) per-hour buckets for the
@@ -1553,7 +1671,7 @@ fn run_backfill(
     true
 }
 
-/// Run the one-shot pre-classifier shape re-derive when the ledger still owes
+/// Run the one-shot shape-classifier re-derive when the ledger still owes
 /// it: sweep the pre-watermark corpus (the same [`backfill_corpus`], whose
 /// parse now classifies + corrects per (file, model)) and hand it to
 /// [`crate::token_ledger::Ledger::rederive_shapes`] (exact-or-correct), which
