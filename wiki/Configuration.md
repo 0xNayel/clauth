@@ -29,7 +29,7 @@ Five providers get typed usage panels:
 | Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
 | OpenRouter | `https://openrouter.ai` | wallet rows from the credits endpoint: api balance (remaining credits, red when overdrawn), used, purchased; then today / this week / this month usage, per-key cap rows when set, free-tier flag |
 | Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
-| MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against; `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
+| MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
 
 Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable stops being polled until you press <kbd>r</kbd>. A dead api key stops polling the same way, on any endpoint: the provider answered 401, so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
 
@@ -42,7 +42,7 @@ For those five, `open provider console` in the TUI action menu ([Interface and k
 | DeepSeek | <https://platform.deepseek.com/api_keys> |
 | Z.ai | <https://z.ai/manage-apikey/apikey-list> |
 | OpenRouter | <https://openrouter.ai/settings/keys> |
-| MiniMax | <https://platform.minimax.io/user-center/basic-information> |
+| MiniMax | <https://platform.minimax.io/user-center/payment/token-plan> |
 | Alibaba Token Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview> |
 | Alibaba Token Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview> |
 | Alibaba Coding Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan> |
@@ -80,7 +80,7 @@ subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 
 ## Presets
 
-A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Seven ship built in:
+A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Eight ship built in:
 
 | Preset | Endpoint |
 |---|---|
