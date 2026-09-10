@@ -181,6 +181,7 @@ fn model(id: &str, input: u64, output: u64, cache_read: u64, cache_create: u64) 
         output,
         cache_read,
         cache_create,
+        shape: Default::default(),
     }
 }
 

@@ -125,6 +125,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             output: 500,
             cache_read: 100,
             cache_create: 50,
+            shape: Default::default(),
         },
         ModelTokens {
             model: "gpt-5.5".to_owned(),
@@ -132,6 +133,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             output: 100,
             cache_read: 0,
             cache_create: 0,
+            shape: Default::default(),
         },
         ModelTokens {
             model: "gemini-3-flash".to_owned(),
@@ -139,6 +141,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             output: 150,
             cache_read: 0,
             cache_create: 0,
+            shape: Default::default(),
         },
         ModelTokens {
             model: "claude-sonnet-4".to_owned(),
@@ -146,6 +149,7 @@ fn group_models_keeps_claude_individual_folds_others() {
             output: 250,
             cache_read: 50,
             cache_create: 25,
+            shape: Default::default(),
         },
     ];
 
@@ -179,6 +183,7 @@ fn group_models_no_others_when_all_claude() {
         output: 50,
         cache_read: 0,
         cache_create: 0,
+        shape: Default::default(),
     }];
     let grouped = group_models(&models);
     assert!(grouped.iter().all(|m| m.model != "others"));
@@ -199,6 +204,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             output: 100_000,
             cache_read: 0,
             cache_create: 0,
+            shape: Default::default(),
         },
         // < 1M total → folds into "others".
         ModelTokens {
@@ -207,6 +213,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             output: 50,
             cache_read: 0,
             cache_create: 0,
+            shape: Default::default(),
         },
         ModelTokens {
             model: "claude-opus-4-8".to_owned(),
@@ -214,6 +221,7 @@ fn group_models_breaks_out_large_non_anthropic() {
             output: 250,
             cache_read: 0,
             cache_create: 0,
+            shape: Default::default(),
         },
     ];
     let grouped = group_models(&models);
@@ -922,6 +930,7 @@ fn period_models_aggregates_range_and_split_flags() {
         output: 20,
         cache_read: 500,
         cache_create: 5,
+        shape: Default::default(),
     };
     let days = vec![
         // Outside the range — must not count.
@@ -970,6 +979,7 @@ fn period_model_metric_honors_split_completeness() {
         output: 5,
         cache_read: 100,
         cache_create: 1,
+        shape: Default::default(),
     };
     let full = PeriodModel::from_full(&m);
     assert_eq!(full.metric(false), 15);
@@ -1387,6 +1397,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         output: 20,
         cache_read: 500,
         cache_create: 5,
+        shape: Default::default(),
     };
     let split_07 = ModelTokens {
         model: "claude-opus-4".into(),
@@ -1394,6 +1405,7 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
         output: 8,
         cache_read: 0,
         cache_create: 0,
+        shape: Default::default(),
     };
 
     let days = vec![
@@ -1553,6 +1565,7 @@ fn backfill_fills_hours_when_corpus_totals_match() {
             output: 100,
             cache_read: 20,
             cache_create: 10,
+            shape: Default::default(),
         },
     );
 
@@ -1643,6 +1656,7 @@ fn backfill_leaves_mismatched_rows_untouched_and_marks_done() {
             output: 100,
             cache_read: 20,
             cache_create: 10,
+            shape: Default::default(),
         },
     );
 
@@ -1807,6 +1821,7 @@ fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
             output: 50,
             cache_read: 0,
             cache_create: 0,
+            shape: Default::default(),
         },
     );
 
@@ -1867,6 +1882,7 @@ fn backfill_runs_once_and_second_run_visits_nothing() {
             output: 100,
             cache_read: 20,
             cache_create: 10,
+            shape: Default::default(),
         },
     );
 
@@ -1935,6 +1951,7 @@ fn backfill_persists_when_record_has_nothing_new() {
             output: 100,
             cache_read: 20,
             cache_create: 10,
+            shape: Default::default(),
         },
     );
 
@@ -2011,6 +2028,7 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
             output: 100,
             cache_read: 20,
             cache_create: 10,
+            shape: Default::default(),
         },
     );
 
@@ -2047,4 +2065,479 @@ fn backfill_persists_flag_on_disk_when_nothing_fills() {
         .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
         .expect("ledger day folded");
     assert!(row.hours.is_none(), "nothing filled, nothing changed");
+}
+// ── usage-shape classification (A1/A2/B) ─────────────────────────────────────
+
+/// Load one committed shape fixture (trimmed real transcript bytes, the
+/// `wire-parity.md` precedent: golden shape from real usage, not synthesized).
+fn shape_fixture(name: &str) -> std::path::PathBuf {
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tests/fixtures");
+    p.push(name);
+    p
+}
+
+fn fixture_totals(path: &std::path::Path) -> (u64, u64, u64, u64, UsageShape, usize) {
+    let recs = super::parse_file(path);
+    let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
+    assert_eq!(usage.len(), 12, "fixture holds 12 usage rows");
+    let input: u64 = usage.iter().map(|r| r.input).sum();
+    let output: u64 = usage.iter().map(|r| r.output).sum();
+    let cr: u64 = usage.iter().map(|r| r.cache_read).sum();
+    let cc: u64 = usage.iter().map(|r| r.cache_create).sum();
+    let shape = usage
+        .iter()
+        .map(|r| r.shape)
+        .max_by_key(|s| super::shape_rank(*s))
+        .unwrap();
+    (input, output, cr, cc, shape, usage.len())
+}
+
+/// Raw (pre-correction) sums read straight off the fixture bytes, so the
+/// test asserts the correction against the provider's own numbers.
+fn raw_sums(path: &std::path::Path) -> (u64, u64, u64, u64) {
+    let raw = std::fs::read_to_string(path).expect("read fixture");
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut cr = 0u64;
+    let mut cc = 0u64;
+    for line in raw.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).expect("fixture line");
+        let u = &v["message"]["usage"];
+        input += u["input_tokens"].as_u64().unwrap_or(0);
+        output += u["output_tokens"].as_u64().unwrap_or(0);
+        cr += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        cc += u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    }
+    (input, output, cr, cc)
+}
+
+#[test]
+fn a1_fixture_corrects_input_to_uncached_tail() {
+    let path = shape_fixture("tokens-shape-a1.jsonl");
+    let (raw_in, raw_out, raw_cr, raw_cc) = raw_sums(&path);
+    assert_eq!(raw_cc, 0, "A1 never reports cache writes");
+    let (input, output, cr, cc, shape, _) = fixture_totals(&path);
+    assert_eq!(shape, UsageShape::WholePromptInput);
+    assert_eq!(
+        input,
+        raw_in - raw_cr,
+        "input corrected: raw minus cache_read"
+    );
+    assert_eq!(output, raw_out);
+    assert_eq!(cr, raw_cr);
+    assert_eq!(cc, 0);
+}
+
+#[test]
+fn healthy_fixture_is_left_byte_identical() {
+    let path = shape_fixture("tokens-shape-healthy.jsonl");
+    let (raw_in, raw_out, raw_cr, raw_cc) = raw_sums(&path);
+    let (input, output, cr, cc, shape, _) = fixture_totals(&path);
+    assert_eq!(shape, UsageShape::Healthy);
+    assert_eq!((input, output, cr, cc), (raw_in, raw_out, raw_cr, raw_cc));
+}
+
+#[test]
+fn a2_fixture_keeps_numbers_marks_shape() {
+    let path = shape_fixture("tokens-shape-a2.jsonl");
+    let (raw_in, raw_out, raw_cr, raw_cc) = raw_sums(&path);
+    let (input, output, cr, cc, shape, _) = fixture_totals(&path);
+    assert_eq!(shape, UsageShape::NoCacheWrites);
+    assert_eq!((input, output, cr, cc), (raw_in, raw_out, raw_cr, raw_cc));
+    assert_eq!(cc, 0);
+}
+
+#[test]
+fn b_fixture_reads_no_cache_reporting() {
+    let path = shape_fixture("tokens-shape-b.jsonl");
+    let (input, output, cr, cc, shape, _) = fixture_totals(&path);
+    assert_eq!(shape, UsageShape::NoCacheReporting);
+    assert_eq!((cr, cc), (0, 0));
+    assert!(input > 0 && output > 0);
+}
+
+/// Pin both sides of the 2.0 threshold: a ratio below 2 classifies A1,
+/// at or above 2 classifies A2. Same row count so only the ratio decides.
+#[test]
+fn ratio_threshold_pins_both_sides() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+
+    // 8 rows; per-row input = cr + 50 keeps the in-row subtraction safe.
+    // below: sum(cr)=440, sum(in)=840 → 440 < 2*840 → A1.
+    let mut below = String::new();
+    for i in 0..8 {
+        let cr = 55;
+        below.push_str(&jsonl_line(
+            &format!("2026-06-11T0{i}:00:00+00:00"),
+            "m",
+            cr + 50 + i,
+            1,
+            cr,
+            0,
+        ));
+        below.push('\n');
+    }
+    let p_below = proj.join("below.jsonl");
+    std::fs::write(&p_below, below).expect("write");
+    let recs = super::parse_file(&p_below);
+    assert_eq!(
+        recs.iter()
+            .filter(|r| r.has_usage)
+            .map(|r| r.shape)
+            .max_by_key(|s| super::shape_rank(*s))
+            .unwrap(),
+        UsageShape::WholePromptInput
+    );
+
+    // above: sum(cr)=16_000, sum(in)=8_428 → ratio ≥ 2 → A2. Per-row
+    // input stays below its cache_read, the healthy-tail inversion A2 shows.
+    let mut above = String::new();
+    for i in 0..8 {
+        let cr = 2_008;
+        above.push_str(&jsonl_line(
+            &format!("2026-06-12T0{i}:00:00+00:00"),
+            "m",
+            1_000 + i,
+            1,
+            cr,
+            0,
+        ));
+        above.push('\n');
+    }
+    let p_above = proj.join("above.jsonl");
+    std::fs::write(&p_above, above).expect("write");
+    let recs = super::parse_file(&p_above);
+    assert_eq!(
+        recs.iter()
+            .filter(|r| r.has_usage)
+            .map(|r| r.shape)
+            .max_by_key(|s| super::shape_rank(*s))
+            .unwrap(),
+        UsageShape::NoCacheWrites
+    );
+}
+
+/// Fewer than 8 usage rows classifies Healthy even with A1-shaped numbers:
+/// never correct on thin evidence.
+#[test]
+fn thin_evidence_classifies_healthy() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    for i in 0..7 {
+        // Ratio ~0.5 (A1-shaped) but only 7 rows; distinct input per row so
+        // the id-less composite dedup key keeps all 7.
+        s.push_str(&jsonl_line(
+            &format!("2026-06-11T0{i}:00:00+00:00"),
+            "m",
+            100 + i,
+            1,
+            50,
+            0,
+        ));
+        s.push('\n');
+    }
+    let p = proj.join("thin.jsonl");
+    std::fs::write(&p, s).expect("write");
+    let recs = super::parse_file(&p);
+    let usage: Vec<&super::LineRec> = recs.iter().filter(|r| r.has_usage).collect();
+    assert_eq!(usage.len(), 7);
+    assert_eq!(usage[0].shape, UsageShape::Healthy);
+    // Nothing corrected: every row's input sits past its cache_read (50)
+    // exactly as written.
+    assert!(
+        usage.iter().all(|r| r.input > r.cache_read),
+        "thin evidence: nothing corrected"
+    );
+}
+
+/// A model can be A1 in one file and healthy in another (official z.ai vs
+/// tokenrouter, same model id): per-(file, model) classification keeps them
+/// separate, and an aggregate merging both carries the strongest shape.
+#[test]
+fn same_model_two_files_two_shapes() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+
+    let mut a1 = String::new();
+    for i in 0..10 {
+        a1.push_str(&jsonl_line(
+            &format!("2026-06-11T0{i}:00:00+00:00"),
+            "glm-5.3",
+            100 + i,
+            1,
+            50,
+            0,
+        ));
+        a1.push('\n');
+    }
+    std::fs::write(proj.join("a1.jsonl"), a1).expect("write");
+
+    let mut healthy = String::new();
+    for i in 0..10 {
+        healthy.push_str(&jsonl_line(
+            &format!("2026-06-12T0{i}:00:00+00:00"),
+            "glm-5.3",
+            100,
+            1,
+            50,
+            5,
+        ));
+        healthy.push('\n');
+    }
+    std::fs::write(proj.join("healthy.jsonl"), healthy).expect("write");
+
+    let a1_recs = super::parse_file(&proj.join("a1.jsonl"));
+    assert_eq!(
+        a1_recs
+            .iter()
+            .filter(|r| r.has_usage)
+            .map(|r| r.shape)
+            .max_by_key(|s| super::shape_rank(*s))
+            .unwrap(),
+        UsageShape::WholePromptInput
+    );
+    let h_recs = super::parse_file(&proj.join("healthy.jsonl"));
+    assert_eq!(
+        h_recs
+            .iter()
+            .filter(|r| r.has_usage)
+            .map(|r| r.shape)
+            .max_by_key(|s| super::shape_rank(*s))
+            .unwrap(),
+        UsageShape::Healthy
+    );
+    assert_eq!(
+        UsageShape::Healthy.merge(UsageShape::WholePromptInput),
+        UsageShape::WholePromptInput,
+        "aggregate carries the strongest shape"
+    );
+}
+
+// ── shape re-derive (pre-classifier ledger days) ─────────────────────────────
+
+/// Write a pre-classifier ledger row: no `shape` key on the wire, so it
+/// loads `Healthy` and owes the re-derive pass.
+fn write_v0_ledger_day(
+    clauth_dir: &std::path::Path,
+    recorded_through: &str,
+    day: &str,
+    model: &str,
+    values: (u64, u64, u64, u64),
+) {
+    let (input, output, cache_read, cache_create) = values;
+    std::fs::create_dir_all(clauth_dir).expect("mkdir");
+    let json = r#"{"recorded_through":"RT","days":{"D":{"M":{"input":I,"output":O,"cache_read":C,"cache_create":K}}}}"#
+        .replace("RT", recorded_through)
+        .replace("D", day)
+        .replace("M", model)
+        .replace("I", &input.to_string())
+        .replace("O", &output.to_string())
+        .replace("C", &cache_read.to_string())
+        .replace("K", &cache_create.to_string());
+    std::fs::write(clauth_dir.join("token_ledger.json"), json).expect("write ledger");
+}
+
+/// A stored pre-classifier day whose corpus re-derives as A1 with exactly
+/// `stored_input - stored_cache_read` gets the corrected values, hours, and
+/// the WholePromptInput marker.
+#[test]
+fn rederive_corrects_a1_day_from_corpus() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    // Stored (raw, poisoned) row: input contains the cached prefix.
+    write_v0_ledger_day(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        "glm-5.3",
+        (1_000, 50, 400, 0),
+    );
+
+    // Corpus: 8 A1-shaped rows (input holds cache_read; distinct ids), summed
+    // input=1_000, cr=400, output=50 — exactly the stored row.
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    // sum: in=1_000, out=50, cr=400 — exactly the stored raw row.
+    let rows = [
+        (125u64, 6u64, 50u64),
+        (125, 6, 50),
+        (125, 6, 50),
+        (125, 6, 50),
+        (125, 7, 50),
+        (125, 7, 50),
+        (125, 6, 50),
+        (125, 6, 50),
+    ];
+    for (i, (inp, out, cr)) in rows.iter().enumerate() {
+        s.push_str(
+            r#"{"timestamp":"2026-06-15T0I:00:00+00:00","message":{"id":"msg_I","model":"glm-5.3","role":"assistant","usage":{"input_tokens":IP,"output_tokens":OP,"cache_read_input_tokens":CR,"cache_creation_input_tokens":0}}}"#
+                .replace("IP", &inp.to_string())
+                .replace("OP", &out.to_string())
+                .replace("CR", &cr.to_string())
+                .replace("I", &i.to_string()).as_str(),
+        );
+        s.push('\n');
+    }
+    std::fs::write(proj.join("sess.jsonl"), s).expect("write");
+    set_mtime(
+        &proj.join("sess.jsonl"),
+        epoch_day("2026-06-15") + Duration::from_secs(60),
+    );
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let today = "2026-06-20";
+    let mut ran = false;
+    let mut progress = |d: usize, t: usize| {
+        let _ = (d, t);
+    };
+    // drive the worker's leg directly
+    if super::run_rederive(&claude_dir, &mut ledger, today, &mut progress) {
+        ledger.save(&clauth_dir);
+        ran = true;
+    }
+    assert!(ran, "the re-derive pass ran");
+    assert!(ledger.rederive_done());
+
+    let (input, output, cr, cc, shape, has_hours) = ledger
+        .wire_model_fields("2026-06-15", "glm-5.3")
+        .expect("day row present");
+    assert_eq!(input, 600, "corrected: stored 1_000 minus cr 400");
+    assert_eq!(cr, 400);
+    assert_eq!(output, 50);
+    assert_eq!(cc, 0);
+    assert_eq!(shape, crate::tokens::UsageShape::WholePromptInput);
+    assert!(has_hours, "corrected row gains hourly buckets");
+}
+
+/// A stored day whose corpus re-derives equal on all four fields (a healthy
+/// day) is left byte-identical and only gains the re-derived shape marker.
+#[test]
+fn rederive_leaves_equal_day_untouched() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    write_v0_ledger_day(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        "claude-opus-4",
+        (100, 50, 20, 10),
+    );
+
+    let proj = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&proj).expect("mkdir");
+    let mut s = String::new();
+    let rows = [
+        (12u64, 6u64, 2u64, 1u64),
+        (12, 6, 2, 1),
+        (12, 6, 2, 1),
+        (12, 6, 2, 1),
+        (12, 6, 2, 1),
+        (12, 6, 2, 1),
+        (12, 6, 2, 1),
+        (16, 8, 6, 3),
+    ];
+    // sum: in=100, out=50, cr=20, cc=10 ✓ (any_cache_create>0 → Healthy)
+    for (i, (inp, out, cr, cc)) in rows.iter().enumerate() {
+        s.push_str(
+            r#"{"timestamp":"2026-06-15T0I:00:00+00:00","message":{"id":"msg_I","model":"claude-opus-4","role":"assistant","usage":{"input_tokens":IP,"output_tokens":OP,"cache_read_input_tokens":CR,"cache_creation_input_tokens":CC}}}"#
+                .replace("IP", &inp.to_string())
+                .replace("OP", &out.to_string())
+                .replace("CR", &cr.to_string())
+                .replace("CC", &cc.to_string())
+                .replace("I", &i.to_string()).as_str(),
+        );
+        s.push('\n');
+    }
+    std::fs::write(proj.join("sess.jsonl"), s).expect("write");
+    set_mtime(
+        &proj.join("sess.jsonl"),
+        epoch_day("2026-06-15") + Duration::from_secs(60),
+    );
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut progress = |_: usize, _: usize| {};
+    assert!(super::run_rederive(
+        &claude_dir,
+        &mut ledger,
+        "2026-06-20",
+        &mut progress
+    ));
+    let (input, output, cr, cc, shape, _) = ledger
+        .wire_model_fields("2026-06-15", "claude-opus-4")
+        .expect("row");
+    assert_eq!((input, output, cr, cc), (100, 50, 20, 10));
+    assert_eq!(shape, crate::tokens::UsageShape::Healthy);
+}
+
+/// A day the corpus no longer covers (pruned) keeps its recorded values and
+/// the never-correcting Healthy marker, and the pass still marks done.
+#[test]
+fn rederive_marks_pruned_day_unverifiable() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    write_v0_ledger_day(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        "glm-5.3",
+        (1_000, 50, 400, 0),
+    );
+    // No projects dir at all: nothing covers the day.
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut progress = |_: usize, _: usize| {};
+    assert!(super::run_rederive(
+        &claude_dir,
+        &mut ledger,
+        "2026-06-20",
+        &mut progress
+    ));
+    assert!(ledger.rederive_done());
+    let (input, _, _, _, shape, _) = ledger
+        .wire_model_fields("2026-06-15", "glm-5.3")
+        .expect("row");
+    assert_eq!(input, 1_000, "unverifiable: values kept");
+    assert_eq!(shape, crate::tokens::UsageShape::Healthy);
+}
+
+/// The pass runs at most once: after `rederive_done`, `rederive_through`
+/// returns None even when uncorrected rows remain.
+#[test]
+fn rederive_runs_once() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    write_v0_ledger_day(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        "glm-5.3",
+        (1_000, 50, 400, 0),
+    );
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut progress = |_: usize, _: usize| {};
+    assert!(super::run_rederive(
+        &claude_dir,
+        &mut ledger,
+        "2026-06-20",
+        &mut progress
+    ));
+    let mut progress2 = |_: usize, _: usize| {};
+    assert!(
+        !super::run_rederive(&claude_dir, &mut ledger, "2026-06-21", &mut progress2),
+        "second run is a no-op"
+    );
 }
