@@ -45,14 +45,33 @@ pub(super) fn matches_base_url(url: &str) -> bool {
 
 pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
     let text = super::get_json(&format!("{ORIGIN}{REMAINS_PATH}"), api_key)?;
-    let body: RemainsResponse = serde_json::from_str(&text).map_err(|_| ThirdPartyError::Parse)?;
-    // `base_resp.status_code` is MiniMax's own verdict and rides an HTTP 200:
-    // a rejected key answers 200 with a non-zero code, so the transport status
-    // alone would publish an empty plan as a healthy one.
-    if body.base_resp.status_code != 0 {
-        return Err(ThirdPartyError::Status);
+    parse(&text)
+}
+
+/// The in-band codes that mean the api key itself is dead, mapped to
+/// [`ThirdPartyError::AuthExpired`] so a rejected key stops polling and
+/// renders `(key rejected)` like every other endpoint: `1004` authentication
+/// failed, `2049` invalid api key (the observed answer on this host). Every
+/// other non-zero code stays a plain failure — a rate limit or an empty
+/// balance has its own recovery and must not suppress the cadence.
+const AUTH_EXPIRED_CODES: [i64; 2] = [1004, 2049];
+
+/// Body → stats, split from HTTP for testability. The in-band verdict gates
+/// everything: `base_resp.status_code` is MiniMax's own result and rides an
+/// HTTP 200 — a rejected key answers 200 with a non-zero code, so the
+/// transport status alone would publish an empty plan as a healthy one. The
+/// envelope is NON-defaulted for the same reason: a 200 body without it is no
+/// verdict at all, and deserializing one to success would publish that healthy
+/// empty plan (cache overwritten, `Fresh`-stamped, and the walk's windows for
+/// the account removed) — every sibling provider fails closed on a missing
+/// verdict.
+fn parse(text: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
+    let body: RemainsResponse = serde_json::from_str(text).map_err(|_| ThirdPartyError::Parse)?;
+    match body.base_resp.status_code {
+        0 => Ok(stats(&body.model_remains)),
+        code if AUTH_EXPIRED_CODES.contains(&code) => Err(ThirdPartyError::AuthExpired),
+        _ => Err(ThirdPartyError::Status),
     }
-    Ok(stats(&body.model_remains))
 }
 
 /// Pure `model_remains[]` → bars + rows, split from HTTP for testability.
@@ -163,19 +182,19 @@ fn ms_to_iso(ms: i64) -> String {
 
 // ── Wire types ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RemainsResponse {
     #[serde(default)]
     model_remains: Vec<ModelRemains>,
-    #[serde(default)]
+    // Non-defaulted: this is the verdict, the one field a healthy empty plan
+    // cannot be told apart on, so a body without it fails closed (see `parse`).
     base_resp: BaseResp,
 }
 
 /// MiniMax's in-band result envelope: `status_code` 0 is success, and it rides
 /// an HTTP 200 even for a rejected key.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct BaseResp {
-    #[serde(default)]
     status_code: i64,
 }
 

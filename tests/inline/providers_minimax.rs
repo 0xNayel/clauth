@@ -178,6 +178,71 @@ fn stats_claim_no_plan_label() {
     assert!(!s.best_effort, "typed integration, not the generic scanner");
 }
 
+// ── The in-band verdict ───────────────────────────────────────────────────────
+
+#[test]
+fn a_body_without_the_verdict_envelope_fails_closed() {
+    // `base_resp` is non-defaulted: a 200 body without it is no verdict at all,
+    // and deserializing one to success would publish a healthy empty plan —
+    // cache overwritten, `Fresh`-stamped, and the walk's windows removed.
+    assert!(matches!(
+        parse(
+            r#"{"model_remains":[{"model_name":"general",
+            "current_interval_remaining_percent":38}]}"#
+        ),
+        Err(ThirdPartyError::Parse)
+    ));
+    assert!(
+        matches!(
+            parse(r#"{"model_remains":[],"base_resp":{}}"#),
+            Err(ThirdPartyError::Parse)
+        ),
+        "an envelope carrying no status_code is not a verdict either"
+    );
+}
+
+#[test]
+fn a_rejected_key_maps_to_auth_expired() {
+    // The dead-key verdict rides an HTTP 200; without the mapping a dead key
+    // never suppresses, never records `third_party_auth.json`, and never
+    // renders `(key rejected)` — the wiki promises that for any endpoint.
+    assert!(matches!(
+        parse(
+            r#"{"model_remains":[],
+            "base_resp":{"status_code":2049,"status_msg":"invalid api key"}}"#
+        ),
+        Err(ThirdPartyError::AuthExpired)
+    ));
+    assert!(matches!(
+        parse(
+            r#"{"model_remains":[],
+            "base_resp":{"status_code":1004,"status_msg":"invalid api key or group_id"}}"#
+        ),
+        Err(ThirdPartyError::AuthExpired)
+    ));
+}
+
+#[test]
+fn any_other_in_band_failure_stays_a_plain_failure() {
+    assert!(
+        matches!(
+            parse(
+                r#"{"model_remains":[],
+                "base_resp":{"status_code":1000,"status_msg":"unknown error"}}"#
+            ),
+            Err(ThirdPartyError::Status)
+        ),
+        "a rate limit or an empty balance has its own recovery and must not \
+         suppress the cadence"
+    );
+}
+
+#[test]
+fn a_zero_verdict_publishes_the_plan() {
+    let s = parse(REMAINS).expect("a zero verdict is success");
+    assert_eq!(s.bars.len(), 2);
+}
+
 // ── Utilization clamp ─────────────────────────────────────────────────────────
 
 #[test]
