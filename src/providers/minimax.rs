@@ -158,18 +158,28 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
         // 24h where `general`'s is 5h — so the shorthand is derived from the
         // instants the response itself carries rather than printed as the 5h/7d
         // the bars follow. A response omitting them falls back to those labels:
-        // they still name the windows by role for the bucket the bars read, and
-        // a length the response left unstated is not one to guess at.
-        let interval =
-            window_label(m.start_time, m.end_time).unwrap_or_else(|| LABEL_5H.to_string());
-        let weekly = window_label(m.weekly_start_time, m.weekly_end_time)
-            .unwrap_or_else(|| LABEL_7D.to_string());
+        // they still name the windows by role for the bucket the bars read. A
+        // STATED span the row has no shorthand for (a 90-minute window) prints
+        // no length at all — a length the response itself contradicts is worse
+        // than none.
+        let interval = match (m.start_time, m.end_time) {
+            (Some(_), Some(_)) => window_label(m.start_time, m.end_time),
+            _ => Some(LABEL_5H.to_string()),
+        };
+        let weekly = match (m.weekly_start_time, m.weekly_end_time) {
+            (Some(_), Some(_)) => window_label(m.weekly_start_time, m.weekly_end_time),
+            _ => Some(LABEL_7D.to_string()),
+        };
+        let span = |label: Option<String>, pct: String| match label {
+            Some(l) => format!("{l} {pct}"),
+            None => pct,
+        };
         rows.push(StatRow {
             label: m.model_name.clone(),
             value: format!(
-                "{interval} {} · {weekly} {}",
-                pct(m.current_interval_remaining_percent),
-                pct(m.current_weekly_remaining_percent)
+                "{} · {}",
+                span(interval, pct(m.current_interval_remaining_percent)),
+                span(weekly, pct(m.current_weekly_remaining_percent))
             ),
             // A spent bucket is the one figure a reader is scanning for.
             kind: match m.current_interval_remaining_percent {
