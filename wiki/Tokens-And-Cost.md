@@ -20,6 +20,8 @@ The figures cover **every account sharing this machine's home directory**, since
 
 Older days from Claude Code's rollup carry a combined in/out total with no cache split. A period that reaches back into those days shows a floor rather than an exact figure, marked with a badge, and cost renders as `$X+`.
 
+Some third-party endpoints report usage in an OpenAI-shaped way: the full prompt (cached prefix included) lands in `input`, and cache writes are never reported. clauth detects that shape from the usage rows themselves, subtracts the double-counted prefix, and prices the corrected figure. A model detail marked `cache write not reported` comes from such an endpoint — the write metric is absent there, so it stays 0 rather than being invented.
+
 ## Cost
 
 The cost figure is what your recorded usage **would cost on the pay-as-you-go API**. Nobody is billing you that: it is the value of what a subscription covered.
