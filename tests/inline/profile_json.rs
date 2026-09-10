@@ -381,3 +381,52 @@ fn published_windows_carries_an_oauth_accounts_windows() {
     assert_eq!(windows[0].label, "5h");
     assert_eq!(windows[0].utilization_pct, 42.0);
 }
+
+/// The other direction of the converted-profile guard: an api-key account
+/// whose provider publishes windows carries them in `windows[]`, read from its
+/// own third-party cache through the same derivation the walk reads.
+#[test]
+fn published_windows_carries_a_third_party_accounts_provider_windows() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "zai-keyed".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("k".to_string()),
+    ))
+    .expect("save the profile");
+    crate::testutil::register_names(&["zai-keyed"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("zai-keyed"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![
+                crate::providers::UsageBar {
+                    label: "5h".to_string(),
+                    pct: 62.0,
+                    resets_at: None,
+                    used: None,
+                    total: None,
+                },
+                crate::providers::UsageBar {
+                    label: "7d".to_string(),
+                    pct: 31.0,
+                    resets_at: None,
+                    used: None,
+                    total: None,
+                },
+            ],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    let windows = published_windows(&crate::profile::ProfileName::from("zai-keyed"));
+    assert_eq!(windows.len(), 2, "both provider windows publish");
+    assert_eq!(windows[0].label, "5h");
+    assert_eq!(windows[0].utilization_pct, 62.0);
+    assert_eq!(windows[1].label, "7d");
+    assert_eq!(windows[1].utilization_pct, 31.0);
+}
