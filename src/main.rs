@@ -165,6 +165,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     match command {
         Command::Start(a) => cmd_start(&a.profile, &a.claude_args, a.isolation(), a.with_fallback),
         Command::Login(a) => cmd_login(a),
+        Command::Capture { profile } => cmd_capture(&profile),
         Command::Delete {
             profile,
             yes,
@@ -196,9 +197,22 @@ fn dispatch(cli: Cli) -> Result<()> {
             standby,
             replace,
             status,
+            listen,
+            cert,
+            key,
+            print_token,
+            rotate_token,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
-        } => cmd_daemon(standby, replace, status),
+        } => cmd_daemon(
+            standby,
+            replace,
+            status,
+            print_token,
+            rotate_token,
+            listen,
+            daemon::api::tls::CertSource::from_flags(cert, key),
+        ),
         Command::Status {
             json: _,
             all,
@@ -221,15 +235,36 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_daemon(standby: bool, replace: bool, status: bool) -> Result<()> {
-    if status {
+fn cmd_daemon(
+    standby: bool,
+    replace: bool,
+    status: bool,
+    print_token: bool,
+    rotate_token: bool,
+    listen: Option<std::net::SocketAddr>,
+    certs: daemon::api::tls::CertSource,
+) -> Result<()> {
+    // The token arms come first: both print and exit without touching the
+    // singleton lock, so they answer for a daemon that is already running as
+    // readily as for one that is not.
+    //
+    // `outln!` rather than `println!` — `out` owns stdout so that
+    // `clauth daemon --print-token | head -1` exits 0 instead of panicking on
+    // the EPIPE, which is what `out::tests::no_bare_print_macro_under_src` pins.
+    if print_token {
+        outln!("{}", daemon::api::token::load_or_create()?);
+        Ok(())
+    } else if rotate_token {
+        outln!("{}", daemon::api::token::rotate()?);
+        Ok(())
+    } else if status {
         daemon::status_probe()
     } else if replace {
-        daemon::serve(daemon::StartMode::Replace)
+        daemon::serve(daemon::StartMode::Replace, listen, &certs)
     } else if standby {
-        daemon::serve(daemon::StartMode::Standby)
+        daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
-        daemon::serve(daemon::StartMode::ExitIfRunning)
+        daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
     }
 }
 
@@ -671,12 +706,14 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
         let snapshot = run_oauth_browser(false, &target)?;
-        actions::capture_into_profile(&mut config, target.to_string(), snapshot)?;
-        // Apply the requested default model so the captured profile's sessions
-        // route there from the first launch.
-        if let Some(model) = args.model.as_deref() {
-            actions::set_profile_default_model(&mut config, &target, model)?;
-        }
+        // The requested default model rides the capture's own save, so the
+        // profile's sessions route there from the first launch.
+        actions::capture_into_profile(
+            &mut config,
+            target.to_string(),
+            args.model.clone(),
+            snapshot,
+        )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
     // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch, so a
@@ -690,6 +727,24 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
              install. This login only feeds usage polling. Drop it with:  clauth static-token \
              {target} --clear"
         );
+    }
+    Ok(())
+}
+
+/// `clauth capture <name>`: save the login Claude Code is using now as a new
+/// profile. The refusal paths (existing name, nothing live to capture) and the
+/// capture itself live in `actions::capture_current_login`, so they are
+/// testable without argv; this wrapper only loads config and reports the
+/// outcome.
+fn cmd_capture(profile: &str) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let name = profile.trim();
+    let became_active = actions::capture_current_login(&mut config, name)?;
+    if became_active {
+        outln!("clauth: captured into profile '{name}'. It is the active account.");
+    } else {
+        outln!("clauth: captured into profile '{name}'. Switch to it with:  clauth {name}");
     }
     Ok(())
 }

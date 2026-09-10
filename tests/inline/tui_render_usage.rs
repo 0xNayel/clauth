@@ -1011,6 +1011,63 @@ fn status_text(ls: &[Line<'_>]) -> String {
         .join("\n")
 }
 
+/// The `stale` cue fires off the age field alone: a stale-aged cache renders
+/// the pill (warning BOLD, like `cached`), a fresh one does not. `fetch_status`
+/// stays out of it, so the pin proves the cue is not a second spelling of the
+/// fetch outcome.
+#[test]
+fn status_lines_renders_stale_cue_from_age_alone() {
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+    };
+
+    let mut stale = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    stale.usage_stale = true;
+    let lines = status_lines(&stale, &header, 120);
+    let stale_spans: Vec<_> = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .filter(|s| s.content == "stale")
+        .collect();
+    assert_eq!(stale_spans.len(), 1, "one stale pill label");
+    assert_eq!(
+        stale_spans[0].style,
+        theme::warning().add_modifier(Modifier::BOLD),
+        "stale pill takes the warning BOLD treatment"
+    );
+
+    let fresh = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let rendered = status_text(&status_lines(&fresh, &header, 120));
+    assert!(!rendered.contains("stale"), "got {rendered:?}");
+}
+
+/// A `Cached` fetch outcome and a `stale` age cue coexist: the two signals
+/// differ, so the cue must not gate on `fetch_status`.
+#[test]
+fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.fetch_status = Some(FetchStatus::Cached);
+    profile.usage_stale = true;
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: Some(now_ms() + 90_000),
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+    };
+    let rendered = status_text(&status_lines(&profile, &header, 120));
+    assert!(rendered.contains("cached"), "got {rendered:?}");
+    assert!(rendered.contains("stale"), "got {rendered:?}");
+}
+
 /// The disabled rung leads but does NOT erase the health rungs beneath it: a
 /// dead login is just as true on a disabled account, and hiding it would strand
 /// an operator who re-enables it. Both facts stack on one `├│└` rail.
@@ -1733,6 +1790,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             extra_usage: extra,
             spend,
             open_at: None,
+            fetched_at: None,
         });
         collect_stats(&profile, ResetFmt::default())
     };

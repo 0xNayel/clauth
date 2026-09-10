@@ -15,7 +15,7 @@
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
 | **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
-The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable.
+The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
 
 ## Keys
 
@@ -82,6 +82,8 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 `disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
 
 ## Setup tab rows
+
+The account list ends in an action row: `+ new`, which turns this pane into the create form. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed.
 
 | Row | Sets |
 |-----|------|

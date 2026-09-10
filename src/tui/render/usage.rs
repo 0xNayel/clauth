@@ -27,7 +27,7 @@ use crate::providers::{Provider, StatRowKind};
 use crate::usage::{
     ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, QueueSlot, StreakCounts, UsageWindow,
     WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak, kick_block_switch_grade,
-    now_epoch_secs, now_ms, queue_anchor_cached, switch_grade_kick_lifts,
+    now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh, switch_grade_kick_lifts,
 };
 
 const KEY_W: usize = 8;
@@ -137,13 +137,13 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(profile.name.as_str()).copied())
+            .map(|activity| crate::usage::selected_activity(&activity, profile))
             .unwrap_or(ProfileActivity::Idle),
         next_refresh_ms: app
             .next_refresh_per_profile
             .lock()
             .ok()
-            .and_then(|m| m.get(profile.name.as_str()).copied()),
+            .and_then(|m| selected_next_refresh(&m, profile)),
         tick: app.tick_count,
         streaks: streaks
             .get(profile.name.as_str())
@@ -977,6 +977,21 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         return render_status_rows(rows, w);
     }
 
+    // The `stale` cue: cache age past `stale_after_ms`, a fact orthogonal to
+    // `fetch_status` — the same kick-`blocked` precedent earns it its own pill.
+    // A `cached` pill and this cue can coexist: one names the last outcome, the
+    // other the reading's age. Same threshold + exemption as `status.json`'s
+    // `stale` age arm.
+    if profile.usage_stale {
+        rows.push(DiagRow {
+            content: pill(
+                "stale".to_string(),
+                theme::warning().add_modifier(Modifier::BOLD),
+            ),
+            hint: None,
+        });
+    }
+
     let countdown = header.next_refresh_ms.map(|next| {
         let secs = ((next as i64 - now_ms() as i64) / 1000).max(0);
         format!("{secs}s")
@@ -1442,16 +1457,12 @@ fn bar_reset_trailing(rem: Option<i64>, reset_fmt: ResetFmt) -> String {
 /// Eyebrow amount for a bar: `used / total` when both are present, else empty.
 fn bar_amount(bar: &crate::providers::UsageBar) -> String {
     match (bar.used, bar.total) {
-        (Some(used), Some(total)) => format!("{} / {}", fmt_amount(used), fmt_amount(total)),
+        (Some(used), Some(total)) => format!(
+            "{} / {}",
+            crate::format::format_amount(used),
+            crate::format::format_amount(total)
+        ),
         _ => String::new(),
-    }
-}
-
-fn fmt_amount(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
     }
 }
 

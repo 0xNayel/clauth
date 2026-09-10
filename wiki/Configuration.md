@@ -31,7 +31,7 @@ Five providers get typed usage panels:
 | Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
 | MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
 
-Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable stops being polled until you press <kbd>r</kbd>. A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
+Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage, fraction-left window, or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable is rescanned at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces a rescan immediately. A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
 
 #### Where the keys come from
 
@@ -190,6 +190,8 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
   ai_pricelog_v4_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
+  auth_token.json          # the REST API's bearer token, created by `--print-token` (0600)
+  tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
   token_ledger.json        # the per-day token ledger behind the Tokens tab
   clauth.log, daemon.log   # event lines from the TUI and the daemon

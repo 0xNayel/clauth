@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::usage::{ActivityStore, ProfileActivity, any_busy};
 
 fn make_activity(entries: &[(&str, ProfileActivity)]) -> ActivityStore {
-    let mut map = HashMap::new();
+    let store = Arc::new(RankedMutex::new(HashMap::new()));
     for (name, activity) in entries {
-        map.insert(name.to_string(), *activity);
+        crate::usage::mark_activity(&store, &crate::profile::ProfileName::from(*name), *activity);
     }
-    Arc::new(RankedMutex::new(map))
+    store
 }
 
 fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
@@ -73,6 +73,62 @@ fn bootstrap_active_false_with_refreshing_slot_still_busy() {
     let flag = Arc::new(AtomicBool::new(false));
     let activity = make_activity(&[("alice", ProfileActivity::Refreshing)]);
     assert!(bootstrap_busy(&flag, &activity));
+}
+
+/// A rotation result reaches the UI thread a tick or more after its worker
+/// returned. Clearing the whole profile there drops an OAuth refetch spinner the
+/// rotation never raised, so the drain retires the rotation marker alone.
+#[test]
+fn a_rotation_result_keeps_a_later_oauth_refetch_spinner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("alice");
+
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
+    // the scheduler re-opens the OAuth leg before the UI drains the result.
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Fetching);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        !crate::usage::is_idle(&app.activity, &name),
+        "the refetch spinner outlives the rotation result it did not belong to"
+    );
+
+    // Control: with no later refetch the drain leaves the profile idle, so the
+    // assert above cannot pass on a drain that clears nothing at all.
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Refreshing);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        crate::usage::is_idle(&app.activity, &name),
+        "the rotation marker itself retires on its own result"
+    );
+
+    // A switch gate opened after the rotation belongs to the gate's own drain.
+    let mut app = bare_app();
+    crate::usage::mark_activity(&app.activity, &name, ProfileActivity::Switching);
+    app.op_sender
+        .send(crate::usage::OpResult {
+            name: "alice".to_string(),
+            outcome: Ok(()),
+        })
+        .expect("send op result");
+    super::drain_op_results(&mut app);
+    assert!(
+        !crate::usage::is_idle(&app.activity, &name),
+        "a pending switch outlives an unrelated rotation result"
+    );
 }
 
 // ── compact mode ─────────────────────────────────────────────────────────
@@ -3020,7 +3076,9 @@ fn login_result_on_the_new_form_stashes_into_the_draft() {
 
 #[test]
 fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
-    use super::{ConfigFocus, ConfigRow, ConfirmAction, Modal, build_draft_new, run_config_row};
+    use super::{
+        ConfigFocus, ConfigRow, ConfirmAction, DraftLogin, Modal, build_draft_new, run_config_row,
+    };
     use crate::profile::{AppConfig, AppState};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -3032,7 +3090,10 @@ fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     // A mint already captured → the `✓ logged in` done-state row.
-    draft.captured_login = Some(Box::new(login_outcome("stashed", Some("uuid-stashed"))));
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "stashed",
+        Some("uuid-stashed"),
+    ))));
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
 
@@ -3091,7 +3152,7 @@ fn login_result_with_the_form_closed_is_dropped_with_a_warning() {
 
 #[test]
 fn commit_new_account_consumes_the_draft_mint() {
-    use super::{build_draft_new, commit_new_account};
+    use super::{DraftLogin, build_draft_new, commit_new_account};
     use crate::profile::{AppConfig, AppState};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -3103,7 +3164,10 @@ fn commit_new_account_consumes_the_draft_mint() {
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     draft.model = InputState::new("opus");
-    draft.captured_login = Some(Box::new(login_outcome("minted", Some("uuid-minted"))));
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "minted",
+        Some("uuid-minted"),
+    ))));
     app.config_draft = Some(draft);
 
     commit_new_account(&mut app);
@@ -3137,6 +3201,256 @@ fn commit_new_account_consumes_the_draft_mint() {
         Some("uuid-minted"),
         "the anchor lands under the name the create committed — the draft carried \
          the login's uuid this far precisely because the name was still editable"
+    );
+}
+
+// ── `+ capture current login` (the `+ new` form row) ─────────────────────────
+
+/// ⏎ on `+ capture current login` stashes the live login into the draft like
+/// `+ login` stashes its mint; `create account` then commits it under the
+/// typed name, folding the typed model — the #72 flow, on the form.
+#[test]
+fn capture_row_stashes_and_create_account_commits() {
+    use super::{
+        ConfigFocus, ConfigRow, DraftLogin, ToastKind, build_draft_new, commit_new_account,
+        config_rows, run_config_row,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    plain_live_login("live-refresh");
+    let mut app = bare_app();
+    app.refresh_unsaved_live_login();
+    app.profile_cursor = 0; // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("work");
+    draft.model = InputState::new("sonnet");
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("work"))
+            .is_none(),
+        "capture-then-commit: no profile until create fires"
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::LiveLogin(_))
+        ),
+        "the live login lands in the draft"
+    );
+    assert_eq!(
+        config_rows(&app).get(app.config_action_cursor),
+        Some(&ConfigRow::Create),
+        "the cursor lands on `create account`"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body.contains("current login captured")),
+        "the stash success toast names what happened"
+    );
+
+    commit_new_account(&mut app);
+
+    let cfg = app.config();
+    let profile = cfg
+        .find(&crate::profile::ProfileName::from("work"))
+        .expect("create account commits the captured login");
+    assert_eq!(
+        profile.refresh_token(),
+        Some("live-refresh"),
+        "the profile holds the live login's tokens"
+    );
+    assert_eq!(
+        profile.models.default.as_deref(),
+        Some("sonnet"),
+        "the typed model folds into the same create"
+    );
+    assert!(
+        !app.unsaved_live_login,
+        "the flag drops once the created account owns the login"
+    );
+}
+
+/// Ownership that appeared after the flag was computed: ⏎ refuses naming the
+/// owner — a new account over an owned login is the duplicate the overwrite
+/// path exists to prevent — and refreshes the flag so the row disappears.
+#[test]
+fn capture_row_over_an_owned_live_login_refuses() {
+    use super::{ConfigFocus, ConfigRow, ToastKind, build_draft_new, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+    plain_live_login("rt-owner");
+    let mut app = bare_app();
+    {
+        let mut cfg = app.config();
+        cfg.profiles
+            .push(stored_oauth_profile("owner", far_future()));
+    }
+    app.unsaved_live_login = true; // stale: the state the row was rendered on
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_new());
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "nothing is stashed over an owned login"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("owner")),
+        "the refusal names the owning profile"
+    );
+    assert!(
+        !app.unsaved_live_login,
+        "the refusal refreshes the flag the row renders on"
+    );
+}
+
+/// The live file going empty between the flag and the press: the shared
+/// `capture_live_or_toast` refusal, not a credential-less stash.
+#[test]
+fn capture_row_with_nothing_live_refuses() {
+    use super::{ConfigFocus, ConfigRow, ToastKind, build_draft_new, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.unsaved_live_login = true; // stale
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_new());
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "nothing is stashed from an empty live file"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("no live login found")),
+        "the empty-snapshot refusal toast fires"
+    );
+}
+
+/// A browser mint already stashed (`✓ logged in`): capturing over it asks
+/// first, exactly like the re-login gate — the mint cost a real browser
+/// round-trip. Confirming swaps the stash.
+#[test]
+fn capture_row_over_a_stashed_mint_confirms_first() {
+    use super::{
+        ConfigFocus, ConfigRow, ConfirmAction, DraftLogin, Modal, build_draft_new, run_config_row,
+        run_confirm_action,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    plain_live_login("live-refresh");
+    let mut app = bare_app();
+    app.refresh_unsaved_live_login();
+    app.profile_cursor = 0;
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "stashed",
+        Some("uuid-stashed"),
+    ))));
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    let action = match app.modals.last() {
+        Some(Modal::Confirm(s)) => {
+            assert!(
+                matches!(s.on_confirm, ConfirmAction::CaptureOverMintStash(_)),
+                "the confirm targets the mint replacement"
+            );
+            s.on_confirm.clone()
+        }
+        other => panic!("⏎ over a stashed mint must confirm first, got {other:?}"),
+    };
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::Mint(_))
+        ),
+        "cancel (no confirm) keeps the mint"
+    );
+
+    run_confirm_action(&mut app, action);
+
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::LiveLogin(_))
+        ),
+        "confirming swaps the mint for the captured live login"
+    );
+}
+
+/// The reverse direction of the same single stash slot: `+ login` over a
+/// stashed live login must confirm before replacing it — the gate now guards
+/// ANY stash, not just a mint.
+#[test]
+fn login_row_over_a_stashed_live_login_confirms_first() {
+    use super::{
+        ConfigFocus, ConfigRow, ConfirmAction, DraftLogin, Modal, build_draft_new, run_config_row,
+    };
+    use crate::actions::CaptureSnapshot;
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0; // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+        credentials: None,
+        base_url: None,
+        api_key: None,
+        account_uuid: None,
+    })));
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::Login);
+
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true))
+        ),
+        "⏎ on `+ login` over a stashed live login must confirm before dropping it",
+    );
+    assert!(
+        app.login.is_none(),
+        "no login worker starts until the confirm is accepted",
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::LiveLogin(_))
+        ),
+        "cancel (no confirm) keeps the stashed live login"
     );
 }
 
@@ -6378,6 +6692,86 @@ fn capture_refuses_empty_snapshot() {
     );
 }
 
+/// A plain live credentials file, as `claude` itself leaves it, holding an
+/// OAuth login (refresh token `rt-<name>` when `name` is given, so a profile
+/// saved with the same token owns it).
+fn plain_live_login(refresh: &str) -> std::path::PathBuf {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("access-{refresh}"),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+    live
+}
+
+/// `+ capture current login` renders on the `+ new` form only while the live
+/// login is real and no profile owns it — `unsaved_live_login` drives the row,
+/// and the flag itself reads live credentials + the profile set. API mode
+/// keeps the row (`+ login` doesn't): a live setup can be an endpoint too.
+#[test]
+fn new_form_capture_row_tracks_an_unsaved_live_login() {
+    use super::{ConfigRow, build_draft_new, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.profile_cursor = 0; // == profile_count() → the `+ new` form
+
+    // Nothing live: no row (the flag starts false — no login exists).
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "no live login, no capture row"
+    );
+
+    // An unowned live login: the row shows, and survives a typed base url.
+    plain_live_login("live-refresh");
+    app.refresh_unsaved_live_login();
+    assert!(
+        app.unsaved_live_login,
+        "an unowned live login turns the flag on"
+    );
+    assert!(
+        config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "the row renders for an unowned live login"
+    );
+    let mut draft = build_draft_new();
+    draft.base_url = InputState::new("https://api.example.com");
+    app.config_draft = Some(draft);
+    assert!(
+        config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "the row survives api mode (a live setup can be an endpoint)"
+    );
+    app.config_draft = None;
+
+    // A profile owning the login: the flag drops, the row goes.
+    plain_live_login("rt-owner");
+    let owner = stored_oauth_profile("owner", far_future());
+    {
+        let mut cfg = app.config();
+        cfg.profiles.push(owner);
+    }
+    app.refresh_unsaved_live_login();
+    assert!(
+        !app.unsaved_live_login,
+        "a login a profile owns turns the flag off"
+    );
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "no row over an owned live login"
+    );
+}
+
 // ── capture-name collision (issue #7) ──────────────────────────────────────
 
 /// Typing an EXISTING profile's name in the capture-name prompt must open the
@@ -6924,6 +7318,7 @@ fn tokens_period_key_cycles_and_clamps_cursor() {
                 output: 5,
                 cache_read: 0,
                 cache_create: 0,
+                shape: Default::default(),
             },
             crate::tokens::ModelTokens {
                 model: "claude-sonnet-4".into(),
@@ -6931,6 +7326,7 @@ fn tokens_period_key_cycles_and_clamps_cursor() {
                 output: 4,
                 cache_read: 0,
                 cache_create: 0,
+                shape: Default::default(),
             },
         ],
         ..Default::default()
@@ -7164,6 +7560,114 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
         after, prior,
         "the UI tick must never write the history log (it belongs to \
          `apply_outcome`, possibly in another process)",
+    );
+}
+
+/// #74 degraded cue, FEED half: `apply_usage` derives `usage_stale` off the
+/// DISK body's `fetched_at` vs `stale_after_ms`, with the spent-account
+/// exemption reading the disk cache too (never the live store — a spent
+/// account the scheduler dropped from its due set keeps its store entry, so
+/// the two sources disagree exactly on the exempted state). The render pins
+/// in `tui_render_usage.rs` hold only if this derivation is right.
+#[test]
+fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
+    let stale_for = |disk: UsageInfo| {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = {
+            let mut profile =
+                crate::testutil::blank_profile(&crate::profile::ProfileName::from(GATE_PROFILE));
+            profile.bell_threshold = None;
+            App::new(crate::profile::AppConfig {
+                state: crate::profile::AppState {
+                    profiles: vec![GATE_PROFILE.into()],
+                    // The spent skip exists only under the opt-out (the
+                    // default is ON), so the exempt arm below needs it OFF.
+                    refresh_spent_accounts: false,
+                    ..crate::profile::AppState::default()
+                },
+                profiles: vec![profile],
+            })
+        };
+        // The live store carries a NON-maxed body while the disk cache is
+        // maxed (spent): the exemption must read the disk side, so a
+        // store-reading derivation flips stale on for a spent account and
+        // reds the exempt arm below.
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        {
+            let mut store = app.usage_store.lock().expect("usage_store mutex poisoned");
+            store.insert(
+                GATE_PROFILE.to_string(),
+                UsageInfo {
+                    five_hour: Some(UsageWindow {
+                        utilization: 42.0,
+                        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                    }),
+                    ..UsageInfo::default()
+                },
+            );
+        }
+        crate::testutil::register_names(&[GATE_PROFILE]);
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(GATE_PROFILE),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &disk,
+        );
+        app.apply_usage();
+        {
+            let cfg = app.config();
+            cfg.profiles
+                .iter()
+                .find(|p| p.name.as_str() == GATE_PROFILE)
+                .expect("profile present")
+                .usage_stale
+        }
+    };
+    let interval = crate::profile::AppState::default().refresh_interval_ms;
+    let body = |util: f64, resets_at: &str, fetched_at: Option<u64>| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: Some(resets_at.to_string()),
+        }),
+        fetched_at,
+        ..UsageInfo::default()
+    };
+    let dated = |age_ms: u64, util: f64| {
+        body(
+            util,
+            "2999-01-01T00:00:00+00:00",
+            Some(crate::usage::now_ms() - age_ms),
+        )
+    };
+    let threshold = crate::profile_json::stale_after_ms(interval);
+
+    assert!(
+        !stale_for(dated(threshold / 2, 42.0)),
+        "a cache under the threshold must not read stale"
+    );
+    assert!(
+        stale_for(dated(threshold + 60_000, 42.0)),
+        "a cache past the threshold must read stale"
+    );
+    // `windows_maxed` keys on the DISK body (100%, a far-future reset): the
+    // exempt arm holds even at an age far past the threshold, and holds
+    // against the live store's non-maxed body.
+    assert!(
+        !stale_for(dated(threshold + 60_000, 100.0)),
+        "a live-maxed window is exempt: its figure cannot change by polling"
+    );
+    // The age rides the BODY. An undated one is stale on its own, and only
+    // this arm separates the contract from the cache-mtime derivation it
+    // replaced: the fixture writes the file NOW, so an mtime reading calls it
+    // fresh.
+    assert!(
+        stale_for(body(42.0, "2999-01-01T00:00:00+00:00", None)),
+        "a body nothing can date reads stale"
+    );
+    // ...and the verdict qualifies a figure, so a body whose only window has
+    // lapsed carries no marker however undatable it is.
+    assert!(
+        !stale_for(body(42.0, "2000-01-01T00:00:00+00:00", None)),
+        "an all-lapsed body publishes no row for a marker to qualify"
     );
 }
 
@@ -7889,6 +8393,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -8932,6 +9437,9 @@ fn herdr_entry(enabled: bool, min: Option<&str>, warnings: Vec<&str>) -> Registr
         min_herdr_version: min.map(str::to_string),
         plugin_root: None,
         source_kind: Some("github".into()),
+        resolved_commit: None,
+        source_owner: None,
+        source_repo: None,
         warnings: warnings.into_iter().map(str::to_string).collect(),
     }
 }

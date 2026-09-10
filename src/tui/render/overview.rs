@@ -25,7 +25,7 @@ use crate::profile::{AppConfig, Profile};
 use crate::providers::Provider;
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
-    switch_grade_kick_lifts,
+    selected_next_refresh, switch_grade_kick_lifts,
 };
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
@@ -394,7 +394,7 @@ fn render_overview_row(
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(profile.name.as_str()).copied())
+            .map(|activity| crate::usage::selected_activity(&activity, profile))
             .unwrap_or(ProfileActivity::Idle);
         if !matches!(activity, ProfileActivity::Idle) {
             let frame = spinner_frame(app.tick_count);
@@ -405,7 +405,7 @@ fn render_overview_row(
                 .next_refresh_per_profile
                 .lock()
                 .ok()
-                .and_then(|m| m.get(profile.name.as_str()).copied())
+                .and_then(|m| selected_next_refresh(&m, profile))
                 .map(|next_ms| {
                     let now = now_ms();
                     let secs = ((next_ms as i64 - now as i64) / 1000).max(0);

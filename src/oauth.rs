@@ -753,7 +753,8 @@ pub(crate) fn auto_start_kick(
     }
     let refreshed = refresh_result(rt, stored_scopes(config, name).as_deref());
     if let Some(activity) = activity {
-        mark_activity(activity, name, ProfileActivity::Fetching);
+        // This site raised `Refreshing`, so it is the one that may retire it.
+        crate::usage::rotation_into_fetch(activity, name);
     }
     let tok = match refreshed {
         Ok(t) => t,
@@ -2692,10 +2693,22 @@ fn gate_under_guard(
     }
 }
 
-/// Set or clear a profile's persisted `auth_broken` flag and save. Best-effort:
-/// a failed save leaves the in-memory flag as set for this run (re-applied on the
-/// next attempt). Locks `config` (outer) then the state flock (inner) — the
-/// established save order.
+/// Set or clear a profile's `auth_broken` flag in memory and persist it. The
+/// memory flip is unconditional — a refused write must not un-quarantine the
+/// account for live readers, since the scheduler's TokenEntry leg reads this
+/// flag to skip the refresh spend — and the persist runs on EVERY call, not
+/// only on transitions: the memory flag alone cannot tell "already on disk"
+/// from "write refused", so any next call through here is the retry that
+/// catches disk up (a read-only no-op once it matches). In a live daemon that
+/// retry is the CLEAR direction (each successful refresh re-clears) and the
+/// switch/install gates; a quarantined profile's own fetch is skipped, so a
+/// failed SET stays memory-only until process exit. A refused persist logs
+/// one line naming the profile and direction; the transition log stays
+/// guarded by `set_auth_broken`'s changed-return, so a retried persist never
+/// re-logs. A write never retried before the process exits stays invisible
+/// to the next process — the pre-existing semantics of an unwritten flag.
+/// Locks `config` (outer) then the state flock (inner) — the established
+/// save order.
 ///
 /// The save goes through [`crate::profile::set_auth_broken_persisted`] rather
 /// than re-serializing the whole in-memory `AppState`: a daemon leg can hold a
@@ -2710,23 +2723,30 @@ pub(crate) fn mark_auth_broken(
     let Ok(mut cfg) = config.lock() else {
         return;
     };
-    if !cfg.set_auth_broken(name, broken) {
-        return;
+    if cfg.set_auth_broken(name, broken) {
+        // Log the transition only — guarded by `set_auth_broken`'s changed-return
+        // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
+        // dropped login leaves one stderr line, never a per-tick repeat.
+        if broken {
+            // The durable record of the quarantine names the same recovery the
+            // live surfaces do: this leg fires for a third-party hybrid too (the
+            // scheduler spends any profile holding a refresh token).
+            let sentence = third_party_dead_chain_copy(cfg.find(name), name)
+                .unwrap_or_else(|| crate::format::login_expired(name).line());
+            logline!("clauth: {sentence} (flagged auth_broken)");
+        } else {
+            logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
+        }
     }
-    // Log the transition only — guarded by `set_auth_broken`'s changed-return
-    // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
-    // dropped login leaves one stderr line, never a per-tick repeat.
-    if broken {
-        // The durable record of the quarantine names the same recovery the
-        // live surfaces do: this leg fires for a third-party hybrid too (the
-        // scheduler spends any profile holding a refresh token).
-        let sentence = third_party_dead_chain_copy(cfg.find(name), name)
-            .unwrap_or_else(|| crate::format::login_expired(name).line());
-        logline!("clauth: {sentence} (flagged auth_broken)");
-    } else {
-        logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
+    // Persisted on every call so a refused write is retried by the next one —
+    // the error used to be discarded here, stranding a quarantine that
+    // idempotence then locked in place: memory said broken, the next call
+    // early-returned on the unchanged flag, and a restart lost the flag
+    // that never reached disk.
+    if let Err(e) = crate::profile::set_auth_broken_persisted(name, broken) {
+        let direction = if broken { "set" } else { "clear" };
+        logline!("clauth: failed to persist auth_broken {direction} for '{name}': {e:#}");
     }
-    let _ = crate::profile::set_auth_broken_persisted(name, broken);
 }
 
 #[cfg(test)]

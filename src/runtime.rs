@@ -682,10 +682,34 @@ fn live_session_holds_rotatable(name: &ProfileName) -> bool {
 /// strictly the more expensive probe (a registry read plus a credential parse
 /// per live session), and it only ever narrows an answer that is already
 /// `true`, so it is never paid by a profile that was not about to be refused.
+///
+/// The `cfg!` term is compile-time false off macOS, so a Linux test can reach
+/// neither arm through the host; the test-only override below is the one way
+/// the scheduler's ordering pins can hold both.
 pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = ROTATION_BLOCKED_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     cfg!(target_os = "macos")
         && rotation_blocked_by_live_session(has_live_session(name), true)
         && live_session_holds_rotatable(name)
+}
+
+// Test seam posing the refusal's answer from a Linux host. Thread-local, same
+// shape as `ROTATION_LOCK_TIMEOUT_OVERRIDE`: a test that forces it affects only
+// the thread it drives the fetch on, and `None` (the default) is the host
+// answer — production never sets it.
+#[cfg(test)]
+thread_local! {
+    static ROTATION_BLOCKED_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set or clear the test-only refusal override. `None` restores the host answer.
+#[cfg(test)]
+pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
+    ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
 /// Count of live `clauth start` sessions for the profile, deduped by marker NAME
@@ -1242,13 +1266,11 @@ pub(crate) struct RotationGuard {
 /// slow enough to burn its budget, which is an unanswered ACL dialog or a locked
 /// keychain, and the refusal is retryable.
 ///
-/// The CEILING is [`crate::mcp::MAX_WAIT_SECS_NO_PROGRESS`], the only deadline
-/// this wait sits inside: the MCP `delegate`'s pre-spawn window emits no progress
-/// notification, there being no child to report on yet, and that constant is the
-/// crate's already-derived answer to how long a peer that cannot receive progress
-/// tolerates silence — itself a conservative proxy for Claude Code's 30-minute
-/// stdio idle abort, not that abort. Past the abort the named refusal below
-/// reaches nobody. Pinned as a relation rather than restated here.
+/// The CEILING is Claude Code's 30-minute stdio idle abort: the MCP
+/// `delegate`'s pre-spawn window emits no progress notification, there being
+/// no child to report on yet, so the wait sits inside whatever silence the
+/// host tolerates before aborting the call. Past the abort the named refusal
+/// below reaches nobody. Pinned as a relation rather than restated here.
 ///
 /// A holder past this deadline gets a named retry rather than a fault, because
 /// the unbounded legs mean a firing is not proof of a wedge.

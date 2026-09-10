@@ -44,6 +44,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -126,6 +127,75 @@ fn dump(app: &App, w: u16, h: u16) -> String {
         .into_iter()
         .map(|r| r + "\n")
         .collect()
+}
+
+#[test]
+fn hybrid_renders_the_activity_and_deadline_of_its_provider_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    use crate::tui::app::Tab;
+    use crate::usage::{FetchLeg, ProfileActivity, mark_activity, mark_fetch_activity};
+
+    let mut hybrid = oauth("hybrid", 40.0, 60.0, false);
+    hybrid.base_url = Some("https://api.deepseek.com".to_string());
+    hybrid.api_key = Some("key".to_string());
+    hybrid.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com");
+    hybrid.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "access".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let name = hybrid.name.clone();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![hybrid],
+    });
+    let now = crate::usage::now_ms();
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(FetchLeg::OAuth.key(name.clone()), now + 11_000);
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(FetchLeg::ThirdParty.key(name.clone()), now + 222_000);
+
+    mark_activity(&app.activity, &name, ProfileActivity::Fetching);
+    app.tab = Tab::Usage;
+    let oauth_only_usage = dump(&app, 100, 24);
+    assert!(
+        (oauth_only_usage.contains("refresh in 221s")
+            || oauth_only_usage.contains("refresh in 222s"))
+            && !oauth_only_usage.contains("refresh in 11s"),
+        "provider figures keep their provider countdown while OAuth fetches:\n{oauth_only_usage}"
+    );
+    app.tab = Tab::Overview;
+    let oauth_only_overview = dump(&app, 100, 24);
+    assert!(
+        oauth_only_overview.contains("221s") || oauth_only_overview.contains("222s"),
+        "overview keeps the provider countdown while OAuth fetches:\n{oauth_only_overview}"
+    );
+
+    mark_fetch_activity(
+        &app.activity,
+        &FetchLeg::ThirdParty.key(name),
+        ProfileActivity::Fetching,
+    );
+    for tab in [Tab::Usage, Tab::Overview] {
+        app.tab = tab;
+        let provider_fetch = dump(&app, 100, 24);
+        assert!(
+            provider_fetch.contains(crate::spinner::SPINNER_FRAMES[0]),
+            "the provider fetch replaces its own countdown on {tab:?}:\n{provider_fetch}"
+        );
+    }
 }
 
 #[test]
@@ -454,8 +524,93 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
         "api account with a key shows a log-out row:\n{out}",
     );
     assert!(
-        out.contains("re-enter the base url"),
+        out.contains("re-enter the base URL"),
         "the login row's hint describes the API re-entry:\n{out}",
+    );
+}
+
+/// The Setup picker ends in exactly one trailing row (`+ new`), and the
+/// create form carries `+ capture current login` under `+ login` while the
+/// live login is unowned — flipping to its ✓ done state once stashed, and
+/// gone entirely when no live login is unsaved.
+#[test]
+fn new_form_renders_the_capture_row_and_its_done_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::actions::CaptureSnapshot;
+    use crate::tui::app::{ConfigRow, DraftLogin, Tab, build_draft_new, config_rows};
+
+    // A plain live credentials file, as `claude` itself leaves it.
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "live-access".to_string(),
+                refresh_token: Some("live-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut app = App::new(config);
+    app.refresh_unsaved_live_login();
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.profile_cursor = 0; // the `+ new` form
+
+    // Park the cursor on the capture row so its hint renders too.
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::CaptureLogin)
+        .expect("the capture row renders for an unowned live login");
+
+    let out = dump(&app, 120, 30);
+    assert!(
+        !out.contains("+ new from"),
+        "the picker carries no second trailing row:\n{out}"
+    );
+    assert!(
+        out.contains("+ capture current login"),
+        "the form carries the capture row under `+ login`:\n{out}"
+    );
+    assert!(
+        out.contains("save the current global credentials into a new account"),
+        "the capture row's hint explains what ⏎ stashes:\n{out}"
+    );
+
+    // Stashed: the ✓ done state, same pattern as `✓ logged in`.
+    let mut draft = build_draft_new();
+    draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+        credentials: None,
+        base_url: None,
+        api_key: None,
+        account_uuid: None,
+    })));
+    app.config_draft = Some(draft);
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("✓ captured current login"),
+        "a stashed snapshot renders the done state:\n{out}"
+    );
+
+    // No unsaved live login: no row at all.
+    app.config_draft = None;
+    app.unsaved_live_login = false;
+    let out = dump(&app, 120, 30);
+    assert!(
+        !out.contains("capture current login"),
+        "a saved or absent live login hides the row:\n{out}"
     );
 }
 
@@ -1086,6 +1241,7 @@ fn bare(name: &str) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 

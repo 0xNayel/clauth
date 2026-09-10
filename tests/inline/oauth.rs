@@ -82,6 +82,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -217,6 +218,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -282,6 +284,7 @@ fn profile_without_refresh_token_excluded() {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -376,6 +379,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -411,6 +415,7 @@ fn third_party_config(name: &str) -> AppConfig {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -4877,6 +4882,205 @@ fn mark_auth_broken_does_not_resurrect_a_deleted_profiles_row() {
             .find(&crate::profile::ProfileName::from("kept-row"))
             .is_some(),
         "the surviving profile's row is untouched"
+    );
+}
+
+// ── quarantine persist-retry pins ──────────────────────────────────────────
+//
+// The quarantine write goes to disk, and disk can refuse it. These pins hold
+// `mark_auth_broken` to the contract that keeps a refused write recoverable
+// in-process: the memory flag flips anyway (live readers keep skipping the
+// refresh spend on a quarantined account), the refusal is logged once naming
+// the profile and direction, and the NEXT call is the retry — which is why
+// the persist cannot sit behind the memory gate: after a failed write memory
+// already matches, and the changed-return would early-return the retry away.
+
+/// One OAuth profile on disk and in a fresh handle, with the on-disk
+/// `auth_broken` list seeded to `broken`.
+fn quarantine_persist_fixture(name: &str, broken: bool) -> crate::profile::ConfigHandle {
+    let profile = Profile::new(name.to_string(), None, None);
+    let state = AppState {
+        profiles: vec![name.into()],
+        auth_broken: broken.then(|| name.into()).into_iter().collect(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    Arc::new(RankedMutex::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    }))
+}
+
+/// Make the next `set_auth_broken_persisted` fail: a DIRECTORY where
+/// `profiles.toml` should be makes the read inside the persist fail, the same
+/// injection `testutil::block_credentials_write` aims at a credentials write.
+/// The last-good file is gone until [`unblock_state_persist`] restores it.
+fn block_state_persist() {
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    std::fs::remove_file(&path).expect("drop the last-good state file");
+    std::fs::create_dir(&path).expect("block the state file with a directory");
+}
+
+/// Put `state` back as the on-disk `profiles.toml` — the file the failed
+/// write never touched, rewritten through the production saver.
+fn unblock_state_persist(state: &AppState) {
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    std::fs::remove_dir(&path).expect("drop the blocking directory");
+    crate::profile::save_app_state(state).expect("restore the last-good state");
+}
+
+/// A refused quarantine write must not vanish: the flag flips in memory (the
+/// scheduler's TokenEntry leg reads `config.is_auth_broken` to skip the
+/// refresh spend, so this is what keeps a quarantined account quarantined for
+/// live readers), the refusal is logged with the profile and direction, and
+/// the next call — whose memory already matches, so the changed-return cannot
+/// gate it — retries the write and re-logs nothing.
+#[test]
+fn a_failed_set_persist_is_logged_and_retried_by_the_next_call() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("qp-set");
+    let handle = quarantine_persist_fixture("qp-set", false);
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+
+    block_state_persist();
+    mark_auth_broken(&handle, &name, true);
+
+    assert!(
+        handle.lock().expect("lock handle").is_auth_broken(&name),
+        "the in-memory flag flips even when the write is refused"
+    );
+    let lines = sink.snapshot();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one transition line, one failure line — nothing else: {lines:?}"
+    );
+    assert_eq!(
+        lines[0],
+        "clauth: login for 'qp-set' has expired: refresh token revoked or \
+         invalid: run clauth login qp-set (flagged auth_broken)"
+    );
+    assert!(
+        lines[1]
+            .starts_with("clauth: failed to persist auth_broken set for 'qp-set': failed to read "),
+        "the failure line names the profile and the direction: {lines:?}"
+    );
+
+    // The next poll is the retry: with the failure removed it lands the flag
+    // on disk, and the memory-matching call re-logs nothing.
+    unblock_state_persist(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    });
+    assert!(
+        !crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "fixture control: the restored last-good file carries no flag"
+    );
+    mark_auth_broken(&handle, &name, true);
+    assert!(
+        crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "the retry lands the flag on disk"
+    );
+    assert_eq!(
+        sink.snapshot().len(),
+        2,
+        "the retry adds no log lines: {:?}",
+        sink.snapshot()
+    );
+}
+
+/// The clear direction mirrors the set: memory heals even when the write is
+/// refused, the refusal is logged, and the next call retries it onto disk.
+#[test]
+fn a_failed_clear_persist_is_logged_and_retried_by_the_next_call() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("qp-clear");
+    let handle = quarantine_persist_fixture("qp-clear", true);
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+
+    block_state_persist();
+    mark_auth_broken(&handle, &name, false);
+
+    assert!(
+        !handle.lock().expect("lock handle").is_auth_broken(&name),
+        "memory clears even when the write is refused"
+    );
+    let lines = sink.snapshot();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one transition line, one failure line — nothing else: {lines:?}"
+    );
+    assert_eq!(
+        lines[0],
+        "clauth: 'qp-clear' re-authenticated: auth_broken cleared"
+    );
+    assert!(
+        lines[1].starts_with(
+            "clauth: failed to persist auth_broken clear for 'qp-clear': failed to read "
+        ),
+        "the failure line names the profile and the direction: {lines:?}"
+    );
+
+    unblock_state_persist(&AppState {
+        profiles: vec![name.clone()],
+        auth_broken: vec![name.clone()],
+        ..AppState::default()
+    });
+    assert!(
+        crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "fixture control: the restored last-good file still carries the flag"
+    );
+    mark_auth_broken(&handle, &name, false);
+    assert!(
+        !crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "the retry clears the flag on disk"
+    );
+    assert_eq!(
+        sink.snapshot().len(),
+        2,
+        "the retry adds no log lines: {:?}",
+        sink.snapshot()
+    );
+}
+
+/// The honest boundary of the in-process retry: a write that never reached
+/// disk and whose process died before a retry is invisible to a fresh load —
+/// the pre-existing semantics of an unwritten flag, pinned so the retry
+/// cannot silently widen into restart-time resurrection.
+#[test]
+fn a_failed_set_persist_that_never_retried_stays_invisible_to_a_fresh_load() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("qp-dead");
+    let handle = quarantine_persist_fixture("qp-dead", false);
+
+    block_state_persist();
+    // Refused; the "process" dies here, before any retry.
+    mark_auth_broken(&handle, &name, true);
+
+    unblock_state_persist(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    });
+    assert!(
+        !crate::profile::load_app_state()
+            .expect("fresh load")
+            .is_auth_broken(&name),
+        "a write that never landed leaves no flag for the next process"
     );
 }
 
