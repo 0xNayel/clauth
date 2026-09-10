@@ -111,7 +111,7 @@ fn rows_state_what_is_left_under_a_remaining_heading() {
     assert_eq!(rows[0].kind, StatRowKind::Heading);
     assert_eq!(rows[0].label, "remaining");
     assert_eq!(rows[1].label, "general");
-    assert_eq!(rows[1].value, "5h 38%  ·  7d 69%");
+    assert_eq!(rows[1].value, "5h 38% · 7d 69%");
 }
 
 #[test]
@@ -122,6 +122,20 @@ fn a_spent_interval_marks_its_row_danger() {
         "base_resp":{"status_code":0}}"#;
     let rows = rows(&parsed(json));
     assert_eq!(rows[1].kind, StatRowKind::Danger);
+    assert_eq!(
+        rows[1].value, "5h 0% · 7d 40%",
+        "a response omitting the instants falls back to the bar labels"
+    );
+}
+
+/// The `video` bucket's interval is 24h in both real captures; printing the
+/// 5h shorthand the `general` bars follow claims a window length the bucket
+/// does not have.
+#[test]
+fn the_video_row_states_its_own_window_lengths() {
+    let rows = rows(&parsed(REMAINS));
+    let video = rows.iter().find(|r| r.label == "video").unwrap();
+    assert_eq!(video.value, "24h 100% · 7d 100%");
 }
 
 #[test]

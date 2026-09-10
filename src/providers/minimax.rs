@@ -4,7 +4,7 @@
 //! by the same api key the `/anthropic` completions endpoint takes. It answers
 //! `model_remains[]` — one entry per plan bucket (`general` for text, `video`
 //! for the video product), each carrying a rolling interval window and a weekly
-//! one as REMAINING percentages plus their end instants in epoch-ms.
+//! one as REMAINING percentages plus their start and end instants in epoch-ms.
 //!
 //! Claude Code traffic bills against the `general` bucket, so that entry drives
 //! the bars; every bucket is listed as a text row, since a reader picking this
@@ -22,16 +22,19 @@
 
 use serde::Deserialize;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
-use crate::usage::{LABEL_5H, LABEL_7D, epoch_secs_to_iso};
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
+use crate::usage::{LABEL_5H, LABEL_7D};
 
 pub(super) const DISPLAY_NAME: &str = "MiniMax";
 
 pub(super) const ORIGIN: &str = "https://api.minimax.io";
 
-/// Where an operator mints the api key this provider authenticates with, as
-/// published by <https://platform.minimax.io/docs/guides/text-generation>.
-pub(super) const CONSOLE_URL: &str = "https://platform.minimax.io/user-center/basic-information";
+/// Where an operator mints the api key this provider authenticates with. The
+/// token-plan endpoint reads the Subscription Key (`sk-cp-…`), minted on the
+/// payment/token-plan page; the basic-information page this used to name is
+/// the pay-as-you-go key page, a different credential for a different billing
+/// mode (the vendor's quickstart-preparation guide splits the two).
+pub(super) const CONSOLE_URL: &str = "https://platform.minimax.io/user-center/payment/token-plan";
 
 const REMAINS_PATH: &str = "/v1/token_plan/remains";
 
@@ -151,10 +154,20 @@ fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
             Some(p) => format!("{p}%"),
             None => "-".to_string(),
         };
+        // Each bucket's windows are its own lengths — the `video` interval is
+        // 24h where `general`'s is 5h — so the shorthand is derived from the
+        // instants the response itself carries rather than printed as the 5h/7d
+        // the bars follow. A response omitting them falls back to those labels:
+        // they still name the windows by role for the bucket the bars read, and
+        // a length the response left unstated is not one to guess at.
+        let interval =
+            window_label(m.start_time, m.end_time).unwrap_or_else(|| LABEL_5H.to_string());
+        let weekly = window_label(m.weekly_start_time, m.weekly_end_time)
+            .unwrap_or_else(|| LABEL_7D.to_string());
         rows.push(StatRow {
             label: m.model_name.clone(),
             value: format!(
-                "{LABEL_5H} {}  ·  {LABEL_7D} {}",
+                "{interval} {} · {weekly} {}",
                 pct(m.current_interval_remaining_percent),
                 pct(m.current_weekly_remaining_percent)
             ),
@@ -175,9 +188,19 @@ fn utilization(remaining_pct: Option<i64>) -> Option<f64> {
     remaining_pct.map(|r| (100.0 - r as f64).clamp(0.0, 100.0))
 }
 
-/// Epoch-ms (MiniMax `end_time` / `weekly_end_time`) → ISO-8601 UTC.
-fn ms_to_iso(ms: i64) -> String {
-    epoch_secs_to_iso(ms / 1000)
+/// A window's length as a row spells it, derived from the instants the
+/// response carries: `5h` for `general`'s interval, `24h` for `video`'s, `7d`
+/// for the shared week. `None` when the span is missing or not a whole number
+/// of hours — a shape the row has no shorthand for and must not guess at.
+fn window_label(start_ms: Option<i64>, end_ms: Option<i64>) -> Option<String> {
+    let secs = end_ms?.checked_sub(start_ms?)? / 1000;
+    if secs >= 48 * 3600 && secs % 86_400 == 0 {
+        Some(format!("{}d", secs / 86_400))
+    } else if secs >= 3600 && secs % 3600 == 0 {
+        Some(format!("{}h", secs / 3600))
+    } else {
+        None
+    }
 }
 
 // ── Wire types ──────────────────────────────────────────────────────────────────
@@ -202,9 +225,15 @@ struct BaseResp {
 struct ModelRemains {
     #[serde(default)]
     model_name: String,
+    /// Start of the rolling interval window, epoch-ms.
+    #[serde(default)]
+    start_time: Option<i64>,
     /// End of the rolling interval window, epoch-ms.
     #[serde(default)]
     end_time: Option<i64>,
+    /// Start of the weekly window, epoch-ms.
+    #[serde(default)]
+    weekly_start_time: Option<i64>,
     /// End of the weekly window, epoch-ms.
     #[serde(default)]
     weekly_end_time: Option<i64>,
