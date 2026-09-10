@@ -4414,6 +4414,38 @@ fn an_endpoint_edit_drops_the_third_party_disk_cache() {
         cache("cache-rotated").is_none(),
         "a rotated key drops the stats fetched under the old one"
     );
+
+    // The preset-apply path moves the endpoint without touching the key, and
+    // its own comment claims it re-derives the provider "exactly like
+    // `edit_profile_endpoint`" — the cache drop has to hold there too.
+    let p = Profile::new(
+        "cache-preset".to_string(),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-k".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["cache-preset"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cache-preset"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats(),
+    );
+    assert!(
+        cache("cache-preset").is_some(),
+        "the fixture wrote the old provider's cache"
+    );
+    let mut config = inactive_config(p);
+    edit_profile_preset(
+        &mut config,
+        &crate::profile::ProfileName::from("cache-preset"),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        crate::profile::ModelSettings::default(),
+    )
+    .expect("edit_profile_preset");
+    assert!(
+        cache("cache-preset").is_none(),
+        "a preset that moves the endpoint drops the old provider's cache"
+    );
 }
 
 /// `main.rs`'s reauth contract is that the snapshot clears the old type's

@@ -555,6 +555,15 @@ pub(crate) fn edit_profile_preset(
             .and_then(Provider::from_base_url);
         if provider != profile.provider {
             profile.third_party_usage = None;
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — with the
+            // usage-store mirror driving the walk off them, the old
+            // provider's windows would keep judging the chain after the
+            // apply.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
         }
         profile.provider = provider;
         save_profile(profile)?;
