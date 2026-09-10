@@ -200,16 +200,65 @@ fn a_map_nested_windows_key_beats_its_own_label_field() {
 #[test]
 fn a_percentage_key_beats_the_remaining_fraction() {
     // No double-bar when a CC-mirror object carries both shapes: the
-    // percentage key wins, the remaining arm fires only without one.
+    // percentage key wins, the remaining arm fires only without one. The
+    // map key labels the pct bar like it labels a fraction window.
     let body = r#"{"pool":{"windows":{"7d":{
         "percentage":42,"remaining":0.93,"resets_at":1789476836}}}}"#;
     let value: serde_json::Value = serde_json::from_str(body).unwrap();
     let (plan, bars, rows) = scan(&value);
     assert_eq!(bars.len(), 1);
     assert!((bars[0].pct - 42.0).abs() < 1e-6, "pct was {}", bars[0].pct);
-    assert_eq!(bars[0].label, "usage");
+    assert_eq!(bars[0].label, "7d");
     assert!(rows.is_empty());
     assert!(plan.is_none());
+}
+
+#[test]
+fn a_map_nested_percentage_window_key_beats_its_own_label_field() {
+    // Both arms share the label chain: for a map entry the key IS the
+    // window name, so a pct bar under `5h` labels `5h` even when the object
+    // describes itself, engaging the same window machinery.
+    let value: serde_json::Value = serde_json::from_str(
+        r#"{"windows":{"5h":{"name":"five hour window","percentage":40,"resets_at":1789476836}}}"#,
+    )
+    .unwrap();
+    let (plan, bars, rows) = scan(&value);
+    assert_eq!(bars.len(), 1, "{bars:?}");
+    assert_eq!(bars[0].label, "5h");
+    assert!((bars[0].pct - 40.0).abs() < 1e-6, "pct was {}", bars[0].pct);
+    assert!(rows.is_empty() && plan.is_none());
+}
+
+#[test]
+fn an_array_under_a_window_literal_key_keeps_the_literal() {
+    // `{"5h": [{…}]}`: the container key parses as a window literal, so it
+    // IS the element's window name and passes through the array leg; a
+    // non-literal container key ("windows") still does not.
+    let value: serde_json::Value = serde_json::from_str(
+        r#"{"5h":[{"remaining":0.5,"resets_at":1789476836}],"7d":[{"percentage":40,"resets_at":1789476836}]}"#,
+    )
+    .unwrap();
+    let (plan, bars, rows) = scan(&value);
+    assert_eq!(bars.len(), 2, "{bars:?}");
+    assert_eq!(bars[0].label, "5h");
+    assert_eq!(bars[1].label, "7d");
+    assert!(rows.is_empty() && plan.is_none());
+}
+
+#[test]
+fn a_case_variant_map_key_normalizes_to_the_window_literal() {
+    // `5H` as a map key is the same window as `5h`: the parent key
+    // normalizes to the canonical literal, not passed through verbatim.
+    let value: serde_json::Value =
+        serde_json::from_str(r#"{"5H":{"remaining":0.5,"resets_at":1789476836}}"#).unwrap();
+    let (plan, bars, rows) = scan(&value);
+    assert_eq!(bars.len(), 1, "{bars:?}");
+    assert_eq!(bars[0].label, "5h");
+    assert_eq!(
+        crate::usage::window_duration_secs(&bars[0].label),
+        Some(5 * 3600)
+    );
+    assert!(rows.is_empty() && plan.is_none());
 }
 
 #[test]
@@ -263,7 +312,7 @@ fn a_zero_percentage_key_beats_the_remaining_fraction() {
     let (plan, bars, rows) = scan(&value);
     assert_eq!(bars.len(), 1, "{bars:?}");
     assert!((bars[0].pct - 0.0).abs() < 1e-6, "pct was {}", bars[0].pct);
-    assert_eq!(bars[0].label, "usage");
+    assert_eq!(bars[0].label, "5h");
     assert!(rows.is_empty() && plan.is_none());
 }
 

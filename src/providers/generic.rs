@@ -162,9 +162,11 @@ fn scan_inner(
         }
         Value::Array(arr) => {
             // The container key names the collection ("windows"), never an
-            // element; inheriting it labels every bar identically.
+            // element — unless it parses as a window literal itself
+            // (`"5h": [{…}]`), where it is every element's window name.
+            let parent_key = parent_key.filter(|k| window_literal(k).is_some());
             for v in arr {
-                scan_inner(v, None, plan, bars);
+                scan_inner(v, parent_key, plan, bars);
             }
         }
         _ => {}
@@ -188,10 +190,10 @@ fn find_plan(obj: &serde_json::Map<String, Value>) -> Option<String> {
 /// optional sibling reset timestamp, label field, and absolute used/total
 /// amounts), or a remaining-fraction window: `remaining`/`left` in 0..=1 plus
 /// a parseable reset sibling (Anthropic-mirror proxies report the fraction
-/// LEFT, so pct = `(1 - remaining) * 100`), labelled by the parent map's key
-/// (an array element or root object: its own label field). The reset sibling
-/// is what separates a window from a balance-looking object; a `remaining`
-/// above 1 is an absolute count (z.ai), never a fraction.
+/// LEFT, so pct = `(1 - remaining) * 100`). Both arms label through
+/// [`bar_label`]. The reset sibling is what separates a window from a
+/// balance-looking object; a `remaining` above 1 is an absolute count (z.ai),
+/// never a fraction.
 fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -> Option<UsageBar> {
     let pct = obj.iter().find_map(|(k, v)| {
         is_pct_key(k)
@@ -210,28 +212,7 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
             return None;
         }
         let resets_at = resets_at?;
-        // Label chain: the parent map's key verbatim (a map entry's key IS its
-        // window name — overview_windows, roster_rank and window_duration_secs
-        // match the literal `5h`/`7d`, so a humanized label silently loses
-        // every window-derived feature); an array element or root object has
-        // no key, so its own label field; else "usage". A label field that
-        // already parses as a window literal passes verbatim for the same
-        // reason (a case-variant `5H` humanized to "5 h" would miss it).
-        let label = match parent_key {
-            Some(k) => k.to_string(),
-            None => obj
-                .iter()
-                .find_map(|(k, v)| {
-                    is_label_key(k)
-                        .then(|| v.as_str())
-                        .flatten()
-                        .map(|s| match window_literal(s) {
-                            Some(lit) => lit,
-                            None => humanize_label(s),
-                        })
-                })
-                .unwrap_or_else(|| "usage".to_string()),
-        };
+        let label = bar_label(obj, parent_key);
         return Some(UsageBar {
             label,
             pct: (1.0 - remaining) * 100.0,
@@ -240,15 +221,7 @@ fn extract_bar(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -
             total: None,
         });
     };
-    let label = obj
-        .iter()
-        .find_map(|(k, v)| {
-            is_label_key(k)
-                .then(|| v.as_str())
-                .flatten()
-                .map(humanize_label)
-        })
-        .unwrap_or_else(|| "usage".to_string());
+    let label = bar_label(obj, parent_key);
     // Absolute amounts. `total` prefers an explicit ceiling field; when the
     // object only carries `used` + `remaining` (z.ai), `used + remaining` is the
     // robust fallback so the bar still shows `x / y`.
@@ -479,6 +452,30 @@ fn is_remaining_key(k: &str) -> bool {
 fn window_literal(s: &str) -> Option<String> {
     let lower = s.to_ascii_lowercase();
     crate::usage::window_duration_secs(&lower).map(|_| lower)
+}
+
+/// The bar's label, shared by both extraction arms: the parent map's key when
+/// present — a map entry's key IS its window name, and overview_windows,
+/// roster_rank and `window_duration_secs` match the literal `5h`/`7d`, so
+/// anything else silently loses every window-derived feature (a key parsing
+/// as a window literal normalizes to it) — else the object's own label field
+/// (a window literal passes verbatim for the same reason; anything else
+/// humanizes), else "usage".
+fn bar_label(obj: &serde_json::Map<String, Value>, parent_key: Option<&str>) -> String {
+    if let Some(k) = parent_key {
+        return window_literal(k).unwrap_or_else(|| k.to_string());
+    }
+    obj.iter()
+        .find_map(|(k, v)| {
+            is_label_key(k)
+                .then(|| v.as_str())
+                .flatten()
+                .map(|s| match window_literal(s) {
+                    Some(lit) => lit,
+                    None => humanize_label(s),
+                })
+        })
+        .unwrap_or_else(|| "usage".to_string())
 }
 
 #[cfg(test)]
