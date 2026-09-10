@@ -1107,7 +1107,9 @@ fn drain_reset_style(rate: Option<f64>, rate_unit: &str, window: &UsageWindow) -
 /// `history_cache`, so no disk read happens under the config guard. Every other
 /// window falls back to the window's own average pace, which needs no burn
 /// history at all: 7d moves too slowly for the recency weighting to say much,
-/// and a synthesized third-party window has no history to weigh.
+/// and a third-party window — bar-synthesized or seeded from the provider's
+/// derived usage — has no history to weigh, since no third-party leg ever
+/// appends `usage_history.jsonl`.
 fn drain_rate(
     app: &App,
     name: &crate::profile::ProfileName,
@@ -1116,6 +1118,7 @@ fn drain_rate(
     window: &UsageWindow,
 ) -> Option<f64> {
     if label == LABEL_5H
+        && !profile.usage_cache_is_third_party()
         && let Some(usage) = profile.usage.as_ref()
     {
         return app.active_burn_rate(name, usage);
