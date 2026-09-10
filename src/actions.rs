@@ -437,11 +437,12 @@ pub(crate) fn edit_profile_endpoint(
             .and_then(crate::providers::Provider::from_base_url);
         if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
             profile.third_party_usage = None;
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — with the
-            // usage-store mirror driving the walk off them, the old
-            // provider's windows would keep judging the chain for up to one
-            // refresh interval after the edit.
+            // The disk cache holds the same stale figures:
+            // `bootstrap_third_party` reseeds them `Fresh` on a restart or
+            // config reload, and the usage-store mirror drives the walk off
+            // the reseed. Dropping the file closes that path; a LIVE
+            // process's in-memory mirror entry survives until the profile's
+            // next fetch (≤ one interval) — no cross-process clear exists.
             crate::profile_cache::remove_profile_cache(
                 name,
                 crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -555,11 +556,12 @@ pub(crate) fn edit_profile_preset(
             .and_then(Provider::from_base_url);
         if provider != profile.provider {
             profile.third_party_usage = None;
-            // The disk cache holds the same stale figures, and
-            // `bootstrap_third_party` reseeds them `Fresh` — with the
-            // usage-store mirror driving the walk off them, the old
-            // provider's windows would keep judging the chain after the
-            // apply.
+            // The disk cache holds the same stale figures:
+            // `bootstrap_third_party` reseeds them `Fresh` on a restart or
+            // config reload, and the usage-store mirror drives the walk off
+            // the reseed. Dropping the file closes that path; a LIVE
+            // process's in-memory mirror entry survives until the profile's
+            // next fetch (≤ one interval) — no cross-process clear exists.
             crate::profile_cache::remove_profile_cache(
                 name,
                 crate::profile_cache::THIRD_PARTY_CACHE_FILE,
