@@ -5845,7 +5845,6 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
 #[test]
 fn roster_rank_reports_free_percent_from_the_best_known_window() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
-    use crate::providers::{ThirdPartyStats, UsageBar};
     use crate::usage::{UsageInfo, UsageWindow};
 
     let _home = HomeSandbox::new();
@@ -5886,20 +5885,16 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
 
     // A third-party provider has no `windows`, but its own bars carry the same
     // percentages, and 5h still outranks 7d.
-    let bar = |label: &str, pct: f64| UsageBar {
-        label: label.to_string(),
-        pct,
-        resets_at: None,
-        used: None,
-        total: None,
-    };
     write_profile_cache(
         &crate::profile::ProfileName::from("bars"),
         THIRD_PARTY_CACHE_FILE,
         &ThirdPartyStats {
             is_available: true,
             rows: Vec::new(),
-            bars: vec![bar("7d", 94.0), bar("5h", 8.0)],
+            bars: vec![
+                crate::testutil::bar("7d", 94.0),
+                crate::testutil::bar("5h", 8.0),
+            ],
             plan: Some("pro".to_string()),
             endpoint: None,
             best_effort: false,
@@ -5952,7 +5947,6 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
 fn roster_rank_ignores_a_stale_oauth_cache_on_an_api_key_account() {
     use crate::profile::{Profile, save_profile};
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
-    use crate::providers::{ThirdPartyStats, UsageBar};
     use crate::usage::{UsageInfo, UsageWindow};
 
     let _home = HomeSandbox::new();
@@ -5981,20 +5975,7 @@ fn roster_rank_ignores_a_stale_oauth_cache_on_an_api_key_account() {
     write_profile_cache(
         &name,
         THIRD_PARTY_CACHE_FILE,
-        &ThirdPartyStats {
-            is_available: true,
-            rows: Vec::new(),
-            bars: vec![UsageBar {
-                label: "5h".to_string(),
-                pct: 40.0,
-                resets_at: None,
-                used: None,
-                total: None,
-            }],
-            plan: None,
-            endpoint: None,
-            best_effort: false,
-        },
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 40.0)]),
     );
 
     assert_eq!(

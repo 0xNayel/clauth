@@ -1853,21 +1853,8 @@ fn the_replay_judges_a_third_party_members_windows_like_the_live_leg() {
     b.base_url = Some("https://api.minimax.io/anthropic".to_string());
     b.api_key = Some("sk-cp-k".to_string());
     crate::profile::save_profile(b).expect("save b");
-    let provider_window = |pct: f64| crate::providers::ThirdPartyStats {
-        is_available: true,
-        rows: Vec::new(),
-        bars: vec![crate::providers::UsageBar {
-            label: "5h".to_string(),
-            pct,
-            resets_at: Some(crate::usage::epoch_secs_to_iso(
-                crate::usage::now_epoch_secs() + 3600,
-            )),
-            used: None,
-            total: None,
-        }],
-        plan: None,
-        endpoint: None,
-        best_effort: false,
+    let provider_window = |pct: f64| {
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar_reset_in("5h", pct, 3_600)])
     };
 
     // A clear provider window is a target the walk lands on, same as a clear

@@ -4338,20 +4338,7 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
 #[test]
 fn an_endpoint_edit_drops_the_third_party_disk_cache() {
     let _home = HomeSandbox::new();
-    let stats = || crate::providers::ThirdPartyStats {
-        is_available: true,
-        rows: Vec::new(),
-        bars: vec![crate::providers::UsageBar {
-            label: "5h".to_string(),
-            pct: 80.0,
-            resets_at: None,
-            used: None,
-            total: None,
-        }],
-        plan: None,
-        endpoint: None,
-        best_effort: false,
-    };
+    let stats = || crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
     let cache = |name: &str| {
         crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
             &crate::profile::ProfileName::from(name),

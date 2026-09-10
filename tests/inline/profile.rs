@@ -521,29 +521,10 @@ fn load_profile_seeds_usage_from_the_third_party_cache() {
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from(name),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        &crate::providers::ThirdPartyStats {
-            is_available: true,
-            rows: Vec::new(),
-            bars: vec![
-                crate::providers::UsageBar {
-                    label: "5h".to_string(),
-                    pct: 62.0,
-                    resets_at: None,
-                    used: None,
-                    total: None,
-                },
-                crate::providers::UsageBar {
-                    label: "7d".to_string(),
-                    pct: 31.0,
-                    resets_at: None,
-                    used: None,
-                    total: None,
-                },
-            ],
-            plan: None,
-            endpoint: None,
-            best_effort: false,
-        },
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 62.0),
+            crate::testutil::bar("7d", 31.0),
+        ]),
     );
 
     let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
