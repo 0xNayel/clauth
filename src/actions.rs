@@ -437,6 +437,15 @@ pub(crate) fn edit_profile_endpoint(
             .and_then(crate::providers::Provider::from_base_url);
         if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
             profile.third_party_usage = None;
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — with the
+            // usage-store mirror driving the walk off them, the old
+            // provider's windows would keep judging the chain for up to one
+            // refresh interval after the edit.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
         }
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
