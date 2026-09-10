@@ -190,8 +190,10 @@ fn utilization(remaining_pct: Option<i64>) -> Option<f64> {
 
 /// A window's length as a row spells it, derived from the instants the
 /// response carries: `5h` for `general`'s interval, `24h` for `video`'s, `7d`
-/// for the shared week. `None` when the span is missing or not a whole number
-/// of hours — a shape the row has no shorthand for and must not guess at.
+/// for the shared week; spans of whole days at two days or more spell in days,
+/// any other whole number of hours in hours. `None` when the span is missing
+/// or not a whole number of hours — a shape the row has no shorthand for and
+/// must not guess at.
 fn window_label(start_ms: Option<i64>, end_ms: Option<i64>) -> Option<String> {
     let secs = end_ms?.checked_sub(start_ms?)? / 1000;
     if secs >= 48 * 3600 && secs % 86_400 == 0 {

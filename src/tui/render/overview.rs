@@ -503,8 +503,9 @@ fn render_overview_row(
     // Bracketed bars ([███░░░]) for overview account rows only; brackets stay
     // dim — the fetch-state cue lives on the countdown above instead.
     // Usage-page gauges, chain bars, and fallback thresholds stay bracket-less.
-    // OAuth windows come from `usage`; api-key/provider profiles have no `usage`,
-    // so the 5h/7d windows are synthesized from the matching third-party bars.
+    // OAuth windows come from `usage`; an api-key/provider profile carries
+    // `usage` only when it was seeded from its provider windows, and where it
+    // is absent the 5h/7d windows are synthesized from the matching bars.
     let (five_window, seven_window) = overview_windows(profile);
     // Drain-color each reset countdown by the window's burn rate — see
     // `drain_rate` for where that rate comes from per window.
@@ -670,8 +671,9 @@ fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Ve
 }
 
 /// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their
-/// live `UsageInfo`; api-key/provider profiles have no `UsageInfo`, so each slot
-/// is synthesized from the third-party bar whose label matches (`5h` / `7d`) —
+/// live `UsageInfo`; an api-key/provider profile carries one only when it was
+/// seeded from its provider windows, so each missing slot is synthesized from
+/// the third-party bar whose label matches (`5h` / `7d`) —
 /// the same labels `zai` decodes from its window codes. `None` per slot when no
 /// source exists (renders `—`).
 fn overview_windows(profile: &Profile) -> (Option<UsageWindow>, Option<UsageWindow>) {

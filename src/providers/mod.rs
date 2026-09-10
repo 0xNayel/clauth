@@ -23,8 +23,9 @@
 //!    than a generic failure, which is what stops the cadence and tells the
 //!    operator to re-authenticate instead of waiting. The shared `get_json`
 //!    already maps a 401 to it — a dead api key has no refresh path either — so
-//!    a provider only needs to produce the verdict itself when its credential
-//!    is session-shaped (Alibaba) and the death arrives in an HTTP 200 body.
+//!    a provider only needs to produce the verdict itself when the death
+//!    arrives in an HTTP 200 body: Alibaba's session verdict and MiniMax's
+//!    in-band dead-key codes.
 //!
 //! No render-layer changes needed — [`ThirdPartyStats`] carries provider-agnostic
 //! [`UsageBar`]s (percentage windows) and [`StatRow`]s (text), which
@@ -499,9 +500,9 @@ pub(crate) enum ThirdPartyError {
     /// refresh path exists — only an operator re-login clears it. Distinct from
     /// `Status` because retrying on the cadence can never succeed: the scheduler
     /// session-suppresses this profile and the UI names the login instead of a
-    /// network fault. Two producers: a 401 from the shared `get_json` (a dead
-    /// api key), and Alibaba's 48-hour console session (the verdict rides an
-    /// HTTP 200 body).
+    /// network fault. Three producers: a 401 from the shared `get_json` (a dead
+    /// api key), Alibaba's 48-hour console session, and MiniMax's in-band
+    /// dead-key codes — the latter two ride HTTP 200 bodies.
     AuthExpired,
 }
 
