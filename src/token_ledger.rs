@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::pricing::HourTokens;
-use crate::tokens::{DayModelTokens, DayTokens, ModelDayAcc, ModelTokens, TokenStats};
+use crate::tokens::{DayModelTokens, DayTokens, ModelDayAcc, ModelTokens, TokenStats, UsageShape};
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs};
 
 const LEDGER_FILE: &str = "token_ledger.json";
@@ -58,6 +58,12 @@ struct WireModel {
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    /// How the model's usage rows reported cache, per the shape classifier.
+    /// Absent in files written before the classifier: `serde(default)` reads
+    /// it [`UsageShape::Healthy`], which never corrects — so a pre-classifier
+    /// row keeps rendering as before.
+    #[serde(default, skip_serializing_if = "is_default_shape")]
+    shape: UsageShape,
     /// Per-hour buckets, index = hour 0..23. A v1 file (no `hours` key) loads
     /// with `None` — serde leaves an absent `Option` field `None`; the explicit
     /// `default` is belt-and-braces per the schema contract. `skip_serializing_if`
@@ -65,6 +71,10 @@ struct WireModel {
     /// gains `hours` entries as new days are recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hours: Option<[WireHour; 24]>,
+}
+
+fn is_default_shape(s: &UsageShape) -> bool {
+    *s == UsageShape::Healthy
 }
 
 /// One hour's token buckets on the wire — the serde twin of [`HourTokens`]
@@ -115,6 +125,11 @@ pub(crate) struct Ledger {
     /// pre-upgrade ledger owe exactly one pass.
     #[serde(default)]
     backfill_done: bool,
+    /// Set once the one-shot pre-classifier shape re-derive pass has run,
+    /// which corrects A1 days recorded before the shape classifier existed.
+    /// Absent → `false`: every pre-classifier ledger owes exactly one pass.
+    #[serde(default)]
+    rederive_done: bool,
 }
 
 impl Ledger {
@@ -178,6 +193,7 @@ impl Ledger {
                     output: w.output,
                     cache_read: w.cache_read,
                     cache_create: w.cache_create,
+                    shape: w.shape,
                 };
                 day_in_out = day_in_out.saturating_add(split.in_out());
                 base.daily_models.push(DayModelTokens {
@@ -239,6 +255,7 @@ impl Ledger {
                     output: split.output,
                     cache_read: split.cache_read,
                     cache_create: split.cache_create,
+                    shape: split.shape,
                     hours: d.hours.map(|hs| hs.map(WireHour::from)),
                 },
             );
@@ -306,6 +323,105 @@ impl Ledger {
             }
         }
         self.backfill_done = true;
+    }
+
+    /// The watermark date the one-shot shape re-derive may sweep up to, when
+    /// that pass still has work: the flag unset AND at least one day strictly
+    /// before `today` holding a row whose `shape` is not
+    /// [`UsageShape::WholePromptInput`] (both the pre-classifier `Healthy`
+    /// default and every other uncorrected class qualify — a stored row is
+    /// either already corrected or owed the re-derive's exact-match check).
+    /// Also `None` when there is no watermark to derive a cutoff from.
+    pub(crate) fn rederive_through(&self, today: &str) -> Option<String> {
+        if self.rederive_done {
+            return None;
+        }
+        let owed = self.days.iter().any(|(date, models)| {
+            date.as_str() < today
+                && models
+                    .values()
+                    .any(|w| w.shape != UsageShape::WholePromptInput)
+        });
+        owed.then(|| self.recorded_through.clone()).flatten()
+    }
+
+    /// Correct the pre-classifier stored days from a re-derived transcript
+    /// corpus ([`crate::tokens::backfill_corpus`], which now applies
+    /// [`crate::tokens::apply_usage_shapes`]). Exact-or-correct: a stored row
+    /// whose corpus re-derivation equals its stored numbers on the
+    /// cache-read / cache-create / output fields — i.e. the corpus covers the
+    /// day and holds no A1 correction for it — is left byte-identical and
+    /// its `shape` set from the re-derived rows. A row whose re-derived
+    /// `input` equals `stored_input - stored_cache_read` (the A1
+    /// correction) gets the corrected values, its per-hour buckets, and the
+    /// [`UsageShape::WholePromptInput`] marker. Any other mismatch means the
+    /// corpus no longer covers the day: the row keeps its recorded values
+    /// and gets the [`UsageShape::Healthy`] marker, which never corrects —
+    /// unverifiable rather than silently corrected. Days the corpus cannot
+    /// reach at all stay entirely untouched (same marker rule). Marks
+    /// `rederive_done` either way.
+    pub(crate) fn rederive_shapes(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
+        for ((date, model), acc) in derived {
+            let Some(day) = self.days.get_mut(date) else {
+                continue;
+            };
+            let Some(w) = day.get_mut(model) else {
+                continue;
+            };
+            if w.shape == UsageShape::WholePromptInput {
+                continue; // already corrected — never rewritten
+            }
+            if acc.flat.output == w.output
+                && acc.flat.cache_read == w.cache_read
+                && acc.flat.cache_create == w.cache_create
+                && acc.flat.input == w.input.saturating_sub(w.cache_read)
+                && acc.flat.shape == UsageShape::WholePromptInput
+            {
+                // The corpus re-derives as A1 with exactly the correction the
+                // stored row needs: adopt the corrected split + hours + shape.
+                w.input = acc.flat.input;
+                w.hours = Some(acc.hours.map(WireHour::from));
+                w.shape = UsageShape::WholePromptInput;
+            } else if acc.flat.input == w.input
+                && acc.flat.output == w.output
+                && acc.flat.cache_read == w.cache_read
+                && acc.flat.cache_create == w.cache_create
+            {
+                // The corpus re-derives equal to the stored row: the day
+                // holds no A1 usage, or it was recorded post-classifier.
+                // Stamp the re-derived shape (the strongest class the
+                // re-derivation saw, e.g. NoCacheWrites for A2 days).
+                w.shape = acc.flat.shape;
+            }
+            // Any other mismatch: unverifiable — keep values, keep the
+            // never-correcting `Healthy` marker.
+        }
+        self.rederive_done = true;
+    }
+
+    /// Test-only: the re-derive pass's done flag.
+    #[cfg(test)]
+    pub(crate) fn rederive_done(&self) -> bool {
+        self.rederive_done
+    }
+
+    /// Test-only: one stored day/model row's fields.
+    #[cfg(test)]
+    pub(crate) fn wire_model_fields(
+        &self,
+        date: &str,
+        model: &str,
+    ) -> Option<(u64, u64, u64, u64, UsageShape, bool)> {
+        self.days.get(date)?.get(model).map(|w| {
+            (
+                w.input,
+                w.output,
+                w.cache_read,
+                w.cache_create,
+                w.shape,
+                w.hours.is_some(),
+            )
+        })
     }
 }
 
