@@ -160,11 +160,11 @@ impl Provider {
     }
 
     /// Whether this provider publishes usage windows of its own (percentage
-    /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai` and
-    /// `Alibaba` do; `DeepSeek` and `OpenRouter` publish a wallet. The MCP
-    /// headroom clause denies a 5h/7d limit only where it knows the provider
-    /// has none: a windows-publishing provider HAS the limits even when one
-    /// cached response carried no bars.
+    /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai`,
+    /// `Alibaba` and `MiniMax` do; `DeepSeek` and `OpenRouter` publish a
+    /// wallet. The MCP headroom clause denies a 5h/7d limit only where it
+    /// knows the provider has none: a windows-publishing provider HAS the
+    /// limits even when one cached response carried no bars.
     pub(crate) fn publishes_windows(self) -> bool {
         matches!(self, Self::Zai | Self::Alibaba | Self::MiniMax)
     }
@@ -172,7 +172,7 @@ impl Provider {
     /// The vendor page where this endpoint's api key is minted, for a surface
     /// that offers to open it. [`alibaba`] answers with four different pages,
     /// since its four endpoints are two products across two consoles; the other
-    /// three have one page each.
+    /// four have one page each.
     ///
     /// `None` means the `base_url` doesn't belong to `self`, which is why every
     /// arm re-checks it rather than only the arm that has to. Returning a page

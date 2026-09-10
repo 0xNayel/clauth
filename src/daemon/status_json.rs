@@ -200,7 +200,9 @@ pub(crate) struct ProfileEntry {
     /// The chain-membership object (`position` / `threshold` / `armed`), `None`
     /// when not a chain member.
     pub(crate) fallback: Option<serde_json::Value>,
-    /// The OAuth 5h/7d usage rows; empty when the profile has no OAuth cache.
+    /// The 5h/7d usage rows: an OAuth account's own windows, or an api-key
+    /// account's provider-derived ones. Empty when the cache behind them
+    /// holds none.
     pub(crate) windows: Vec<Window>,
     /// The third-party availability object (`available`), `None` for OAuth
     /// accounts.

@@ -215,7 +215,7 @@ fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
 
 /// One published OAuth window row — the `{label, utilization_pct, resets_at}`
 /// spelling of a 5h, 7d, or per-model weekly window. Both writers
-/// ([`oauth_windows`] → the daemon's `status.json` feed and the MCP payloads)
+/// ([`usage_windows`] → the daemon's `status.json` feed and the MCP payloads)
 /// and the reader (`clauth list`'s 5h/7d columns) derive from this one struct,
 /// so a reader's key spelling cannot drift from what a writer emits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,9 +225,11 @@ pub(crate) struct Window {
     pub(crate) resets_at: Option<String>,
 }
 
-/// The [`Window`] rows of an OAuth usage read — 5h, 7d, then one entry per
-/// weekly model window (`7d <model>`).
-pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
+/// The [`Window`] rows of a usage read — 5h, 7d, then one entry per weekly
+/// model window (`7d <model>`). Serves both cache shapes: an OAuth read
+/// directly, and a third-party read through the derivation
+/// [`published_windows`] maps it with.
+pub(crate) fn usage_windows(usage: &UsageInfo) -> Vec<Window> {
     usage
         .windows()
         .into_iter()
@@ -259,12 +261,12 @@ pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
             .as_ref()
             .and_then(ThirdPartyStats::to_usage_info)
             .as_ref()
-            .map(oauth_windows)
+            .map(usage_windows)
             .unwrap_or_default();
     }
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
         .as_ref()
-        .map(oauth_windows)
+        .map(usage_windows)
         .unwrap_or_default()
 }
 

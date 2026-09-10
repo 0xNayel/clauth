@@ -2371,13 +2371,13 @@ impl App {
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
                 }
-                // A third-party member's bars are its usage snapshot. The OAuth
-                // store above just wrote `None` over this account (it holds no
-                // entry for one), so the seed `load_profile` set is gone by
-                // here and the derivation has to run on every apply, not once
-                // at load. Guarded on `is_none` so a hybrid account that really
-                // does carry an OAuth reading keeps it — that one is the
-                // authoritative window, the provider cache is the other leg.
+                // A third-party member's bars are its usage snapshot. The
+                // scheduler writes the snapshot and mirrors its derived window
+                // into the usage store as two separate acquisitions, so an
+                // apply landing between them still owes this account a figure:
+                // derive it off the snapshot. The `is_none` guard keeps that a
+                // fallback — the store's own entry, whichever leg wrote it,
+                // always wins.
                 if p.usage.is_none()
                     && let Some(stats) = p.third_party_usage.as_ref()
                 {
