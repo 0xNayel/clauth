@@ -131,12 +131,22 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
 /// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
 /// cache (no caching across tool calls per the design). The roster's own rank
 /// reads this: it asks for the two figures it sorts on, and consults the
-/// third-party cache itself for an account that has no such window.
+/// third-party cache itself for an account that has no such window. A
+/// third-party account is read from ITS OWN cache through the same derivation
+/// the walk's mirror runs — reading the OAuth file for one would publish a
+/// stale Anthropic window left over from an earlier OAuth life, the same
+/// stale-leftover read `profile_json::published_windows` guards against.
 fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
-    match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
+    let pair = |u: Option<UsageInfo>| match u {
         Some(u) => (u.five_hour, u.seven_day),
         None => (None, None),
+    };
+    if crate::profile::stored_usage_cache_is_third_party(name) {
+        let derived = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
+            .and_then(|s| s.to_usage_info());
+        return pair(derived);
     }
+    pair(load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE))
 }
 
 /// The discriminated headroom payload every MCP surface renders through

@@ -5943,6 +5943,67 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     );
 }
 
+/// An api-key account whose disk still holds a stale OAuth `usage_cache.json`
+/// from an earlier OAuth life ranks off its own provider bars, never the
+/// stale Anthropic window — the same stale-leftover read
+/// `profile_json::published_windows` guards against, and the reason
+/// `load_windows` routes an api-key account through the third-party cache.
+#[test]
+fn roster_rank_ignores_a_stale_oauth_cache_on_an_api_key_account() {
+    use crate::profile::{Profile, save_profile};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("zai-x");
+    save_profile(&Profile::new(
+        "zai-x".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("k".to_string()),
+    ))
+    .expect("save the profile");
+    crate::testutil::register_names(&["zai-x"]);
+
+    // A leftover OAuth cache claiming a nearly-spent 5h window would rank the
+    // account Window(5.0) — the stale Anthropic figure, not this account's.
+    write_profile_cache(
+        &name,
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 95.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    write_profile_cache(
+        &name,
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![UsageBar {
+                label: "5h".to_string(),
+                pct: 40.0,
+                resets_at: None,
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    assert_eq!(
+        roster_rank(&name),
+        RosterRank::Window(60.0),
+        "the provider bar answers, the stale OAuth window never reaches the rank",
+    );
+}
+
 /// The two-wallet ruling (owner 2026-08-28): a profile whose cached rows carry
 /// the empty USD wallet BEFORE the funded CNY one ranks on the funded wallet —
 /// zero-amount wallets drop, the first funded one is the pick. Driven from the
