@@ -384,12 +384,17 @@ fn to_usage_info_maps_the_two_windows_the_chain_judges() {
     assert_eq!(usage.five_hour.as_ref().map(|w| w.utilization), Some(62.0));
     assert_eq!(usage.seven_day.as_ref().map(|w| w.utilization), Some(31.0));
     let resets_at = usage.five_hour.and_then(|w| w.resets_at);
+    // Equality against the constructed instant, not a liveness property: a
+    // regression that synthesizes any future instant passes a "is it live"
+    // check and rides a wrong reset into every liveness judgment downstream.
+    let parsed = resets_at
+        .as_deref()
+        .and_then(crate::usage::iso_to_epoch_secs)
+        .expect("the provider's own reset instant parses");
+    let expected = crate::usage::now_epoch_secs() + 3_600;
     assert!(
-        resets_at
-            .as_deref()
-            .and_then(crate::usage::iso_to_epoch_secs)
-            .is_some_and(|r| r > crate::usage::now_epoch_secs()),
-        "the provider's own reset instant rides through as a live one: {resets_at:?}"
+        (parsed - expected).abs() <= 1,
+        "the bar's own instant rides through verbatim: {resets_at:?}"
     );
 }
 

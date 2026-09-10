@@ -138,9 +138,10 @@ fn the_video_row_states_its_own_window_lengths() {
     assert_eq!(video.value, "24h 100% · 7d 100%");
 }
 
-/// A span the response STATES but the row has no shorthand for (90 minutes)
-/// prints no length at all — the 5h fallback would claim a length the
-/// response itself contradicts. The fallback is for an ABSENT span only.
+/// A span the response STATES but the row has no shorthand for (the fixture
+/// states a 10-minute interval) prints no length at all — the 5h fallback
+/// would claim a length the response itself contradicts. The fallback is for
+/// an ABSENT span only.
 #[test]
 fn a_stated_span_without_a_shorthand_prints_no_length() {
     let json = r#"{"model_remains":[{"model_name":"general",
@@ -151,7 +152,7 @@ fn a_stated_span_without_a_shorthand_prints_no_length() {
     let rows = rows(&parsed(json));
     assert_eq!(
         rows[1].value, "38% · 7d 69%",
-        "a 90-minute stated span carries no length; the absent weekly span falls back"
+        "a stated non-whole-hour span carries no length; the absent weekly span falls back"
     );
 }
 

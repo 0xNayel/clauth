@@ -5086,10 +5086,10 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
 }
 
 /// The endpoint edit drops the third-party DISK cache with the in-memory
-/// stats: `bootstrap_third_party` reseeds a leftover cache `Fresh`, and the
-/// usage-store mirror drives the auto-switch walk off it, so the old
-/// provider's windows would keep judging the chain for up to one refresh
-/// interval after the edit.
+/// stats: `bootstrap_third_party` reseeds a leftover cache `Fresh` on the
+/// restart/boot paths, and the usage-store mirror drives the auto-switch
+/// walk off the reseed. A live process's in-memory mirror entry survives
+/// until the profile's next fetch — the boundary the src comment names.
 #[test]
 fn an_endpoint_edit_drops_the_third_party_disk_cache() {
     let _home = HomeSandbox::new();
